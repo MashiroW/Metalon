@@ -1,0 +1,11 @@
+# Game resources: the content of the "Silver Blockouts" (see README.md).
+# Not versioned: 1.5 GB, and they come from the original game.
+/assets/*
+!/assets/README.md
+
+# Build folder: only the game exe is kept
+/build/*
+!/build/silver_remaster.exe
+
+__pycache__/
+*.pyc
