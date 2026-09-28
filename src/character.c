@@ -263,7 +263,7 @@ int david_load(const char *dir) { return char_model_load(&g_david, dir, "david")
 
 /* ---------------- animation library ---------------- */
 typedef struct {
-    char name[48], source[8];
+    char name[48], source[48];
     char path[600];
     int state;             /* 0 not loaded, 1 loaded, -1 unreadable / no animation */
     int nodes;             /* the clip file's skeleton node count */
@@ -272,6 +272,9 @@ typedef struct {
     int *node, *kind, *off, *cnt; /* per channel; kind 0=T 1=R 2=S */
     float *times;          /* n_keys */
     float (*values)[4];    /* n_keys */
+    /* the rest pose of the skeleton the clip was made on (its file's nodes):
+       clips are applied as offsets from it (see anim_lib_sample_for) */
+    float (*rest_t)[3], (*rest_r)[4], (*rest_s)[3];
 } LibClip;
 static LibClip *g_lib = NULL;
 static int g_lib_count = 0;
@@ -333,6 +336,16 @@ static int lib_load_clip(LibClip *c) {
     int nch = json_len(chans);
     c->nodes = json_len(json_get(g.root, "nodes"));
     if (c->nodes <= 0 || c->nodes > DAVID_MAX_NODES || !anim || nch <= 0) goto done;
+    c->rest_t = (float (*)[3])malloc(sizeof(float) * 3 * c->nodes);
+    c->rest_r = (float (*)[4])malloc(sizeof(float) * 4 * c->nodes);
+    c->rest_s = (float (*)[3])malloc(sizeof(float) * 3 * c->nodes);
+    for (int i = 0; i < c->nodes; i++) {
+        const JsonValue *n = json_at(json_get(g.root, "nodes"), i);
+        const JsonValue *t = json_get(n, "translation"), *r = json_get(n, "rotation"), *s = json_get(n, "scale");
+        for (int k = 0; k < 3; k++) c->rest_t[i][k] = (float)json_num(json_at(t, k), 0.0);
+        for (int k = 0; k < 4; k++) c->rest_r[i][k] = (float)json_num(json_at(r, k), k == 3 ? 1.0 : 0.0);
+        for (int k = 0; k < 3; k++) c->rest_s[i][k] = (float)json_num(json_at(s, k), 1.0);
+    }
     c->node = (int *)calloc(nch, sizeof(int)); c->kind = (int *)calloc(nch, sizeof(int));
     c->off = (int *)calloc(nch, sizeof(int)); c->cnt = (int *)calloc(nch, sizeof(int));
     int cap = 0;
@@ -380,11 +393,61 @@ float anim_lib_duration(int i) { return lib_loaded(i) ? g_lib[i].duration : 0.0f
 int anim_lib_channels(int i) { return lib_loaded(i) ? g_lib[i].n_channels : 0; }
 int anim_lib_keys(int i) { return lib_loaded(i) ? g_lib[i].n_keys : 0; }
 
-void anim_lib_sample(int i, float t, NodeOverride *overrides) {
+static void quat_mul(const float a[4], const float b[4], float out[4]) { /* x y z w */
+    float x = a[3] * b[0] + a[0] * b[3] + a[1] * b[2] - a[2] * b[1];
+    float y = a[3] * b[1] - a[0] * b[2] + a[1] * b[3] + a[2] * b[0];
+    float z = a[3] * b[2] + a[0] * b[1] - a[1] * b[0] + a[2] * b[3];
+    float w = a[3] * b[3] - a[0] * b[0] - a[1] * b[1] - a[2] * b[2];
+    out[0] = x; out[1] = y; out[2] = z; out[3] = w;
+}
+
+/* A clip carries the bone lengths (and rest orientations/scales) of the
+   skeleton it was made on -- its file's nodes. Played as-is on another
+   character with the same bone count, it imposes those proportions
+   (stretched chests, limbs apart). So every channel is applied as an
+   OFFSET from the clip's own rest pose onto the character's rest pose:
+     position = character rest + (animated - clip rest)
+     rotation = character rest * (clip rest^-1 * animated)
+     scale    = character rest * (animated / clip rest)
+   On the skeleton the clip was made for, this is the identity.
+   Some clips were keyed directly on one character's body while their file
+   keeps another rig's rest pose (silvbob, bethwalk, jugwalk...): their
+   bone positions already match that character, and offsetting them would
+   apply the difference twice. So a clip whose keyed positions sit closer
+   to the character's rest pose than to its file's is played as-is. */
+static int clip_keyed_on(const LibClip *c, const CharModel *m) {
+    float to_model = 0.0f, to_clip = 0.0f;
+    for (int ch = 0; ch < c->n_channels; ch++) {
+        int k = c->node[ch];
+        if (c->kind[ch] != 0 || k >= c->nodes || k >= m->node_count) continue;
+        const float *v = c->values[c->off[ch]];
+        for (int q = 0; q < 3; q++) {
+            to_model += fabsf(v[q] - m->node_t[k][q]);
+            to_clip += fabsf(v[q] - c->rest_t[k][q]);
+        }
+    }
+    return to_model < to_clip;
+}
+
+void anim_lib_sample_for(int i, float t, const CharModel *m, NodeOverride *overrides) {
     if (!lib_loaded(i)) { memset(overrides, 0, DAVID_MAX_NODES * sizeof(NodeOverride)); return; }
     LibClip *c = &g_lib[i];
     anim_sample_generic(t, overrides, c->duration, c->n_channels, c->node, c->kind, c->off, c->cnt, c->times, (const float (*)[4])c->values);
+    if (clip_keyed_on(c, m)) return;
+    int n = c->nodes < m->node_count ? c->nodes : m->node_count;
+    for (int k = 0; k < n; k++) {
+        NodeOverride *o = &overrides[k];
+        if (o->has_t) for (int q = 0; q < 3; q++) o->t[q] = m->node_t[k][q] + (o->t[q] - c->rest_t[k][q]);
+        if (o->has_r) {
+            const float *cr = c->rest_r[k];
+            float inv[4] = { -cr[0], -cr[1], -cr[2], cr[3] }, d[4];
+            quat_mul(inv, o->r, d);
+            quat_mul(m->node_r[k], d, o->r);
+        }
+        if (o->has_s) for (int q = 0; q < 3; q++) o->s[q] = m->node_s[k][q] * (fabsf(c->rest_s[k][q]) > 1e-6f ? o->s[q] / c->rest_s[k][q] : 1.0f);
+    }
 }
+void anim_lib_sample(int i, float t, NodeOverride *overrides) { anim_lib_sample_for(i, t, &g_david, overrides); }
 
 static void sample_named(const char *name, int *cache, float t, NodeOverride *overrides) {
     if (*cache == -2) *cache = anim_lib_find(name);

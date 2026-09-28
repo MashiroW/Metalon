@@ -91,7 +91,10 @@ int anim_lib_fits(int i, int node_count); /* 1 = usable on a skeleton of node_co
 float anim_lib_duration(int i);
 int anim_lib_channels(int i);
 int anim_lib_keys(int i);
-void anim_lib_sample(int i, float t, NodeOverride *overrides); /* all zero if unusable */
+void anim_lib_sample(int i, float t, NodeOverride *overrides); /* on David; all zero if unusable */
+/* on any character: the clip applied as offsets from the rest pose of the
+   skeleton it was made on (keeps the character's own proportions) */
+void anim_lib_sample_for(int i, float t, const CharModel *m, NodeOverride *overrides);
 /* David's own cycles: stand / walk / run from the library */
 void anim_sample_idle(float t, NodeOverride *overrides);
 void anim_sample_walk(float t, NodeOverride *overrides);

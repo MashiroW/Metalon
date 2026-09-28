@@ -4246,6 +4246,37 @@ static void anim_view_rects(HWND hwnd) {
 static int anim_rows_visible(void) { int n = (g_anim_list_rc.bottom - g_anim_list_rc.top) / ANIM_ROW_H; return n < 1 ? 1 : n; }
 static int anim_current_clip(void) { return (g_anim_filtered_count > 0 && g_anim_sel < g_anim_filtered_count) ? g_anim_filtered[g_anim_sel] : -1; }
 
+/* The clip list's scrollbar: drag the thumb, click (or hold) the track to
+   page towards the mouse, wheel anywhere over the list. */
+#define ANIM_SB_W 12
+#define ANIM_SB_TIMER_ID 3
+static int g_anim_sb_grab = 0;    /* thumb drag: mouse offset in the thumb */
+static int g_anim_sb_page = 0;    /* -1/+1 while the track is held */
+static int g_anim_sb_hover = 0;
+static int anim_sb_geom(RECT *track, RECT *thumb) {
+    int rows = anim_rows_visible();
+    if (g_anim_filtered_count <= rows) return 0;
+    *track = g_anim_list_rc; track->left = track->right - ANIM_SB_W;
+    int th = track->bottom - track->top;
+    int bh = th * rows / g_anim_filtered_count; if (bh < 24) bh = 24;
+    int by = track->top + (th - bh) * g_anim_scroll / (g_anim_filtered_count - rows);
+    *thumb = *track; thumb->top = by; thumb->bottom = by + bh;
+    return 1;
+}
+static void anim_scroll_to(int s) {
+    int maxs = g_anim_filtered_count - anim_rows_visible();
+    if (s > maxs) s = maxs;
+    if (s < 0) s = 0;
+    g_anim_scroll = s;
+}
+/* one page towards the mouse, until the thumb reaches it */
+static void anim_sb_page_step(void) {
+    RECT tr, tb;
+    if (!g_anim_sb_page || !anim_sb_geom(&tr, &tb)) return;
+    if ((g_anim_sb_page < 0 && g_mouse_y >= tb.top) || (g_anim_sb_page > 0 && g_mouse_y < tb.bottom)) return;
+    anim_scroll_to(g_anim_scroll + g_anim_sb_page * anim_rows_visible());
+}
+
 /* The clips shown for the current character: its own folder's first,
    then the shared ones of chars/anims, all with its skeleton. */
 static void anim_view_filter(void) {
@@ -4344,7 +4375,7 @@ static void render_char_view(const CharModel *m, int clip, float t, uint32_t *px
     if (m->vertex_count <= 0) return;
 
     NodeOverride ov[DAVID_MAX_NODES];
-    if (clip >= 0 && anim_lib_fits(clip, m->node_count)) anim_lib_sample(clip, t, ov);
+    if (clip >= 0 && anim_lib_fits(clip, m->node_count)) anim_lib_sample_for(clip, t, m, ov);
     else memset(ov, 0, sizeof(ov));
     static Mat4 mats[DAVID_MAX_JOINTS];
     skeleton_skin_matrices_for(m, ov, mats);
@@ -4626,15 +4657,15 @@ static void anim_view_paint(HWND hwnd, HDC hdc) {
         snprintf(t, sizeof(t), "%s%s", anim_lib_name(id), own ? "  (own)" : "");
         ui_text(hdc, g_anim_list_rc.left + 8, y, 190, ANIM_ROW_H, t, col, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
         snprintf(t, sizeof(t), "%.2fs", anim_lib_duration(id));
-        ui_text(hdc, g_anim_list_rc.right - 62, y, 54, ANIM_ROW_H, t, RGB(130, 130, 140), DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+        ui_text(hdc, g_anim_list_rc.right - 62 - ANIM_SB_W, y, 54, ANIM_ROW_H, t, RGB(130, 130, 140), DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
     }
     if (g_anim_filtered_count == 0) ui_text(hdc, g_anim_list_rc.left + 8, g_anim_list_rc.top + 6, 270, 40, "no clip for this skeleton", RGB(150, 150, 160), DT_LEFT | DT_WORDBREAK);
-    if (g_anim_filtered_count > rows) { /* scrollbar */
-        int th = g_anim_list_rc.bottom - g_anim_list_rc.top;
-        int bh = th * rows / g_anim_filtered_count; if (bh < 20) bh = 20;
-        int by = g_anim_list_rc.top + (th - bh) * g_anim_scroll / (g_anim_filtered_count - rows);
-        RECT sb = { g_anim_list_rc.right - 4, by, g_anim_list_rc.right, by + bh };
-        ui_fill(hdc, &sb, RGB(90, 90, 100));
+    RECT sb_track, sb_thumb;
+    if (anim_sb_geom(&sb_track, &sb_thumb)) { /* scrollbar */
+        ui_fill(hdc, &sb_track, RGB(30, 30, 38));
+        InflateRect(&sb_thumb, -2, -1);
+        int hot = g_anim_drag == 2 || g_anim_sb_hover;
+        ui_fill(hdc, &sb_thumb, g_anim_drag == 2 ? RGB(200, 170, 60) : hot ? RGB(140, 140, 155) : RGB(90, 90, 100));
     }
     /* stage */
     anim_render_stage(hdc, &g_anim_stage_rc);
@@ -4732,6 +4763,17 @@ static int anim_view_mouse_down(HWND hwnd, int x, int y, int dbl) {
     }
     int b = ui_hit(x, y);
     if (b != B_NONE) { anim_view_action(b); return 1; }
+    RECT tr, tb;
+    if (anim_sb_geom(&tr, &tb) && x >= tr.left && x < tr.right && y >= tr.top && y < tr.bottom) {
+        if (y >= tb.top && y < tb.bottom) { g_anim_drag = 2; g_anim_sb_grab = y - tb.top; }
+        else {
+            g_anim_sb_page = y < tb.top ? -1 : 1;
+            anim_sb_page_step();
+            SetTimer(hwnd, ANIM_SB_TIMER_ID, 350, NULL); /* then repeats while held */
+        }
+        SetCapture(hwnd);
+        return 1;
+    }
     if (x >= g_anim_list_rc.left && x < g_anim_list_rc.right && y >= g_anim_list_rc.top && y < g_anim_list_rc.bottom) {
         anim_select(g_anim_scroll + (y - g_anim_list_rc.top) / ANIM_ROW_H);
         return 1;
@@ -4744,6 +4786,17 @@ static int anim_view_mouse_down(HWND hwnd, int x, int y, int dbl) {
 static void anim_view_mouse_move(int x, int y) {
     g_mouse_x = x; g_mouse_y = y;
     if (g_picker) { g_pick_hover = pick_card_at(x, y); return; }
+    RECT tr, tb;
+    int has_sb = anim_sb_geom(&tr, &tb);
+    g_anim_sb_hover = has_sb && x >= tr.left && x < tr.right && y >= tb.top && y < tb.bottom;
+    if (g_anim_drag == 2) { /* thumb follows the mouse */
+        if (!has_sb) return;
+        int span = (tr.bottom - tr.top) - (tb.bottom - tb.top);
+        int maxs = g_anim_filtered_count - anim_rows_visible();
+        int pos = y - g_anim_sb_grab - tr.top;
+        anim_scroll_to(span > 0 ? (pos * maxs + span / 2) / span : 0);
+        return;
+    }
     if (!g_anim_drag) return;
     g_anim_yaw += (x - g_anim_drag_x) * 0.01f;
     g_anim_pitch += (y - g_anim_drag_y) * 0.006f;
@@ -4761,10 +4814,7 @@ static void anim_view_wheel(int x, int y, int delta) {
         return;
     }
     if (x >= g_anim_list_rc.left && x < g_anim_list_rc.right && y >= g_anim_list_rc.top && y < g_anim_list_rc.bottom) {
-        int rows = anim_rows_visible(), maxs = g_anim_filtered_count - rows;
-        g_anim_scroll -= (delta / 120) * 3;
-        if (g_anim_scroll > maxs) g_anim_scroll = maxs;
-        if (g_anim_scroll < 0) g_anim_scroll = 0;
+        anim_scroll_to(g_anim_scroll - (delta / 120) * 3);
         return;
     }
     g_anim_zoom *= powf(1.15f, delta / 120.0f);
@@ -5214,7 +5264,8 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             return 0;
         }
         case WM_LBUTTONUP: {
-            if (g_anim_drag) { g_anim_drag = 0; ReleaseCapture(); return 0; }
+            if (g_anim_sb_page) { g_anim_sb_page = 0; KillTimer(hwnd, ANIM_SB_TIMER_ID); ReleaseCapture(); InvalidateRect(hwnd, NULL, FALSE); return 0; }
+            if (g_anim_drag) { g_anim_drag = 0; ReleaseCapture(); InvalidateRect(hwnd, NULL, FALSE); return 0; }
             if (g_drag != DRAG_NONE) {
                 int rx, ry;
                 client_to_room_point(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam), &rx, &ry);
@@ -5253,7 +5304,12 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             break;
         }
         case WM_TIMER: {
-            if (0) {
+            if (wParam == ANIM_SB_TIMER_ID) {
+                if (!g_anim_sb_page) { KillTimer(hwnd, ANIM_SB_TIMER_ID); return 0; }
+                SetTimer(hwnd, ANIM_SB_TIMER_ID, 60, NULL);
+                anim_view_layout(hwnd);
+                anim_sb_page_step();
+                InvalidateRect(hwnd, NULL, FALSE);
             } else if (wParam == GAME_TIMER_ID) {
                 /* fallback while Windows runs a modal loop (menus, window
                    drag): the main loop normally ticks every display frame */
