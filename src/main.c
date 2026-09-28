@@ -3260,7 +3260,7 @@ enum {
     B_WALK, B_HITBOX, B_MESH, B_COLL, B_FULL,
     B_EDIT, B_T_SELECT, B_T_RECT, B_T_CIRCLE, B_T_POLY, B_UNDO, B_DELETE,
     B_R_RED, B_R_GREEN, B_R_FG, B_R_DOOR, B_R_REDO, B_R_RETARGET, B_W_CANCEL, B_SETTINGS, B_SET_RESET,
-    B_ANIMS, B_AV_PREV, B_AV_PLAY, B_AV_NEXT, B_AV_STEPB, B_AV_STEPF, B_AV_SLOWER, B_AV_FASTER, B_AV_FOLLOW, B_AV_RESET, B_AV_CLOSE,
+    B_ANIMS, B_AV_MODEL, B_AV_PREV, B_AV_PLAY, B_AV_NEXT, B_AV_STEPB, B_AV_STEPF, B_AV_SLOWER, B_AV_FASTER, B_AV_FOLLOW, B_AV_RESET, B_AV_CLOSE,
     B_SET_BASE = 100 /* + 2*i (-), + 2*i+1 (+) */
 };
 typedef struct { int id; RECT r; const char *label; const char *key; const char *desc; int on; int enabled; int kind; } UiButton;
@@ -3478,7 +3478,7 @@ static void ui_action(HWND hwnd, int id) {
         case B_R_RETARGET: if (g_sel >= 0 && g_shapes[g_sel].door) { g_wiz_shape = g_sel; g_wiz_repick_only = 0; g_wiz_other_side = 0; wizard_open_target_list(); } break;
         case B_SETTINGS: g_show_settings = !g_show_settings; break;
         case B_ANIMS: anim_view_toggle(); break;
-        case B_AV_PREV: case B_AV_PLAY: case B_AV_NEXT: case B_AV_STEPB: case B_AV_STEPF:
+        case B_AV_MODEL: case B_AV_PREV: case B_AV_PLAY: case B_AV_NEXT: case B_AV_STEPB: case B_AV_STEPF:
         case B_AV_SLOWER: case B_AV_FASTER: case B_AV_FOLLOW: case B_AV_RESET: case B_AV_CLOSE:
             anim_view_action(id); break;
         case B_SET_RESET: {
@@ -4132,13 +4132,15 @@ static HCURSOR cursor_for(int cx, int cy) {
 }
 
 /* =====================================================================
-   ANIMATION VIEWER (A)
-   Every clip of the blockouts' chars folder that fits David's rig (baked by
-   loaded from assets/chars/anims and assets/chars/david), played on David,
-   big, in a studio view: searchable list on the left, stage on the
-   right (drag = rotate, wheel = zoom), playback buttons + shortcuts.
+   ANIMATION VIEWER (A) + CHARACTER PICKER (Tab)
+   A character of assets/chars (David by default) playing the clips made
+   for its skeleton: its own folder's clips first, then the shared ones
+   of chars/anims with the same skeleton. Big studio view: searchable
+   list on the left, stage on the right (drag = rotate, wheel = zoom),
+   playback buttons + shortcuts. The picker shows every character as a
+   card with a 3D preview (grid, mouse or keyboard).
    ===================================================================== */
-static int g_anim_sel = 0, g_anim_scroll = 0, g_anim_paused = 0, g_anim_follow = 1, g_anim_lib_n = -1;
+static int g_anim_sel = 0, g_anim_scroll = 0, g_anim_paused = 0, g_anim_follow = 1;
 static float g_anim_t = 0.0f, g_anim_speed = 1.0f;
 #define ANIM_DEFAULT_YAW 3.74f /* front three-quarter view */
 static float g_anim_yaw = ANIM_DEFAULT_YAW, g_anim_pitch = 0.15f, g_anim_zoom = 1.0f;
@@ -4149,23 +4151,114 @@ static int g_anim_drag = 0, g_anim_drag_x = 0, g_anim_drag_y = 0;
 static int g_anim_skip_char = 0; /* the WM_CHAR of the key that opened the viewer */
 static RECT g_anim_list_rc, g_anim_stage_rc;
 #define ANIM_ROW_H 20
-/* ANIM_LIB_PATH: see the turn-starts, near David's speeds */
+static CharModel *g_view_model = &g_david; /* the character shown */
 
-#define ANIM_BUTTONS_W 960 /* total width of the button row */
+/* ---- characters of assets/chars (scanned the first time the picker opens) ---- */
+typedef struct {
+    CharModel model;
+    int own_clips;          /* .gltf files in its folder besides the model */
+    int preview_clip;       /* clip used for its card (-1: rest pose) */
+    uint32_t *preview;      /* cached card picture, PICK_PW x PICK_PH */
+} PickEntry;
+static PickEntry *g_pick = NULL;
+static int g_pick_count = 0, g_pick_scanned = 0;
+static int g_picker = 0;                     /* picker screen shown (inside the viewer) */
+static int g_pick_sel = 0, g_pick_scroll = 0, g_pick_hover = -1;
+static char g_pick_filter[32] = "";
+static int g_pick_filter_len = 0;
+static int g_pick_filtered[512], g_pick_filtered_count = 0;
+static RECT g_pick_grid_rc;
+static int g_mouse_x = 0, g_mouse_y = 0;
+#define PICK_PW 176
+#define PICK_PH 176
+#define PICK_CARD_H (PICK_PH + 40)
+#define PICK_GAP 12
+
+static int g_anim_view_lib_n = 0;
+static void anim_view_filter(void);
+
+static int pick_name_cmp(const void *a, const void *b) { return strcmp(((const PickEntry *)a)->model.name, ((const PickEntry *)b)->model.name); }
+
+/* Every folder of assets/chars holding a skinned character <name>/<name>.gltf
+   (not the shared clips, the items, nor the 4-6 bone props: weapons, keys...). */
+static void pick_scan(void) {
+    if (g_pick_scanned) return;
+    g_pick_scanned = 1;
+    char pat[1024];
+    root_path(pat, sizeof(pat), "assets/chars/*");
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(pat, &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    int cap = 0;
+    do {
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || fd.cFileName[0] == '.') continue;
+        if (!_stricmp(fd.cFileName, "anims") || !_stricmp(fd.cFileName, "items")) continue;
+        char dir[1024];
+        root_path(dir, sizeof(dir), "assets/chars/%s", fd.cFileName);
+        if (g_pick_count == cap) { cap = cap ? cap * 2 : 256; g_pick = (PickEntry *)realloc(g_pick, sizeof(PickEntry) * cap); }
+        PickEntry *e = &g_pick[g_pick_count];
+        memset(e, 0, sizeof(*e));
+        char lower[64]; snprintf(lower, sizeof(lower), "%s", fd.cFileName);
+        for (char *q = lower; *q; q++) if (*q >= 'A' && *q <= 'Z') *q += 32;
+        if (!char_model_load(&e->model, dir, lower) || e->model.node_count <= 6) { char_model_free(&e->model); continue; }
+        /* its own clips join the library (David's are in it already) */
+        e->own_clips = strcmp(lower, "david") ? anim_lib_add_dir(dir, lower) : 0;
+        g_pick_count++;
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+    qsort(g_pick, g_pick_count, sizeof(PickEntry), pick_name_cmp);
+    for (int i = 0; i < g_pick_count; i++) {
+        PickEntry *e = &g_pick[i];
+        if (!strcmp(e->model.name, "david")) {
+            for (int k = 0; k < anim_lib_count(); k++) if (!strcmp(anim_lib_source(k), "david")) e->own_clips++;
+        }
+        e->preview_clip = -2; /* chosen on first draw */
+    }
+    g_anim_view_lib_n = anim_lib_count();
+}
+
+/* A standing pose for the card: an own clip named like an idle, the shared
+   "stand" when it fits, else the first own clip, else the rest pose. */
+static int pick_preview_clip(const PickEntry *e) {
+    const CharModel *m = &e->model;
+    static const char *idle[] = { "stand", "idle", "still", "bob", "wait" };
+    int first_own = -1;
+    for (int k = 0; k < anim_lib_count(); k++) {
+        if (strcmp(anim_lib_source(k), m->name)) continue;
+        if (!anim_lib_fits(k, m->node_count)) continue;
+        if (first_own < 0) first_own = k;
+        for (int q = 0; q < 5; q++) if (strstr(anim_lib_name(k), idle[q])) return k;
+    }
+    int st = anim_lib_find("stand");
+    if (anim_lib_fits(st, m->node_count)) return st;
+    return first_own;
+}
+
+static void anim_view_rects(HWND hwnd);
+#define ANIM_BUTTONS_W 1090 /* total width of the button row */
 static void anim_view_rects(HWND hwnd) {
     RECT rc; GetClientRect(hwnd, &rc);
     int two_rows = (rc.right - 10 - 300) < ANIM_BUTTONS_W;
     SetRect(&g_anim_list_rc, 10, 64, 290, rc.bottom - 10);
     SetRect(&g_anim_stage_rc, 300, 44, rc.right - 10, rc.bottom - (two_rows ? 94 : 60));
+    SetRect(&g_pick_grid_rc, 12, 72, rc.right - 12, rc.bottom - 12);
 }
 static int anim_rows_visible(void) { int n = (g_anim_list_rc.bottom - g_anim_list_rc.top) / ANIM_ROW_H; return n < 1 ? 1 : n; }
 static int anim_current_clip(void) { return (g_anim_filtered_count > 0 && g_anim_sel < g_anim_filtered_count) ? g_anim_filtered[g_anim_sel] : -1; }
 
+/* The clips shown for the current character: its own folder's first,
+   then the shared ones of chars/anims, all with its skeleton. */
 static void anim_view_filter(void) {
     int keep = anim_current_clip();
+    const CharModel *m = g_view_model;
     g_anim_filtered_count = 0;
-    for (int i = 0; i < g_anim_lib_n && g_anim_filtered_count < 4096; i++)
-        if ((!g_anim_filter[0] || ci_strstr(anim_lib_name(i), g_anim_filter)) && anim_lib_ready(i)) g_anim_filtered[g_anim_filtered_count++] = i;
+    for (int pass = 0; pass < 2; pass++)
+        for (int i = 0; i < anim_lib_count() && g_anim_filtered_count < 4096; i++) {
+            const char *src = anim_lib_source(i);
+            if (pass == 0 ? strcmp(src, m->name) != 0 : strcmp(src, "anims") != 0) continue;
+            if (g_anim_filter[0] && !ci_strstr(anim_lib_name(i), g_anim_filter)) continue;
+            if (anim_lib_fits(i, m->node_count)) g_anim_filtered[g_anim_filtered_count++] = i;
+        }
     g_anim_sel = 0;
     for (int k = 0; k < g_anim_filtered_count; k++) if (g_anim_filtered[k] == keep) g_anim_sel = k;
     g_anim_scroll = 0;
@@ -4182,15 +4275,15 @@ static void anim_select(int k) {
 }
 static void anim_view_toggle(void) {
     if (g_anim_view) { g_anim_view = 0; return; }
-    if (g_anim_lib_n < 0) g_anim_lib_n = anim_lib_count();
-    if (g_anim_lib_n <= 0) { snprintf(g_status, sizeof(g_status), "no animations found in assets/chars/anims"); return; }
+    if (anim_lib_count() <= 0) { snprintf(g_status, sizeof(g_status), "no animations found in assets/chars/anims"); return; }
     g_map_mode = 0;
     g_anim_view = 1;
+    g_picker = 0;
     anim_view_filter();
     ClipCursor(NULL); g_clip_active = 0;
 }
 
-/* ---- the stage: David skinned + lit + textured into a 32-bit DIB ---- */
+/* ---- rendering a character: skinned + lit + textured into 32-bit pixels ---- */
 static void anim_px_line(uint32_t *px, int W, int H, float x0, float y0, float x1, float y1, uint32_t col) {
     int n = (int)(fmaxf(fabsf(x1 - x0), fabsf(y1 - y0))) + 1;
     if (n > 4000) n = 4000;
@@ -4199,7 +4292,7 @@ static void anim_px_line(uint32_t *px, int W, int H, float x0, float y0, float x
         if (x >= 0 && y >= 0 && x < W && y < H) px[(size_t)y * W + x] = col;
     }
 }
-static void anim_raster_tri(uint32_t *px, float *zb, int W, int H, const float *sx, const float *sy, const float *sz,
+static void anim_raster_tri(const CharModel *m, uint32_t *px, float *zb, int W, int H, const float *sx, const float *sy, const float *sz,
                             const float *u, const float *v, float shade) {
     int minx = (int)floorf(fminf(sx[0], fminf(sx[1], sx[2]))), maxx = (int)ceilf(fmaxf(sx[0], fmaxf(sx[1], sx[2])));
     int miny = (int)floorf(fminf(sy[0], fminf(sy[1], sy[2]))), maxy = (int)ceilf(fmaxf(sy[0], fmaxf(sy[1], sy[2])));
@@ -4223,10 +4316,10 @@ static void anim_raster_tri(uint32_t *px, float *zb, int W, int H, const float *
         float tv = (w0 * v[0] / sz[0] + w1 * v[1] / sz[1] + w2 * v[2] / sz[2]) * z;
         int iu = (int)tu, iv = (int)tv;
         if (iu < 0) iu = 0;
-        if (iu >= DAVID_TEX_W) iu = DAVID_TEX_W - 1;
+        if (iu >= m->tex_w) iu = m->tex_w - 1;
         if (iv < 0) iv = 0;
-        if (iv >= DAVID_TEX_H) iv = DAVID_TEX_H - 1;
-        const uint8_t *c = DAVID_TEXEL(iv, iu);
+        if (iv >= m->tex_h) iv = m->tex_h - 1;
+        const uint8_t *c = m->tex_rgb + ((size_t)iv * m->tex_w + iu) * 3;
         int r = (int)(c[0] * shade), g = (int)(c[1] * shade), b = (int)(c[2] * shade);
         if (r > 255) r = 255;
         if (g > 255) g = 255;
@@ -4235,17 +4328,10 @@ static void anim_raster_tri(uint32_t *px, float *zb, int W, int H, const float *
     }
 }
 
-static void anim_render_stage(HDC hdc, const RECT *r) {
-    int W = r->right - r->left, H = r->bottom - r->top;
-    if (W < 16 || H < 16) return;
-    BITMAPINFO bi; memset(&bi, 0, sizeof(bi));
-    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    bi.bmiHeader.biWidth = W; bi.bmiHeader.biHeight = -H;
-    bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32; bi.bmiHeader.biCompression = BI_RGB;
-    void *bits = NULL;
-    HBITMAP dib = CreateDIBSection(hdc, &bi, DIB_RGB_COLORS, &bits, NULL, 0);
-    if (!dib || !bits) return;
-    uint32_t *px = (uint32_t *)bits;
+/* `m` posed by `clip` at time t (rest pose if clip < 0), orbit camera
+   (yaw/pitch/zoom); follow = frame the whole body, grid = floor grid. */
+static void render_char_view(const CharModel *m, int clip, float t, uint32_t *px, int W, int H,
+                             float yaw, float pitch, float zoom, int follow, int grid) {
     static float *zb = NULL; static size_t zbn = 0;
     size_t npx = (size_t)W * H;
     if (zbn < npx) { free(zb); zb = (float *)malloc(npx * sizeof(float)); zbn = npx; }
@@ -4255,56 +4341,57 @@ static void anim_render_stage(HDC hdc, const RECT *r) {
         for (int x = 0; x < W; x++) px[(size_t)y * W + x] = col;
     }
     for (size_t i = 0; i < npx; i++) zb[i] = 1e30f;
+    if (m->vertex_count <= 0) return;
 
-    /* pose */
     NodeOverride ov[DAVID_MAX_NODES];
-    anim_lib_sample(anim_current_clip(), g_anim_t, ov);
+    if (clip >= 0 && anim_lib_fits(clip, m->node_count)) anim_lib_sample(clip, t, ov);
+    else memset(ov, 0, sizeof(ov));
     static Mat4 mats[DAVID_MAX_JOINTS];
-    skeleton_compute_skin_matrices(ov, mats);
+    skeleton_skin_matrices_for(m, ov, mats);
     static float sk[DAVID_MAX_VERTS][3];
-    float cxs = 0, czs = 0, ymin = 1e9f, ymax = -1e9f;
-    for (int vi = 0; vi < DAVID_VERTEX_COUNT; vi++) {
+    float cxs = 0, czs = 0, ymin = 1e9f, ymax = -1e9f, xmin = 1e9f, xmax = -1e9f, zmin = 1e9f, zmax = -1e9f;
+    for (int vi = 0; vi < m->vertex_count; vi++) {
         float acc[3] = { 0, 0, 0 };
         for (int k = 0; k < 4; k++) {
-            float w = david_weights[vi][k];
+            float w = m->weights[vi][k];
             if (w <= 0) continue;
-            float sp[3]; mat4_vec3(&mats[david_joints_idx[vi][k]], david_positions[vi], sp);
+            float sp[3]; mat4_vec3(&mats[m->joints_idx[vi][k]], m->positions[vi], sp);
             acc[0] += sp[0] * w; acc[1] += sp[1] * w; acc[2] += sp[2] * w;
         }
         memcpy(sk[vi], acc, sizeof(acc));
         cxs += acc[0]; czs += acc[2];
         ymin = fminf(ymin, acc[1]); ymax = fmaxf(ymax, acc[1]);
+        xmin = fminf(xmin, acc[0]); xmax = fmaxf(xmax, acc[0]); zmin = fminf(zmin, acc[2]); zmax = fmaxf(zmax, acc[2]);
     }
-    /* camera: orbits a target; "follow" keeps David centred when a clip
-       moves him (root motion), "fixed" shows the motion over the grid */
+    /* camera: orbits a target; "follow" keeps the character centred (a
+       clip that moves it, big creatures), "fixed" shows motion over the grid */
     float tx = 0, tz = 0, ty = 0.95f, body_h = 1.93f;
     if (!(ymax - ymin < 1e6f)) { ymin = 0; ymax = 1.93f; cxs = czs = 0; } /* broken data guard */
-    if (g_anim_follow) {
-        tx = cxs / DAVID_VERTEX_COUNT; tz = czs / DAVID_VERTEX_COUNT;
+    if (follow) {
+        tx = cxs / m->vertex_count; tz = czs / m->vertex_count;
         ty = (ymin + ymax) * 0.5f;
-        body_h = fmaxf(1.93f, ymax - ymin);
+        float span = fmaxf(ymax - ymin, 0.8f * fmaxf(xmax - xmin, zmax - zmin));
+        body_h = fmaxf(0.5f, span);
     }
-    float D = 2.3f * body_h / g_anim_zoom, f = H * 1.15f;
-    float cyw = cosf(g_anim_yaw), syw = sinf(g_anim_yaw), cp = cosf(g_anim_pitch), spp = sinf(g_anim_pitch);
+    float D = 2.3f * body_h / zoom, f = H * 1.15f;
+    float cyw = cosf(yaw), syw = sinf(yaw), cp = cosf(pitch), spp = sinf(pitch);
     #define ANIM_PROJ(wx, wy, wz, ox, oy, oz) do { \
         float x_ = (wx) - tx, y_ = (wy) - ty, z_ = (wz) - tz; \
         float xr = x_ * cyw + z_ * syw, zr = -x_ * syw + z_ * cyw; \
         float yr = y_ * cp - zr * spp, zz = y_ * spp + zr * cp; \
         (oz) = D - zz; (ox) = W * 0.5f + f * xr / (oz); (oy) = H * 0.5f - f * yr / (oz); } while (0)
-    /* ground grid (world-fixed, 0.5 units) */
-    float g0x = floorf(tx) - 4.0f, g0z = floorf(tz) - 4.0f;
-    for (int i = 0; i <= 16; i++) {
-        float a = i * 0.5f;
-        uint32_t col = (i % 2 == 0) ? 0x50525E : 0x3A3C46;
-        float ax, ay, az, bx, by, bz;
-        ANIM_PROJ(g0x + a, 0.0f, g0z, ax, ay, az); ANIM_PROJ(g0x + a, 0.0f, g0z + 8.0f, bx, by, bz);
-        if (az > 0.2f && bz > 0.2f) anim_px_line(px, W, H, ax, ay, bx, by, col);
-        ANIM_PROJ(g0x, 0.0f, g0z + a, ax, ay, az); ANIM_PROJ(g0x + 8.0f, 0.0f, g0z + a, bx, by, bz);
-        if (az > 0.2f && bz > 0.2f) anim_px_line(px, W, H, ax, ay, bx, by, col);
-    }
-    /* soft shadow under him */
-    {
-        float scx = cxs / DAVID_VERTEX_COUNT, scz = czs / DAVID_VERTEX_COUNT;
+    if (grid) { /* ground grid (world-fixed, 0.5 units) + soft shadow */
+        float g0x = floorf(tx) - 4.0f, g0z = floorf(tz) - 4.0f;
+        for (int i = 0; i <= 16; i++) {
+            float a = i * 0.5f;
+            uint32_t col = (i % 2 == 0) ? 0x50525E : 0x3A3C46;
+            float ax, ay, az, bx, by, bz;
+            ANIM_PROJ(g0x + a, 0.0f, g0z, ax, ay, az); ANIM_PROJ(g0x + a, 0.0f, g0z + 8.0f, bx, by, bz);
+            if (az > 0.2f && bz > 0.2f) anim_px_line(px, W, H, ax, ay, bx, by, col);
+            ANIM_PROJ(g0x, 0.0f, g0z + a, ax, ay, az); ANIM_PROJ(g0x + 8.0f, 0.0f, g0z + a, bx, by, bz);
+            if (az > 0.2f && bz > 0.2f) anim_px_line(px, W, H, ax, ay, bx, by, col);
+        }
+        float scx = cxs / m->vertex_count, scz = czs / m->vertex_count;
         for (int ring = 6; ring >= 1; ring--) {
             float rr = 0.08f * ring, lx = 0, ly = 0, lz = 0; int first = 1;
             for (int k = 0; k <= 24; k++) {
@@ -4315,12 +4402,11 @@ static void anim_render_stage(HDC hdc, const RECT *r) {
             }
         }
     }
-    /* David: textured, simple two-light shading */
     static float vx[DAVID_MAX_VERTS], vy[DAVID_MAX_VERTS], vz[DAVID_MAX_VERTS];
-    for (int vi = 0; vi < DAVID_VERTEX_COUNT; vi++) ANIM_PROJ(sk[vi][0], sk[vi][1], sk[vi][2], vx[vi], vy[vi], vz[vi]);
+    for (int vi = 0; vi < m->vertex_count; vi++) ANIM_PROJ(sk[vi][0], sk[vi][1], sk[vi][2], vx[vi], vy[vi], vz[vi]);
     const float L[3] = { -0.45f, 0.75f, 0.48f };
-    for (int t = 0; t < DAVID_INDEX_COUNT / 3; t++) {
-        int i0 = david_indices[t * 3], i1 = david_indices[t * 3 + 1], i2 = david_indices[t * 3 + 2];
+    for (int tr = 0; tr < m->index_count / 3; tr++) {
+        int i0 = m->indices[tr * 3], i1 = m->indices[tr * 3 + 1], i2 = m->indices[tr * 3 + 2];
         if (vz[i0] < 0.1f || vz[i1] < 0.1f || vz[i2] < 0.1f) continue;
         float e1[3] = { sk[i1][0] - sk[i0][0], sk[i1][1] - sk[i0][1], sk[i1][2] - sk[i0][2] };
         float e2[3] = { sk[i2][0] - sk[i0][0], sk[i2][1] - sk[i0][1], sk[i2][2] - sk[i0][2] };
@@ -4329,25 +4415,153 @@ static void anim_render_stage(HDC hdc, const RECT *r) {
         float d = nl > 1e-9f ? fabsf((n[0] * L[0] + n[1] * L[1] + n[2] * L[2]) / nl) : 0.5f;
         float shade = 0.55f + 0.65f * d;
         float sx3[3] = { vx[i0], vx[i1], vx[i2] }, sy3[3] = { vy[i0], vy[i1], vy[i2] }, sz3[3] = { vz[i0], vz[i1], vz[i2] };
-        float u3[3] = { david_uvs_px[i0][0], david_uvs_px[i1][0], david_uvs_px[i2][0] };
-        float v3[3] = { david_uvs_px[i0][1], david_uvs_px[i1][1], david_uvs_px[i2][1] };
-        anim_raster_tri(px, zb, W, H, sx3, sy3, sz3, u3, v3, shade);
+        float u3[3] = { m->uvs_px[i0][0], m->uvs_px[i1][0], m->uvs_px[i2][0] };
+        float v3[3] = { m->uvs_px[i0][1], m->uvs_px[i1][1], m->uvs_px[i2][1] };
+        anim_raster_tri(m, px, zb, W, H, sx3, sy3, sz3, u3, v3, shade);
     }
     #undef ANIM_PROJ
-    HDC mdc = CreateCompatibleDC(hdc);
-    HBITMAP old = (HBITMAP)SelectObject(mdc, dib);
-    BitBlt(hdc, r->left, r->top, W, H, mdc, 0, 0, SRCCOPY);
-    SelectObject(mdc, old);
-    DeleteDC(mdc);
-    DeleteObject(dib);
+}
+
+/* 32-bit top-down pixels -> screen */
+static void blit_pixels(HDC hdc, int x, int y, int W, int H, const uint32_t *px) {
+    BITMAPINFO bi; memset(&bi, 0, sizeof(bi));
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth = W; bi.bmiHeader.biHeight = -H;
+    bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32; bi.bmiHeader.biCompression = BI_RGB;
+    SetDIBitsToDevice(hdc, x, y, W, H, 0, 0, 0, H, px, &bi, DIB_RGB_COLORS);
+}
+
+static void anim_render_stage(HDC hdc, const RECT *r) {
+    int W = r->right - r->left, H = r->bottom - r->top;
+    if (W < 16 || H < 16) return;
+    static uint32_t *px = NULL; static size_t cap = 0;
+    if (cap < (size_t)W * H) { free(px); px = (uint32_t *)malloc((size_t)W * H * 4); cap = (size_t)W * H; }
+    render_char_view(g_view_model, anim_current_clip(), g_anim_t, px, W, H, g_anim_yaw, g_anim_pitch, g_anim_zoom, g_anim_follow, 1);
+    blit_pixels(hdc, r->left, r->top, W, H, px);
+}
+
+/* ---- picker ---- */
+static int pick_cols(void) { int w = g_pick_grid_rc.right - g_pick_grid_rc.left; int c = (w + PICK_GAP) / (PICK_PW + PICK_GAP); return c < 1 ? 1 : c; }
+static int pick_rows_visible(void) { int h = g_pick_grid_rc.bottom - g_pick_grid_rc.top; int r = (h + PICK_GAP) / (PICK_CARD_H + PICK_GAP); return r < 1 ? 1 : r; }
+static void pick_filter(void) {
+    int keep = (g_pick_filtered_count > 0 && g_pick_sel < g_pick_filtered_count) ? g_pick_filtered[g_pick_sel] : -1;
+    g_pick_filtered_count = 0;
+    for (int i = 0; i < g_pick_count && g_pick_filtered_count < 512; i++)
+        if (!g_pick_filter[0] || ci_strstr(g_pick[i].model.name, g_pick_filter)) g_pick_filtered[g_pick_filtered_count++] = i;
+    g_pick_sel = 0;
+    for (int k = 0; k < g_pick_filtered_count; k++) if (g_pick_filtered[k] == keep) g_pick_sel = k;
+    g_pick_scroll = 0;
+}
+static void pick_select(int k) {
+    if (g_pick_filtered_count <= 0) return;
+    if (k < 0) k = 0;
+    if (k >= g_pick_filtered_count) k = g_pick_filtered_count - 1;
+    g_pick_sel = k;
+    int cols = pick_cols(), rows = pick_rows_visible(), row = k / cols;
+    if (row < g_pick_scroll) g_pick_scroll = row;
+    if (row >= g_pick_scroll + rows) g_pick_scroll = row - rows + 1;
+}
+static void picker_open(void) {
+    pick_scan();
+    g_picker = 1;
+    g_pick_filter[0] = 0; g_pick_filter_len = 0;
+    pick_filter();
+    for (int k = 0; k < g_pick_filtered_count; k++) /* start on the character shown */
+        if (!strcmp(g_pick[g_pick_filtered[k]].model.name, g_view_model->name)) { pick_select(k); break; }
+}
+/* Opens the animation menu with the chosen character. */
+static void picker_choose(void) {
+    if (g_pick_filtered_count <= 0) return;
+    PickEntry *e = &g_pick[g_pick_filtered[g_pick_sel]];
+    g_view_model = !strcmp(e->model.name, "david") ? &g_david : &e->model;
+    g_picker = 0;
+    g_anim_filter[0] = 0; g_anim_filter_len = 0;
+    g_anim_sel = 0; g_anim_t = 0.0f;
+    g_anim_filtered_count = 0;
+    anim_view_filter();
+    int pv = e->preview_clip >= 0 ? e->preview_clip : -1; /* start on its standing clip */
+    for (int k = 0; k < g_anim_filtered_count; k++) if (g_anim_filtered[k] == pv) { anim_select(k); break; }
+    g_anim_yaw = ANIM_DEFAULT_YAW; g_anim_pitch = 0.15f; g_anim_zoom = 1.0f;
+}
+static int pick_card_at(int x, int y) {
+    if (x < g_pick_grid_rc.left || y < g_pick_grid_rc.top || x >= g_pick_grid_rc.right || y >= g_pick_grid_rc.bottom) return -1;
+    int cols = pick_cols();
+    int cx = (x - g_pick_grid_rc.left) / (PICK_PW + PICK_GAP), cy = (y - g_pick_grid_rc.top) / (PICK_CARD_H + PICK_GAP);
+    int ox = (x - g_pick_grid_rc.left) % (PICK_PW + PICK_GAP), oy = (y - g_pick_grid_rc.top) % (PICK_CARD_H + PICK_GAP);
+    if (cx >= cols || ox >= PICK_PW || oy >= PICK_CARD_H) return -1;
+    int k = (g_pick_scroll + cy) * cols + cx;
+    return k < g_pick_filtered_count ? k : -1;
+}
+
+static void picker_paint(HWND hwnd, HDC hdc) {
+    RECT rc; GetClientRect(hwnd, &rc);
+    ui_fill(hdc, &rc, RGB(14, 14, 18));
+    HFONT fh = ui_font(20, 1), fn = ui_font(14, 0), fs = ui_font(12, 1);
+    char t[200];
+    SelectObject(hdc, fh);
+    snprintf(t, sizeof(t), "Choose a character  (%d / %d)", g_pick_filtered_count, g_pick_count);
+    ui_text(hdc, 12, 10, 600, 26, t, RGB(255, 225, 120), DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    SelectObject(hdc, fn);
+    snprintf(t, sizeof(t), "filter: %s_", g_pick_filter);
+    ui_text(hdc, 12, 40, 300, 18, t, RGB(200, 200, 200), DT_LEFT | DT_SINGLELINE);
+    SelectObject(hdc, fs);
+    ui_text(hdc, rc.right - 760, 14, 748, 16, "ARROWS / CLICK = SELECT   ENTER / DOUBLE-CLICK = OPEN   TYPE = FILTER   WHEEL = SCROLL   ESC = BACK",
+            RGB(120, 150, 190), DT_RIGHT | DT_SINGLELINE);
+    int cols = pick_cols(), rows = pick_rows_visible();
+    static uint32_t live[PICK_PW * PICK_PH];
+    for (int r = 0; r < rows + 1; r++) for (int cidx = 0; cidx < cols; cidx++) {
+        int k = (g_pick_scroll + r) * cols + cidx;
+        if (k >= g_pick_filtered_count) break;
+        int x = g_pick_grid_rc.left + cidx * (PICK_PW + PICK_GAP), y = g_pick_grid_rc.top + r * (PICK_CARD_H + PICK_GAP);
+        if (y + PICK_CARD_H > g_pick_grid_rc.bottom) break;
+        PickEntry *e = &g_pick[g_pick_filtered[k]];
+        if (e->preview_clip == -2) e->preview_clip = pick_preview_clip(e);
+        const uint32_t *img;
+        if (k == g_pick_sel) { /* selected: alive, turning slowly */
+            float dur = anim_lib_duration(e->preview_clip);
+            float tt = dur > 0 ? fmodf(g_anim_t, dur) : 0.0f;
+            render_char_view(&e->model, e->preview_clip, tt, live, PICK_PW, PICK_PH, ANIM_DEFAULT_YAW + g_anim_t * 0.6f, 0.15f, 1.0f, 1, 0);
+            img = live;
+        } else {
+            if (!e->preview) {
+                e->preview = (uint32_t *)malloc(PICK_PW * PICK_PH * 4);
+                render_char_view(&e->model, e->preview_clip, 0.0f, e->preview, PICK_PW, PICK_PH, ANIM_DEFAULT_YAW, 0.15f, 1.0f, 1, 0);
+            }
+            img = e->preview;
+        }
+        RECT card = { x - 2, y - 2, x + PICK_PW + 2, y + PICK_CARD_H + 2 };
+        int cur = (e->model.name[0] && !strcmp(e->model.name, g_view_model->name));
+        ui_fill(hdc, &card, k == g_pick_sel ? RGB(70, 58, 12) : k == g_pick_hover ? RGB(44, 44, 54) : RGB(26, 26, 32));
+        blit_pixels(hdc, x, y, PICK_PW, PICK_PH, img);
+        if (k == g_pick_sel) ui_frame(hdc, &card, RGB(255, 210, 60));
+        else if (k == g_pick_hover) ui_frame(hdc, &card, RGB(150, 150, 165));
+        SelectObject(hdc, ui_font(15, 1));
+        ui_text(hdc, x + 6, y + PICK_PH + 2, PICK_PW - 12, 18, e->model.name, k == g_pick_sel ? RGB(255, 230, 90) : RGB(235, 235, 240), DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
+        SelectObject(hdc, fn);
+        snprintf(t, sizeof(t), "%d bones  |  %d own clips%s", e->model.node_count, e->own_clips, cur ? "  |  shown" : "");
+        ui_text(hdc, x + 6, y + PICK_PH + 20, PICK_PW - 12, 16, t, RGB(140, 140, 150), DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
+    }
+    int total_rows = (g_pick_filtered_count + cols - 1) / cols;
+    if (total_rows > rows) { /* scrollbar */
+        int th = g_pick_grid_rc.bottom - g_pick_grid_rc.top;
+        int bh = th * rows / total_rows; if (bh < 24) bh = 24;
+        int by = g_pick_grid_rc.top + (th - bh) * g_pick_scroll / (total_rows - rows);
+        RECT sb = { rc.right - 7, by, rc.right - 3, by + bh };
+        ui_fill(hdc, &sb, RGB(90, 90, 100));
+    }
+    SelectObject(hdc, GetStockObject(SYSTEM_FONT));
 }
 
 /* buttons under the stage (hover descriptions + shortcuts like the rest) */
 static void anim_view_layout(HWND hwnd) {
     anim_view_rects(hwnd);
     g_btn_count = 0;
+    if (g_picker) return;
     int x = g_anim_stage_rc.left, y = g_anim_stage_rc.bottom + 12, h = 28, gap = 6;
+    static char model_lbl[64];
+    snprintf(model_lbl, sizeof(model_lbl), "Model: %s", g_view_model->name);
     struct { int id, w; const char *label, *key, *desc; int on; } b[] = {
+        { B_AV_MODEL, 130, model_lbl, "Tab", "Choose another character of the game (grid with previews).", 0 },
         { B_AV_PREV, 92, "< Prev", "Up", "Previous animation in the list.", 0 },
         { B_AV_PLAY, 104, g_anim_paused ? "Play" : "Pause", "Space", "Play / pause the animation (it loops).", g_anim_paused },
         { B_AV_NEXT, 92, "Next >", "Down", "Next animation in the list.", 0 },
@@ -4355,7 +4569,7 @@ static void anim_view_layout(HWND hwnd) {
         { B_AV_STEPF, 86, "Frame +", "Right", "Pause and step forward 1/30 s.", 0 },
         { B_AV_SLOWER, 104, "Slower", "Num-", "Play slower (down to x0.125).", 0 },
         { B_AV_FASTER, 104, "Faster", "Num+", "Play faster (up to x4).", 0 },
-        { B_AV_FOLLOW, 118, g_anim_follow ? "Camera: follow" : "Camera: fixed", "", "Follow: the camera stays on David when a clip moves him. Fixed: see him travel over the grid.", !g_anim_follow },
+        { B_AV_FOLLOW, 118, g_anim_follow ? "Camera: follow" : "Camera: fixed", "", "Follow: the camera stays on the character when a clip moves it. Fixed: see it travel over the grid.", !g_anim_follow },
         { B_AV_RESET, 96, "Reset view", "", "Default angle and zoom (drag the stage to rotate, mouse wheel to zoom).", 0 },
         { B_AV_CLOSE, 86, "Close", "Esc", "Back to the game.", 0 },
     };
@@ -4368,6 +4582,7 @@ static void anim_view_layout(HWND hwnd) {
 
 static void anim_view_action(int id) {
     switch (id) {
+        case B_AV_MODEL: picker_open(); break;
         case B_AV_PREV: anim_select(g_anim_sel - 1); break;
         case B_AV_NEXT: anim_select(g_anim_sel + 1); break;
         case B_AV_PLAY: g_anim_paused = !g_anim_paused; break;
@@ -4382,18 +4597,20 @@ static void anim_view_action(int id) {
 }
 
 static void anim_view_paint(HWND hwnd, HDC hdc) {
-    RECT rc; GetClientRect(hwnd, &rc);
     anim_view_layout(hwnd);
+    if (g_picker) { picker_paint(hwnd, hdc); return; }
+    RECT rc; GetClientRect(hwnd, &rc);
     ui_fill(hdc, &rc, RGB(14, 14, 18));
     HFONT fh = ui_font(20, 1), fs = ui_font(12, 1), fn = ui_font(14, 0), fb = ui_font(26, 1);
-    int n = anim_lib_count(), clip = anim_current_clip();
+    int clip = anim_current_clip();
+    const char *mname = g_view_model->name;
     /* header */
     SelectObject(hdc, fh);
     char t[200];
-    snprintf(t, sizeof(t), "Animations on David");
-    ui_text(hdc, 12, 10, 280, 26, t, RGB(255, 225, 120), DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    snprintf(t, sizeof(t), "Animations on %s", mname);
+    ui_text(hdc, 12, 10, 280, 26, t, RGB(255, 225, 120), DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
     SelectObject(hdc, fn);
-    snprintf(t, sizeof(t), "filter: %s_   (%d / %d)", g_anim_filter, g_anim_filtered_count, n);
+    snprintf(t, sizeof(t), "filter: %s_   (%d clips)", g_anim_filter, g_anim_filtered_count);
     ui_text(hdc, 12, 40, 280, 18, t, RGB(200, 200, 200), DT_LEFT | DT_SINGLELINE);
     /* list */
     ui_fill(hdc, &g_anim_list_rc, RGB(22, 22, 28));
@@ -4404,13 +4621,14 @@ static void anim_view_paint(HWND hwnd, HDC hdc) {
         int id = g_anim_filtered[k];
         int y = g_anim_list_rc.top + r * ANIM_ROW_H;
         if (k == g_anim_sel) { RECT hl = { g_anim_list_rc.left, y, g_anim_list_rc.right, y + ANIM_ROW_H }; ui_fill(hdc, &hl, RGB(60, 50, 10)); }
-        int own = strcmp(anim_lib_source(id), "david") == 0;
+        int own = strcmp(anim_lib_source(id), mname) == 0;
         COLORREF col = k == g_anim_sel ? RGB(255, 230, 60) : own ? RGB(140, 200, 255) : RGB(210, 210, 210);
-        snprintf(t, sizeof(t), "%s%s", anim_lib_name(id), own ? "  (david)" : "");
+        snprintf(t, sizeof(t), "%s%s", anim_lib_name(id), own ? "  (own)" : "");
         ui_text(hdc, g_anim_list_rc.left + 8, y, 190, ANIM_ROW_H, t, col, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
         snprintf(t, sizeof(t), "%.2fs", anim_lib_duration(id));
         ui_text(hdc, g_anim_list_rc.right - 62, y, 54, ANIM_ROW_H, t, RGB(130, 130, 140), DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
     }
+    if (g_anim_filtered_count == 0) ui_text(hdc, g_anim_list_rc.left + 8, g_anim_list_rc.top + 6, 270, 40, "no clip for this skeleton", RGB(150, 150, 160), DT_LEFT | DT_WORDBREAK);
     if (g_anim_filtered_count > rows) { /* scrollbar */
         int th = g_anim_list_rc.bottom - g_anim_list_rc.top;
         int bh = th * rows / g_anim_filtered_count; if (bh < 20) bh = 20;
@@ -4423,7 +4641,7 @@ static void anim_view_paint(HWND hwnd, HDC hdc) {
     ui_frame(hdc, &g_anim_stage_rc, RGB(60, 60, 70));
     float dur = anim_lib_duration(clip);
     SelectObject(hdc, fb);
-    ui_text(hdc, g_anim_stage_rc.left + 14, g_anim_stage_rc.top + 10, 500, 32, clip >= 0 ? anim_lib_name(clip) : "(no match)", RGB(255, 255, 255), DT_LEFT | DT_SINGLELINE);
+    ui_text(hdc, g_anim_stage_rc.left + 14, g_anim_stage_rc.top + 10, 500, 32, clip >= 0 ? anim_lib_name(clip) : "(rest pose)", RGB(255, 255, 255), DT_LEFT | DT_SINGLELINE);
     SelectObject(hdc, fn);
     if (clip >= 0) {
         float tt = dur > 0 ? fmodf(g_anim_t, dur) : 0.0f;
@@ -4438,7 +4656,7 @@ static void anim_view_paint(HWND hwnd, HDC hdc) {
         ui_fill(hdc, &fill, RGB(255, 200, 60));
     }
     SelectObject(hdc, fs);
-    ui_text(hdc, g_anim_stage_rc.right - 360, g_anim_stage_rc.top + 14, 346, 16, "DRAG = ROTATE   WHEEL = ZOOM   TYPE = FILTER", RGB(120, 150, 190), DT_RIGHT | DT_SINGLELINE);
+    ui_text(hdc, g_anim_stage_rc.right - 460, g_anim_stage_rc.top + 14, 446, 16, "TAB = CHARACTERS   DRAG = ROTATE   WHEEL = ZOOM   TYPE = FILTER", RGB(120, 150, 190), DT_RIGHT | DT_SINGLELINE);
     /* hovered button description */
     const UiButton *hb = ui_find(g_hover_btn);
     if (hb) {
@@ -4451,8 +4669,28 @@ static void anim_view_paint(HWND hwnd, HDC hdc) {
 
 /* input while the viewer is open; returns 1 if handled */
 static int anim_view_key(int vk) {
+    if (g_picker) {
+        int cols = pick_cols(), page = cols * pick_rows_visible();
+        switch (vk) {
+            case VK_ESCAPE: case VK_TAB: g_picker = 0; return 1;
+            case VK_RETURN: picker_choose(); return 1;
+            case VK_LEFT: pick_select(g_pick_sel - 1); return 1;
+            case VK_RIGHT: pick_select(g_pick_sel + 1); return 1;
+            case VK_UP: pick_select(g_pick_sel - cols); return 1;
+            case VK_DOWN: pick_select(g_pick_sel + cols); return 1;
+            case VK_PRIOR: pick_select(g_pick_sel - page); return 1;
+            case VK_NEXT: pick_select(g_pick_sel + page); return 1;
+            case VK_HOME: pick_select(0); return 1;
+            case VK_END: pick_select(g_pick_filtered_count - 1); return 1;
+            case VK_BACK:
+                if (g_pick_filter_len > 0) { g_pick_filter[--g_pick_filter_len] = 0; pick_filter(); }
+                return 1;
+        }
+        return 0;
+    }
     switch (vk) {
         case VK_ESCAPE: g_anim_view = 0; return 1;
+        case VK_TAB: picker_open(); return 1;
         case VK_UP: anim_select(g_anim_sel - 1); return 1;
         case VK_DOWN: anim_select(g_anim_sel + 1); return 1;
         case VK_PRIOR: anim_select(g_anim_sel - anim_rows_visible()); return 1;
@@ -4472,14 +4710,26 @@ static int anim_view_key(int vk) {
 }
 static void anim_view_char(char c) {
     if (g_anim_skip_char) { g_anim_skip_char = 0; if (c == 'a' || c == 'A') return; }
-    if (c > 32 && c < 127 && g_anim_filter_len < (int)sizeof(g_anim_filter) - 1) {
+    if (!(c > 32 && c < 127)) return;
+    if (g_picker) {
+        if (g_pick_filter_len < (int)sizeof(g_pick_filter) - 1) { g_pick_filter[g_pick_filter_len++] = c; g_pick_filter[g_pick_filter_len] = 0; pick_filter(); }
+        return;
+    }
+    if (g_anim_filter_len < (int)sizeof(g_anim_filter) - 1) {
         g_anim_filter[g_anim_filter_len++] = c; g_anim_filter[g_anim_filter_len] = 0;
         anim_view_filter();
     }
 }
 static int anim_view_mouse_down(HWND hwnd, int x, int y, int dbl) {
-    (void)dbl;
     anim_view_layout(hwnd);
+    if (g_picker) {
+        int k = pick_card_at(x, y);
+        if (k >= 0) {
+            if (dbl || k == g_pick_sel) { pick_select(k); picker_choose(); }
+            else pick_select(k);
+        }
+        return 1;
+    }
     int b = ui_hit(x, y);
     if (b != B_NONE) { anim_view_action(b); return 1; }
     if (x >= g_anim_list_rc.left && x < g_anim_list_rc.right && y >= g_anim_list_rc.top && y < g_anim_list_rc.bottom) {
@@ -4492,6 +4742,8 @@ static int anim_view_mouse_down(HWND hwnd, int x, int y, int dbl) {
     return 1;
 }
 static void anim_view_mouse_move(int x, int y) {
+    g_mouse_x = x; g_mouse_y = y;
+    if (g_picker) { g_pick_hover = pick_card_at(x, y); return; }
     if (!g_anim_drag) return;
     g_anim_yaw += (x - g_anim_drag_x) * 0.01f;
     g_anim_pitch += (y - g_anim_drag_y) * 0.006f;
@@ -4500,6 +4752,14 @@ static void anim_view_mouse_move(int x, int y) {
     g_anim_drag_x = x; g_anim_drag_y = y;
 }
 static void anim_view_wheel(int x, int y, int delta) {
+    if (g_picker) {
+        int cols = pick_cols(), rows = pick_rows_visible(), total = (g_pick_filtered_count + cols - 1) / cols;
+        g_pick_scroll -= delta / 120;
+        if (g_pick_scroll > total - rows) g_pick_scroll = total - rows;
+        if (g_pick_scroll < 0) g_pick_scroll = 0;
+        g_pick_hover = pick_card_at(x, y);
+        return;
+    }
     if (x >= g_anim_list_rc.left && x < g_anim_list_rc.right && y >= g_anim_list_rc.top && y < g_anim_list_rc.bottom) {
         int rows = anim_rows_visible(), maxs = g_anim_filtered_count - rows;
         g_anim_scroll -= (delta / 120) * 3;

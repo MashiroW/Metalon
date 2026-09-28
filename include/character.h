@@ -17,10 +17,11 @@ void quat_nlerp(const float a[4], const float b[4], float t, float out[4]);
 
 /* --- David, loaded at startup from the blockouts' glTF (assets/chars/david):
    mesh (primitive 0 of mesh 0), skin, skeleton rest pose and texture. --- */
-#define DAVID_MAX_VERTS 4096
+#define DAVID_MAX_VERTS 8192 /* any character: the biggest (apocalyp) has 4365 */
 #define DAVID_MAX_NODES 64
 #define DAVID_MAX_JOINTS 64
 typedef struct {
+    char name[48];
     int vertex_count, index_count, node_count, joint_count;
     float (*positions)[3];
     float (*uvs_px)[2];          /* texture coordinates in texels */
@@ -33,9 +34,14 @@ typedef struct {
     float inv_bind[DAVID_MAX_JOINTS][16]; /* glTF column-major */
     int tex_w, tex_h;
     uint8_t *tex_rgb;            /* tex_w * tex_h * 3 */
-} DavidModel;
+} CharModel;
+typedef CharModel DavidModel;
 extern DavidModel g_david;
-/* Loads <dir>/david.gltf + david.png. 1 on success. */
+/* Any character of assets/chars: <dir>/<name>.gltf, every primitive of
+   its mesh, its texture. 1 on success (0: no skinned mesh). */
+int char_model_load(CharModel *m, const char *dir, const char *name);
+void char_model_free(CharModel *m);
+/* Loads <dir>/david.gltf into g_david. 1 on success. */
 int david_load(const char *dir);
 #define DAVID_VERTEX_COUNT (g_david.vertex_count)
 #define DAVID_INDEX_COUNT (g_david.index_count)
@@ -66,16 +72,22 @@ typedef struct {
 
 void skeleton_compute_skin_matrices(const NodeOverride *overrides /* [DAVID_NODE_COUNT] */,
                                      Mat4 *out_skin_mats /* [DAVID_JOINT_COUNT] */);
+/* same, for any character */
+void skeleton_skin_matrices_for(const CharModel *m, const NodeOverride *overrides, Mat4 *out_skin_mats);
 
-/* --- Animation library: every .gltf of the blockouts' chars/anims and chars/david
-   folders, indexed at startup and each clip loaded the first time it's
-   used. A clip is usable on David if its file has his 48-node rig. --- */
+/* --- Animation library: the .gltf clips of chars/anims, chars/david and
+   (added on demand) any character's own folder, each clip loaded the
+   first time it's used. A clip plays on a character whose skeleton has
+   the same number of nodes as the clip's file. --- */
 int anim_lib_init(const char *anims_dir, const char *david_dir); /* returns files indexed */
+int anim_lib_add_dir(const char *dir, const char *source);       /* appends a folder's clips; returns how many */
+int anim_lib_nodes(int i);                                       /* the clip's skeleton node count (loads it), -1 unreadable */
 int anim_lib_count(void);
 const char *anim_lib_name(int i);
-const char *anim_lib_source(int i); /* "anims" or "david" */
+const char *anim_lib_source(int i); /* "anims" or the character's folder name */
 int anim_lib_find(const char *name); /* index or -1 */
 int anim_lib_ready(int i);           /* loads it if needed; 1 = usable on David */
+int anim_lib_fits(int i, int node_count); /* 1 = usable on a skeleton of node_count nodes */
 float anim_lib_duration(int i);
 int anim_lib_channels(int i);
 int anim_lib_keys(int i);

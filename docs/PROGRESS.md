@@ -1399,3 +1399,22 @@ Validation, before removing the old data:
   exact glTF values, which moves a few spawn-visibility ties.
 - Performance unchanged: ~140 fps on a 144 Hz monitor, 2.5 ms per frame.
 - (same day) `spires/la_corri`: the user fixed the empty picture in the Blockouts (640x480); the room loads again -> 278 rooms. Rooms are found by scanning assets/levels at every launch (a room = <room>.gltf + non-empty <room>.png).
+
+## 2026-09-28 -- Character picker in the animation viewer
+
+- `char_model_load` (character.c) loads any character of assets/chars:
+  every primitive of its mesh merged (the small second primitives are
+  double-sided bits -- David now also gets his 6 missing vertices), the
+  texture named by the glTF material. `skeleton_skin_matrices_for` skins
+  any of them.
+- The animation library knows each clip's skeleton (node count) and takes
+  new folders on demand (`anim_lib_add_dir`, existing indices never
+  move); a clip plays on a character with the same node count.
+- Picker (Tab / Model button): every assets/chars/<name>/<name>.gltf with a
+  skinned mesh and more than 6 bones -- 198 characters (the 4-6 bone props,
+  chars/items and the animation-only folders are left out). Grid of cards,
+  cached preview in a standing pose (an own idle-like clip, else the shared
+  stand when it fits, else the rest pose), the selected card animated and
+  turning. The scan (all models + textures) takes well under a second.
+- VERIFY_SPAWNS 278/278 with David's extra vertices.
+

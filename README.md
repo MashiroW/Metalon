@@ -54,9 +54,14 @@ No file of the original game is needed.
 - Saved per room in `data/rooms/`.
 
 **Animation viewer** (A)
-- Every clip of `assets/chars` that fits David's skeleton (410), played
-  on David.
+- Plays every clip made for the shown character's skeleton: its own
+  folder's clips first, then the shared ones of `assets/chars/anims`
+  (410 for David).
 - Filter by name, play / pause, frame by frame, speed, rotate and zoom.
+- **Character picker** (Tab or the Model button): the 198 characters
+  and creatures of the game in a grid, each card with a 3D preview (the
+  selected card is animated). Mouse (click, double-click, wheel) or
+  keyboard (arrows, PgUp/PgDn, Enter, Esc, type to filter).
 
 ## Setup
 
@@ -88,7 +93,7 @@ Every tool is also a button in the side panel, with its shortcut shown.
 | C | collisions on/off (fly mode) |
 | F3 | raw 3D blockout instead of the picture |
 | F11 | fullscreen |
-| A | animation viewer |
+| A | animation viewer (Tab inside it: choose the character) |
 | E | scene editor: V select, 1 rectangle, 2 circle, 3 polygon, Ctrl+Z undo, Del delete, right-click = roles |
 | N (editor) | David & navigation settings |
 

@@ -79,34 +79,31 @@ void quat_nlerp(const float a[4], const float b_in[4], float t, float out[4]) {
 
 /* ---------------- skeleton ---------------- */
 
-static void node_trs(int node_idx, const NodeOverride *overrides, float t[3], float q[4], float s[3]) {
-    const NodeOverride *ov = &overrides[node_idx];
-    if (ov->has_t) memcpy(t, ov->t, 3*sizeof(float)); else memcpy(t, david_node_translation[node_idx], 3*sizeof(float));
-    if (ov->has_r) memcpy(q, ov->r, 4*sizeof(float)); else memcpy(q, david_node_rotation[node_idx], 4*sizeof(float));
-    if (ov->has_s) memcpy(s, ov->s, 3*sizeof(float)); else memcpy(s, david_node_scale[node_idx], 3*sizeof(float));
+void skeleton_skin_matrices_for(const CharModel *m, const NodeOverride *overrides, Mat4 *out_skin_mats) {
+    static Mat4 local[DAVID_MAX_NODES];
+    static Mat4 global[DAVID_MAX_NODES];
+    for (int i = 0; i < m->node_count; i++) {
+        const NodeOverride *ov = &overrides[i];
+        const float *t = ov->has_t ? ov->t : m->node_t[i];
+        const float *q = ov->has_r ? ov->r : m->node_r[i];
+        const float *s = ov->has_s ? ov->s : m->node_s[i];
+        local[i] = mat4_from_trs(t, q, s);
+    }
+    /* node_parent is always < node index in these exports: one forward pass */
+    for (int i = 0; i < m->node_count; i++) {
+        int p = m->node_parent[i];
+        global[i] = (p >= 0 && p < i) ? mat4_mul(global[p], local[i]) : local[i];
+    }
+    for (int ji = 0; ji < m->joint_count; ji++) {
+        Mat4 ib;
+        memcpy(ib.m, m->inv_bind[ji], 16 * sizeof(float));
+        int j = m->joints[ji];
+        out_skin_mats[ji] = mat4_mul(global[(j >= 0 && j < m->node_count) ? j : 0], ib);
+    }
 }
 
 void skeleton_compute_skin_matrices(const NodeOverride *overrides, Mat4 *out_skin_mats) {
-    static Mat4 local[DAVID_MAX_NODES];
-    static Mat4 global[DAVID_MAX_NODES];
-
-    for (int i = 0; i < DAVID_NODE_COUNT; i++) {
-        float t[3], q[4], s[3];
-        node_trs(i, overrides, t, q, s);
-        local[i] = mat4_from_trs(t, q, s);
-    }
-    /* iterative parent-first pass: node_parent is always < node index in
-       this skeleton's export order, so a single forward pass suffices */
-    for (int i = 0; i < DAVID_NODE_COUNT; i++) {
-        int p = david_node_parent[i];
-        if (p >= 0) global[i] = mat4_mul(global[p], local[i]);
-        else global[i] = local[i];
-    }
-    for (int ji = 0; ji < DAVID_JOINT_COUNT; ji++) {
-        Mat4 ib;
-        memcpy(ib.m, david_inv_bind[ji], 16*sizeof(float));
-        out_skin_mats[ji] = mat4_mul(global[david_joints[ji]], ib);
-    }
+    skeleton_skin_matrices_for(&g_david, overrides, out_skin_mats);
 }
 
 /* ---------------- animation sampling ---------------- */
@@ -159,86 +156,117 @@ static void anim_sample_generic(float t, NodeOverride *overrides,
 /* ---------------- David (the blockouts' glTF) ---------------- */
 DavidModel g_david;
 
-int david_load(const char *dir) {
+void char_model_free(CharModel *m) {
+    free(m->positions); free(m->uvs_px); free(m->joints_idx); free(m->weights); free(m->indices); free(m->tex_rgb);
+    memset(m, 0, sizeof(*m));
+}
+
+int char_model_load(CharModel *m, const char *dir, const char *name) {
     char path[1024];
-    snprintf(path, sizeof(path), "%s\\david.gltf", dir);
+    snprintf(path, sizeof(path), "%s\\%s.gltf", dir, name);
+    char_model_free(m);
+    snprintf(m->name, sizeof(m->name), "%.47s", name);
     Gltf g;
     if (!gltf_load(path, &g)) return 0;
-    DavidModel *d = &g_david;
     int ok = 0;
     const JsonValue *nodes = json_get(g.root, "nodes");
-    d->node_count = json_len(nodes);
+    m->node_count = json_len(nodes);
     const JsonValue *skin = json_at(json_get(g.root, "skins"), 0);
-    const JsonValue *prim = json_at(json_get(json_at(json_get(g.root, "meshes"), 0), "primitives"), 0);
-    const JsonValue *attr = json_get(prim, "attributes");
-    float *pos = NULL, *uv = NULL, *wt = NULL, *ib = NULL;
-    uint32_t *jn = NULL, *idx = NULL;
-    int nv = 0, nuv = 0, nw = 0, nj = 0, ni = 0, nib = 0, c;
-    if (d->node_count <= 0 || d->node_count > DAVID_MAX_NODES || !skin || !attr) goto done;
-    for (int i = 0; i < d->node_count; i++) {
+    const JsonValue *prims = json_get(json_at(json_get(g.root, "meshes"), 0), "primitives");
+    float *ib = NULL;
+    int nib = 0, c;
+    if (m->node_count <= 0 || m->node_count > DAVID_MAX_NODES || !skin || json_len(prims) <= 0) goto done;
+    for (int i = 0; i < m->node_count; i++) {
         const JsonValue *n = json_at(nodes, i);
         const JsonValue *t = json_get(n, "translation"), *r = json_get(n, "rotation"), *s = json_get(n, "scale");
-        for (int k = 0; k < 3; k++) d->node_t[i][k] = (float)json_num(json_at(t, k), 0.0);
-        for (int k = 0; k < 4; k++) d->node_r[i][k] = (float)json_num(json_at(r, k), k == 3 ? 1.0 : 0.0);
-        for (int k = 0; k < 3; k++) d->node_s[i][k] = (float)json_num(json_at(s, k), 1.0);
-        d->node_parent[i] = -1;
+        for (int k = 0; k < 3; k++) m->node_t[i][k] = (float)json_num(json_at(t, k), 0.0);
+        for (int k = 0; k < 4; k++) m->node_r[i][k] = (float)json_num(json_at(r, k), k == 3 ? 1.0 : 0.0);
+        for (int k = 0; k < 3; k++) m->node_s[i][k] = (float)json_num(json_at(s, k), 1.0);
+        m->node_parent[i] = -1;
     }
-    for (int i = 0; i < d->node_count; i++) {
+    for (int i = 0; i < m->node_count; i++) {
         const JsonValue *ch = json_get(json_at(nodes, i), "children");
         for (int k = 0; k < json_len(ch); k++) {
             int cidx = json_int(json_at(ch, k), -1);
-            if (cidx >= 0 && cidx < d->node_count) d->node_parent[cidx] = i;
+            if (cidx >= 0 && cidx < m->node_count) m->node_parent[cidx] = i;
         }
     }
     const JsonValue *joints = json_get(skin, "joints");
-    d->joint_count = json_len(joints);
-    if (d->joint_count <= 0 || d->joint_count > DAVID_MAX_JOINTS) goto done;
-    for (int j = 0; j < d->joint_count; j++) d->joints[j] = json_int(json_at(joints, j), 0);
+    m->joint_count = json_len(joints);
+    if (m->joint_count <= 0 || m->joint_count > DAVID_MAX_JOINTS) goto done;
+    for (int j = 0; j < m->joint_count; j++) m->joints[j] = json_int(json_at(joints, j), 0);
     ib = gltf_read_floats(&g, json_int(json_get(skin, "inverseBindMatrices"), -1), &nib, &c);
-    if (!ib || nib != d->joint_count || c != 16) goto done;
-    memcpy(d->inv_bind, ib, sizeof(float) * 16 * nib);
-    pos = gltf_read_floats(&g, json_int(json_get(attr, "POSITION"), -1), &nv, &c);
-    if (!pos || c != 3 || nv > DAVID_MAX_VERTS) goto done;
-    uv = gltf_read_floats(&g, json_int(json_get(attr, "TEXCOORD_0"), -1), &nuv, &c);
-    if (!uv || nuv != nv || c != 2) goto done;
-    wt = gltf_read_floats(&g, json_int(json_get(attr, "WEIGHTS_0"), -1), &nw, &c);
-    if (!wt || nw != nv || c != 4) goto done;
-    jn = gltf_read_uints(&g, json_int(json_get(attr, "JOINTS_0"), -1), &nj, &c);
-    if (!jn || nj != nv || c != 4) goto done;
-    idx = gltf_read_uints(&g, json_int(json_get(prim, "indices"), -1), &ni, &c);
-    if (!idx || c != 1 || ni % 3) goto done;
-    snprintf(path, sizeof(path), "%s\\david.png", dir);
+    if (!ib || nib != m->joint_count || c != 16) goto done;
+    memcpy(m->inv_bind, ib, sizeof(float) * 16 * nib);
+
+    /* texture: the first primitive's material, else <name>.png */
+    char tex_name[256];
+    snprintf(tex_name, sizeof(tex_name), "%s.png", name);
+    {
+        int mat = json_int(json_get(json_at(prims, 0), "material"), 0);
+        int ti = json_int(json_get(json_get(json_get(json_at(json_get(g.root, "materials"), mat), "pbrMetallicRoughness"), "baseColorTexture"), "index"), -1);
+        int src = json_int(json_get(json_at(json_get(g.root, "textures"), ti), "source"), -1);
+        const char *uri = json_str(json_get(json_at(json_get(g.root, "images"), src), "uri"), NULL);
+        if (uri) snprintf(tex_name, sizeof(tex_name), "%s", uri);
+    }
+    snprintf(path, sizeof(path), "%s\\%s", dir, tex_name);
     int tw = 0, th = 0;
     uint32_t *tex = image_load(path, &tw, &th);
-    if (!tex) goto done;
-    d->tex_w = tw; d->tex_h = th;
-    d->tex_rgb = (uint8_t *)malloc((size_t)tw * th * 3);
+    if (!tex) { tw = th = 1; tex = (uint32_t *)malloc(4); tex[0] = 0xFFA0A0A0u; } /* untextured: grey */
+    m->tex_w = tw; m->tex_h = th;
+    m->tex_rgb = (uint8_t *)malloc((size_t)tw * th * 3);
     for (int i = 0; i < tw * th; i++) {
-        d->tex_rgb[i * 3] = (uint8_t)(tex[i] >> 16); d->tex_rgb[i * 3 + 1] = (uint8_t)(tex[i] >> 8); d->tex_rgb[i * 3 + 2] = (uint8_t)tex[i];
+        m->tex_rgb[i * 3] = (uint8_t)(tex[i] >> 16); m->tex_rgb[i * 3 + 1] = (uint8_t)(tex[i] >> 8); m->tex_rgb[i * 3 + 2] = (uint8_t)tex[i];
     }
     free(tex);
-    d->vertex_count = nv; d->index_count = ni;
-    d->positions = (float (*)[3])pos; pos = NULL;
-    d->weights = (float (*)[4])wt; wt = NULL;
-    d->indices = idx; idx = NULL;
-    d->uvs_px = (float (*)[2])malloc(sizeof(float) * 2 * nv);
-    d->joints_idx = (uint8_t (*)[4])malloc(4 * (size_t)nv);
-    for (int v = 0; v < nv; v++) {
-        d->uvs_px[v][0] = uv[v * 2] * tw; d->uvs_px[v][1] = uv[v * 2 + 1] * th;
-        for (int k = 0; k < 4; k++) d->joints_idx[v][k] = (uint8_t)(jn[v * 4 + k] < (uint32_t)d->joint_count ? jn[v * 4 + k] : 0);
+
+    /* every primitive, merged (the small second ones are double-sided bits) */
+    for (int p = 0; p < json_len(prims); p++) {
+        const JsonValue *prim = json_at(prims, p), *attr = json_get(prim, "attributes");
+        int nv = 0, nuv = 0, nw = 0, nj = 0, ni = 0;
+        float *pos = gltf_read_floats(&g, json_int(json_get(attr, "POSITION"), -1), &nv, &c);
+        if (!pos || c != 3) { free(pos); continue; }
+        float *uv = gltf_read_floats(&g, json_int(json_get(attr, "TEXCOORD_0"), -1), &nuv, &c);
+        if (uv && (nuv != nv || c != 2)) { free(uv); uv = NULL; }
+        float *wt = gltf_read_floats(&g, json_int(json_get(attr, "WEIGHTS_0"), -1), &nw, &c);
+        uint32_t *jn = gltf_read_uints(&g, json_int(json_get(attr, "JOINTS_0"), -1), &nj, &c);
+        uint32_t *idx = gltf_read_uints(&g, json_int(json_get(prim, "indices"), -1), &ni, &c);
+        if (!wt || nw != nv || !jn || nj != nv || !idx || ni % 3 || m->vertex_count + nv > DAVID_MAX_VERTS) {
+            free(pos); free(uv); free(wt); free(jn); free(idx); continue;
+        }
+        int base = m->vertex_count, nvt = base + nv, nit = m->index_count + ni;
+        m->positions = (float (*)[3])realloc(m->positions, sizeof(float) * 3 * nvt);
+        m->uvs_px = (float (*)[2])realloc(m->uvs_px, sizeof(float) * 2 * nvt);
+        m->weights = (float (*)[4])realloc(m->weights, sizeof(float) * 4 * nvt);
+        m->joints_idx = (uint8_t (*)[4])realloc(m->joints_idx, 4 * (size_t)nvt);
+        m->indices = (uint32_t *)realloc(m->indices, sizeof(uint32_t) * nit);
+        for (int v = 0; v < nv; v++) {
+            memcpy(m->positions[base + v], pos + v * 3, sizeof(float) * 3);
+            memcpy(m->weights[base + v], wt + v * 4, sizeof(float) * 4);
+            m->uvs_px[base + v][0] = uv ? uv[v * 2] * tw : 0.0f;
+            m->uvs_px[base + v][1] = uv ? uv[v * 2 + 1] * th : 0.0f;
+            for (int k = 0; k < 4; k++) m->joints_idx[base + v][k] = (uint8_t)(jn[v * 4 + k] < (uint32_t)m->joint_count ? jn[v * 4 + k] : 0);
+        }
+        for (int i = 0; i < ni; i++) m->indices[m->index_count + i] = base + (idx[i] < (uint32_t)nv ? idx[i] : 0);
+        m->vertex_count = nvt; m->index_count = nit;
+        free(pos); free(uv); free(wt); free(jn); free(idx);
     }
-    ok = 1;
+    ok = m->vertex_count > 0 && m->index_count > 0;
 done:
-    free(pos); free(uv); free(wt); free(ib); free(jn); free(idx);
+    free(ib);
     gltf_free(&g);
+    if (!ok) { char keep[48]; snprintf(keep, sizeof(keep), "%s", m->name); char_model_free(m); snprintf(m->name, sizeof(m->name), "%s", keep); }
     return ok;
 }
+
+int david_load(const char *dir) { return char_model_load(&g_david, dir, "david"); }
 
 /* ---------------- animation library ---------------- */
 typedef struct {
     char name[48], source[8];
     char path[600];
-    int state;             /* 0 not loaded, 1 usable, -1 not for David's rig / unreadable */
+    int state;             /* 0 not loaded, 1 loaded, -1 unreadable / no animation */
+    int nodes;             /* the clip file's skeleton node count */
     float duration;
     int n_channels, n_keys;
     int *node, *kind, *off, *cnt; /* per channel; kind 0=T 1=R 2=S */
@@ -247,6 +275,7 @@ typedef struct {
 } LibClip;
 static LibClip *g_lib = NULL;
 static int g_lib_count = 0;
+static int g_lib_cap = 0;
 
 static int lib_name_cmp(const void *a, const void *b) {
     const LibClip *x = (const LibClip *)a, *y = (const LibClip *)b;
@@ -275,11 +304,16 @@ static void lib_add_dir(const char *dir, const char *source, int *cap) {
 }
 
 int anim_lib_init(const char *anims_dir, const char *david_dir) {
-    int cap = 0;
-    lib_add_dir(anims_dir, "anims", &cap);
-    lib_add_dir(david_dir, "david", &cap);
+    lib_add_dir(anims_dir, "anims", &g_lib_cap);
+    lib_add_dir(david_dir, "david", &g_lib_cap);
     if (g_lib_count) qsort(g_lib, g_lib_count, sizeof(LibClip), lib_name_cmp);
     return g_lib_count;
+}
+int anim_lib_add_dir(const char *dir, const char *source) {
+    int before = g_lib_count;
+    lib_add_dir(dir, source, &g_lib_cap);
+    if (g_lib_count > before) qsort(g_lib + before, g_lib_count - before, sizeof(LibClip), lib_name_cmp);
+    return g_lib_count - before;
 }
 int anim_lib_count(void) { return g_lib_count; }
 const char *anim_lib_name(int i) { return (i >= 0 && i < g_lib_count) ? g_lib[i].name : ""; }
@@ -297,7 +331,8 @@ static int lib_load_clip(LibClip *c) {
     const JsonValue *anim = json_at(json_get(g.root, "animations"), 0);
     const JsonValue *chans = json_get(anim, "channels"), *samplers = json_get(anim, "samplers");
     int nch = json_len(chans);
-    if (json_len(json_get(g.root, "nodes")) != g_david.node_count || !anim || nch <= 0) goto done;
+    c->nodes = json_len(json_get(g.root, "nodes"));
+    if (c->nodes <= 0 || c->nodes > DAVID_MAX_NODES || !anim || nch <= 0) goto done;
     c->node = (int *)calloc(nch, sizeof(int)); c->kind = (int *)calloc(nch, sizeof(int));
     c->off = (int *)calloc(nch, sizeof(int)); c->cnt = (int *)calloc(nch, sizeof(int));
     int cap = 0;
@@ -306,7 +341,7 @@ static int lib_load_clip(LibClip *c) {
         const char *path = json_str(json_get(tgt, "path"), "");
         int kind = !strcmp(path, "translation") ? 0 : !strcmp(path, "rotation") ? 1 : !strcmp(path, "scale") ? 2 : -1;
         int node = json_int(json_get(tgt, "node"), -1);
-        if (kind < 0 || node < 0 || node >= g_david.node_count) continue;
+        if (kind < 0 || node < 0 || node >= c->nodes) continue;
         const JsonValue *smp = json_at(samplers, json_int(json_get(ch, "sampler"), -1));
         int nt = 0, nvv = 0, ct = 0, cv = 0;
         float *t = gltf_read_floats(&g, json_int(json_get(smp, "input"), -1), &nt, &ct);
@@ -333,17 +368,20 @@ done:
     return result;
 }
 
-int anim_lib_ready(int i) {
+static int lib_loaded(int i) {
     if (i < 0 || i >= g_lib_count) return 0;
     if (g_lib[i].state == 0) g_lib[i].state = lib_load_clip(&g_lib[i]);
     return g_lib[i].state == 1;
 }
-float anim_lib_duration(int i) { return anim_lib_ready(i) ? g_lib[i].duration : 0.0f; }
-int anim_lib_channels(int i) { return anim_lib_ready(i) ? g_lib[i].n_channels : 0; }
-int anim_lib_keys(int i) { return anim_lib_ready(i) ? g_lib[i].n_keys : 0; }
+int anim_lib_nodes(int i) { return lib_loaded(i) ? g_lib[i].nodes : -1; }
+int anim_lib_fits(int i, int node_count) { return lib_loaded(i) && g_lib[i].nodes == node_count; }
+int anim_lib_ready(int i) { return anim_lib_fits(i, g_david.node_count); }
+float anim_lib_duration(int i) { return lib_loaded(i) ? g_lib[i].duration : 0.0f; }
+int anim_lib_channels(int i) { return lib_loaded(i) ? g_lib[i].n_channels : 0; }
+int anim_lib_keys(int i) { return lib_loaded(i) ? g_lib[i].n_keys : 0; }
 
 void anim_lib_sample(int i, float t, NodeOverride *overrides) {
-    if (!anim_lib_ready(i)) { memset(overrides, 0, DAVID_MAX_NODES * sizeof(NodeOverride)); return; }
+    if (!lib_loaded(i)) { memset(overrides, 0, DAVID_MAX_NODES * sizeof(NodeOverride)); return; }
     LibClip *c = &g_lib[i];
     anim_sample_generic(t, overrides, c->duration, c->n_channels, c->node, c->kind, c->off, c->cnt, c->times, (const float (*)[4])c->values);
 }
