@@ -1418,3 +1418,35 @@ Validation, before removing the old data:
   turning. The scan (all models + textures) takes well under a second.
 - VERIFY_SPAWNS 278/278 with David's extra vertices.
 
+
+## 2026-09-29 -- Scripts (cutscenes), audio, several characters, movesets
+
+- **Audio** (audio.c): the .ogg files of assets/sound decoded with
+  stb_vorbis (src/third_party, public domain; Windows' Media Foundation
+  can't open them: MF_E_UNSUPPORTED_BYTESTREAM_TYPE even with the Web
+  Media Extensions installed). Streamed per voice, resampled to 44.1 kHz
+  stereo (the files are 22 kHz mono sounds / 44 kHz stereo music), mixed
+  on a waveOut thread (4 x 1024-frame buffers). Three separate parts:
+  the music playlist (per-track loop; a new playlist replaces the old
+  one), sounds (1 + repeat times), ambiences (looped or not), plus an
+  editor preview voice. Checked offline by driving the mixer without an
+  output device: bell.ogg 1.30 s -> repeat 2 = 3.90 s, a looped ambience
+  still playing after 10 s, a playlist moving on to its looped 2nd track.
+- **Scripts** (script.c + main.c): a grid of actions per script, several
+  scripts per room in data/rooms/<level>/<room>_scripts.cfg. Rows play
+  one after the other, the actions of a row all at once. Actions: wait,
+  background picture, music, sound, ambience, stop sound, place
+  character, move character (to a point or through a connector). While a
+  script plays the player can only left-click to skip the row -- not a
+  row that moves a character. Played on arrival through a connector
+  (each connector names its script, asked by the connector wizard) or,
+  entering a room otherwise, its first "auto" script.
+  File round-trip tested (save -> load -> save identical).
+- **Several characters**: David's movement state became an `Actor`
+  (g_actors[0] = David, script characters after him); the movement code
+  runs on `g_act` through the old g_char_* names. All characters share
+  one depth buffer (stamped per frame, never cleared) in the hi-res pass.
+- **Movesets**: the 13 clips a character walks with (stand / walk / run
+  cycles, starts, turns) per model, Human preset (David's clips) + per-slot
+  overrides in data/movesets/<model>.cfg; graph editor with a live
+  preview (animation viewer: Moveset..., or from a script action).

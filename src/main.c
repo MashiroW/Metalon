@@ -14,6 +14,8 @@
 #include "character.h"
 #include "gltf.h"
 #include "image.h"
+#include "audio.h"
+#include "script.h"
 
 /* ---------------- project paths ----------------
    The project folder is the exe's folder, or its parent when the exe
@@ -54,6 +56,7 @@ static struct { uint32_t width, height; } g_hdr; /* current room picture size */
 static uint32_t *g_dib_pixels = NULL;    /* the room's pre-rendered picture, 0x00RRGGBB, top-down */
 static uint32_t *g_render_pixels = NULL; /* working copy: picture + shadow + tints, rebuilt each frame */
 static uint32_t g_dib_stride = 0;        /* pixels per row */
+static uint32_t *g_dib_own = NULL;       /* the room's own picture while a script shows another one (background_set) */
 static int g_loaded = 0;
 static char g_status[512] = "no background loaded";
 
@@ -182,12 +185,59 @@ static HCURSOR g_cursor_arrow = NULL, g_cursor_door = NULL;
 static int g_has_3d_character = 0;
 static RoomCamera g_room_cam;
 static RoomCamera g_char_cam; /* roll-free variant of g_room_cam, David's mesh projection only -- see camera_make_upright */
-static float g_char_pos[3];
-static float g_char_target[3];
-static float g_char_facing = 0.0f;
-static int g_char_moving = 0;
-static int g_char_walk_mode = 0; /* 0 = idle clip, 1 = walk clip, 2 = run clip */
-static float g_char_anim_t = 0.0f;
+
+/* Characters in the room: David (g_actors[0], always there) and the ones a
+   script brings in (ACT_PLACE), each with its own model, position, path,
+   animation state and moveset (see MOVESETS). The movement code works on
+   the CURRENT character g_act -- David, except between actor_begin() and
+   actor_end() -- through the g_char_* names below.
+   Moveset slots: the turn-starts / start transitions (the blockouts' anims),
+   played before the walk/run cycle takes over -- rules in move_clip_for --
+   and the three cycles. run90a/c and run180a/c were measured: they turn
+   the hips exactly 90/180 degrees without moving him and end in the run
+   cycle's first pose. */
+enum { MC_RUN90A, MC_RUN90C, MC_RUN180A, MC_RUN180C, MC_TOWALKA, MC_TOWALKC, MC_TOWALK, MC_TORUN, MC_TO180A, MC_TO180C,
+       MC_STAND, MC_WALK, MC_RUN, MC_COUNT };
+#define MAX_CHAR_WAYPOINTS 48
+#define MAX_ACTORS 16
+typedef struct {
+    int used;
+    CharModel *model;
+    int place_id;              /* id of the script action that brought it in (0 = David) */
+    float pos[3], target[3], facing;
+    int moving;
+    int walk_mode;             /* 0 = idle clip, 1 = walk clip, 2 = run clip */
+    float anim_t;
+    int turn_clip;             /* library clip playing, -1 = none */
+    float turn_t, turn_to;     /* turn_to: facing once the turn is done */
+    int turn_from_stand;       /* the clip playing was picked by the standing-start rules */
+    int turn_interrupted;      /* the clip playing already replaced another one (a new direction mid-turn) */
+    float waypoints[MAX_CHAR_WAYPOINTS][3];
+    int waypoint_count, waypoint_idx;
+    int pending_door;          /* connector it walks to (goes through it on arrival), -1 = none */
+    int clips[MC_COUNT];       /* its moveset, resolved: library clip per slot, -1 = no animation */
+    int clips_gen;             /* g_moveset_gen they were resolved at */
+} Actor;
+static Actor g_actors[MAX_ACTORS];
+static Actor *g_act = &g_actors[0];
+#define DAVID_ACTOR (&g_actors[0])
+#define g_char_pos (g_act->pos)
+#define g_char_target (g_act->target)
+#define g_char_facing (g_act->facing)
+#define g_char_moving (g_act->moving)
+#define g_char_walk_mode (g_act->walk_mode)
+#define g_char_anim_t (g_act->anim_t)
+#define g_char_turn_clip (g_act->turn_clip)
+#define g_char_turn_t (g_act->turn_t)
+#define g_char_turn_to (g_act->turn_to)
+#define g_char_turn_from_stand (g_act->turn_from_stand)
+#define g_char_turn_interrupted (g_act->turn_interrupted)
+#define g_char_waypoints (g_act->waypoints)
+#define g_char_waypoint_count (g_act->waypoint_count)
+#define g_char_waypoint_idx (g_act->waypoint_idx)
+#define g_pending_door (g_act->pending_door)
+static void actor_begin(Actor *a) { g_act = a; }
+static void actor_end(void) { g_act = DAVID_ACTOR; }
 /* David's speeds -- global settings (editor "David & navigation" panel,
    "DAVID (ALL ROOMS)" group, saved in data/david.cfg) */
 static float g_david_walk_speed = 6.0f;  /* world units/sec, matches the Python prototype */
@@ -197,41 +247,16 @@ static float g_david_run_turn_pct = 50.0f; /* speed during a turn-start while ru
 static float g_david_shadow_radius = 0.7f; /* half-width of his floor shadow, world units (was a fixed 0.45) */
 #define CHAR_WALK_SPEED (g_david_walk_speed)
 #define CHAR_RUN_SPEED (g_david_run_speed)
-/* Turn-starts / start transitions (the blockouts' anims), played before the
-   walk/run cycle takes over -- rules in move_clip_for. run90a/c and
-   run180a/c were measured: they turn the hips exactly 90/180 degrees
-   without moving him and end in the run cycle's first pose. */
-enum { MC_RUN90A, MC_RUN90C, MC_RUN180A, MC_RUN180C, MC_TOWALKA, MC_TOWALKC, MC_TOWALK, MC_TORUN, MC_TO180A, MC_TO180C, MC_COUNT };
-static int g_move_clip_ids[MC_COUNT] = { -2 }; /* library clip per MC_* (-2 = not looked up, -1 = missing) */
-static int g_walk_clip_id = -2; /* library clip "walk" -- David's walk cycle (the baked towalk was the wrong clip) */
-static int g_char_turn_clip = -1;     /* library clip playing, -1 = none */
-static float g_char_turn_t = 0.0f;
-static float g_char_turn_to = 0.0f;   /* facing once the turn is done */
-static int g_char_turn_from_stand = 0; /* the clip playing was picked by the standing-start rules */
-static int g_char_turn_interrupted = 0; /* the clip playing already replaced another one (a new direction mid-turn) */
 #define TURN_INTERRUPT_WINDOW 0.3f /* a new direction restarts the turn only in its first 30% */
-static void david_turn_clips_init(void) {
-    if (g_move_clip_ids[0] != -2) return;
-    static const char *names[MC_COUNT] = { "run90a", "run90c", "run180a", "run180c", "towalka", "towalkc", "towalk", "torun", "to180a", "to180c" };
-    for (int k = 0; k < MC_COUNT; k++) {
-        g_move_clip_ids[k] = anim_lib_find(names[k]);
-        if (!anim_lib_ready(g_move_clip_ids[k])) g_move_clip_ids[k] = -1;
-    }
-    g_walk_clip_id = anim_lib_find("walk");
-    if (!anim_lib_ready(g_walk_clip_id)) g_walk_clip_id = -1;
-}
+static void actor_resolve_clips(Actor *a); /* MOVESETS */
 #define CHAR_RADIUS 0.4f /* coarse capsule half-width for path/wall checks */
 
 /* Multi-waypoint queue for A*-routed moves (see try_click_to_move):
    g_char_target is always the CURRENT leg's destination; the rest of
-   the route waits here and advance_character pulls the next one off
-   on arrival, same run/walk mode throughout. A direct, unobstructed
-   click never touches this -- it's just a single-target move like
-   before, queue count 0. */
-#define MAX_CHAR_WAYPOINTS 48
-static float g_char_waypoints[MAX_CHAR_WAYPOINTS][3];
-static int g_char_waypoint_count = 0;
-static int g_char_waypoint_idx = 0;
+   the route waits in g_char_waypoints and advance_character pulls the
+   next one off on arrival, same run/walk mode throughout. A direct,
+   unobstructed click never touches it -- it's just a single-target move
+   like before, queue count 0. */
 
 /* Small on-screen marker at the current click-to-move destination
    (item 16): appears where the player clicked, disappears once David
@@ -242,8 +267,10 @@ static int g_char_waypoint_idx = 0;
    anchored if the view scrolls. */
 static int g_click_marker_active = 0;
 static float g_click_marker_world[3];
+static int script_playing(void); /* SCRIPTS */
 
 static void set_click_marker(const float world[3]) {
+    if (g_act != DAVID_ACTOR || script_playing()) return; /* the player's own orders only */
     g_click_marker_world[0] = world[0];
     g_click_marker_world[1] = world[1];
     g_click_marker_world[2] = world[2];
@@ -907,13 +934,14 @@ static int move_clip_for(float from, float to, int run, int standing) {
     while (delta > 3.14159265f) delta -= 6.2831853f;
     while (delta < -3.14159265f) delta += 6.2831853f;
     float ad = fabsf(delta);
-    david_turn_clips_init();
-    if (ad < 0.785398f) return standing ? g_move_clip_ids[run ? MC_TORUN : MC_TOWALK] : -1;
-    if (ad < 2.356194f) return g_move_clip_ids[delta > 0 ? (run ? MC_RUN90A : MC_TOWALKA) : (run ? MC_RUN90C : MC_TOWALKC)];
-    return g_move_clip_ids[delta > 0 ? (run ? MC_RUN180A : MC_TO180A) : (run ? MC_RUN180C : MC_TO180C)];
+    actor_resolve_clips(g_act);
+    const int *mc = g_act->clips;
+    if (ad < 0.785398f) return standing ? mc[run ? MC_TORUN : MC_TOWALK] : -1;
+    if (ad < 2.356194f) return mc[delta > 0 ? (run ? MC_RUN90A : MC_TOWALKA) : (run ? MC_RUN90C : MC_TOWALKC)];
+    return mc[delta > 0 ? (run ? MC_RUN180A : MC_TO180A) : (run ? MC_RUN180C : MC_TO180C)];
 }
 static int move_clip_is_front_start(int clip) {
-    return clip >= 0 && (clip == g_move_clip_ids[MC_TOWALK] || clip == g_move_clip_ids[MC_TORUN]);
+    return clip >= 0 && (clip == g_act->clips[MC_TOWALK] || clip == g_act->clips[MC_TORUN]);
 }
 static float wrap_angle(float a) {
     while (a > 3.14159265f) a -= 6.2831853f;
@@ -923,7 +951,7 @@ static float wrap_angle(float a) {
 /* Yaw of the hips (node 2) in a turn clip at time t, model space. */
 static float turn_clip_hip_yaw(int clip, float t) {
     NodeOverride ov[DAVID_MAX_NODES];
-    anim_lib_sample(clip, t, ov);
+    anim_lib_sample_for(clip, t, g_act->model, ov);
     if (!ov[2].has_r) return 0.0f;
     const float *q = ov[2].r; /* x y z w; forward = q * (0,0,-1) * q^-1 */
     float x = q[0], y = q[1], z = q[2], w = q[3];
@@ -1257,7 +1285,6 @@ static int click_to_world(float px, float py, float out[3]) {
     return 1;
 }
 
-static int g_pending_door = -1;        /* door David is walking to (travel on arrival) */
 static int g_door_travel_request = -1; /* set when he reaches it; handled by the game timer */
 
 static int try_click_to_move(float px, float py, int run) {
@@ -1293,9 +1320,8 @@ static int try_click_to_move(float px, float py, int run) {
    first pass starts from its middle; it then loops as usual. */
 static float cycle_start_after(int clip) {
     if (clip < 0) return 0.0f;
-    if (clip == g_move_clip_ids[MC_RUN180C]) return anim_lib_duration(anim_lib_find("run")) * 0.5f;
-    if (clip == g_move_clip_ids[MC_TO180C])
-        return anim_lib_duration(g_walk_clip_id) * 0.5f;
+    if (clip == g_act->clips[MC_RUN180C]) return anim_lib_duration(g_act->clips[MC_RUN]) * 0.5f;
+    if (clip == g_act->clips[MC_TO180C]) return anim_lib_duration(g_act->clips[MC_WALK]) * 0.5f;
     return 0.0f;
 }
 
@@ -1360,8 +1386,12 @@ static int advance_character(float dt) {
         g_char_walk_mode = 0;
         g_char_anim_t = 0.0f;
         g_char_waypoint_count = 0;
-        g_click_marker_active = 0; /* reached it -- marker disappears (item 16) */
-        if (g_pending_door >= 0) { g_door_travel_request = g_pending_door; g_pending_door = -1; }
+        if (g_act == DAVID_ACTOR) g_click_marker_active = 0; /* reached it -- marker disappears (item 16) */
+        if (g_pending_door >= 0) {
+            if (g_act == DAVID_ACTOR) g_door_travel_request = g_pending_door; /* he goes to the other room */
+            else g_act->used = 0;                                            /* another character: leaves the room */
+            g_pending_door = -1;
+        }
         break;
     }
     {
@@ -1389,10 +1419,10 @@ static int advance_character(float dt) {
     return 1;
 }
 
-/* Fills a triangle directly into g_render_pixels, sampling David's
-   texture (affine per-triangle UV interpolation, matching the Python
-   prototype's draw_textured_triangle) instead of a flat color. */
-static void fill_triangle_textured(float x0, float y0, float x1, float y1, float x2, float y2,
+/* Fills a triangle directly into g_render_pixels, sampling the
+   character's texture (affine per-triangle UV interpolation, matching the
+   Python prototype's draw_textured_triangle) instead of a flat color. */
+static void fill_triangle_textured(const CharModel *m, float x0, float y0, float x1, float y1, float x2, float y2,
                                     float z0, float z1, float z2,
                                     float u0, float v0, float u1, float v1, float u2, float v2,
                                     float *depth_buf) {
@@ -1419,77 +1449,78 @@ static void fill_triangle_textured(float x0, float y0, float x1, float y1, float
                off by 10-60%, i.e. wrong surfaces winning the z-test --
                measured on gno/eastower against an exact reference) */
             float z = 1.0f / (w0 / z0 + w1 / z1 + w2 / z2);
-            if (depth_buf && z >= depth_buf[idx]) continue; /* occluded by room geometry or nearer David triangle */
+            if (depth_buf && z >= depth_buf[idx]) continue; /* occluded by room geometry or a nearer character triangle */
             float u = (w0 * u0 / z0 + w1 * u1 / z1 + w2 * u2 / z2) * z;
             float v = (w0 * v0 / z0 + w1 * v1 / z1 + w2 * v2 / z2) * z;
-            int iu = (int)u; if (iu < 0) iu = 0; if (iu >= DAVID_TEX_W) iu = DAVID_TEX_W - 1;
-            int iv = (int)v; if (iv < 0) iv = 0; if (iv >= DAVID_TEX_H) iv = DAVID_TEX_H - 1;
-            const uint8_t *tc = DAVID_TEXEL(iv, iu);
+            int iu = (int)u; if (iu < 0) iu = 0; if (iu >= m->tex_w) iu = m->tex_w - 1;
+            int iv = (int)v; if (iv < 0) iv = 0; if (iv >= m->tex_h) iv = m->tex_h - 1;
+            const uint8_t *tc = m->tex_rgb + ((size_t)iv * m->tex_w + iu) * 3;
             g_render_pixels[idx] = ((uint32_t)tc[0] << 16) | ((uint32_t)tc[1] << 8) | tc[2];
             if (depth_buf) depth_buf[idx] = z;
         }
     }
 }
 
-/* Skins David's mesh for the current animation state, projects through
-   the room camera, and rasterizes flat-shaded triangles (depth-sorted,
-   painter's algorithm) directly into g_render_pixels. Must be called
-   AFTER composite_frame() so it draws on top of the background/overlays. */
-/* David's animated vertices projected into ROOM-image pixels (+ depth). */
-static void david_project(float *px_buf, float *py_buf, float *z_buf, int *visible) {
+/* The pose of a character right now: the turn-start playing, else its
+   walk / run / stand cycle (rest pose for a slot set to "no animation"). */
+static void actor_pose(Actor *a, NodeOverride *overrides) {
+    actor_resolve_clips(a);
+    int clip = a->turn_clip;
+    float t = a->turn_t;
+    if (clip < 0) { clip = a->clips[a->walk_mode == 2 ? MC_RUN : a->walk_mode == 1 ? MC_WALK : MC_STAND]; t = a->anim_t; }
+    if (clip >= 0 && anim_lib_fits(clip, a->model->node_count)) anim_lib_sample_for(clip, t, a->model, overrides);
+    else memset(overrides, 0, sizeof(NodeOverride) * DAVID_MAX_NODES);
+}
+
+/* A character's animated vertices projected into ROOM-image pixels (+ depth). */
+static void actor_project(Actor *a, float *px_buf, float *py_buf, float *z_buf, int *visible) {
+    const CharModel *m = a->model;
     NodeOverride overrides[DAVID_MAX_NODES];
-    if (g_char_turn_clip >= 0) anim_lib_sample(g_char_turn_clip, g_char_turn_t, overrides);
-    else if (g_char_walk_mode == 2) anim_sample_run(g_char_anim_t, overrides);
-    else if (g_char_walk_mode == 1) {
-        david_turn_clips_init();
-        if (g_walk_clip_id >= 0) anim_lib_sample(g_walk_clip_id, g_char_anim_t, overrides);
-        else anim_sample_walk(g_char_anim_t, overrides);
-    }
-    else anim_sample_idle(g_char_anim_t, overrides);
-
+    actor_pose(a, overrides);
     static Mat4 skin_mats[DAVID_MAX_JOINTS];
-    skeleton_compute_skin_matrices(overrides, skin_mats);
+    skeleton_skin_matrices_for(m, overrides, skin_mats);
 
-    /* g_char_facing = direction he's heading (atan2(dx, dz)); David's
-       model faces -Z (measured: in the walk cycles the grounded foot
-       slides toward +Z and the head leans toward -Z), hence the half turn */
-    float cf = cosf(g_char_facing + 3.14159265f), sf = sinf(g_char_facing + 3.14159265f);
-    for (int vi = 0; vi < DAVID_VERTEX_COUNT; vi++) {
+    /* facing = direction it's heading (atan2(dx, dz)); the models face -Z
+       (measured on David: in the walk cycles the grounded foot slides
+       toward +Z and the head leans toward -Z), hence the half turn */
+    float cf = cosf(a->facing + 3.14159265f), sf = sinf(a->facing + 3.14159265f);
+    for (int vi = 0; vi < m->vertex_count; vi++) {
         float acc[3] = {0, 0, 0};
         for (int k = 0; k < 4; k++) {
-            float w = david_weights[vi][k];
+            float w = m->weights[vi][k];
             if (w <= 0) continue;
-            int j = david_joints_idx[vi][k];
+            int j = m->joints_idx[vi][k];
             float sp[3];
-            mat4_vec3(&skin_mats[j], david_positions[vi], sp);
+            mat4_vec3(&skin_mats[j], m->positions[vi], sp);
             acc[0] += sp[0] * w; acc[1] += sp[1] * w; acc[2] += sp[2] * w;
         }
-        float world[3] = { acc[0] * cf + acc[2] * sf + g_char_pos[0], acc[1] + g_char_pos[1], -acc[0] * sf + acc[2] * cf + g_char_pos[2] };
-        visible[vi] = char_project(g_char_pos, world, &px_buf[vi], &py_buf[vi], &z_buf[vi]);
+        float world[3] = { acc[0] * cf + acc[2] * sf + a->pos[0], acc[1] + a->pos[1], -acc[0] * sf + acc[2] * cf + a->pos[2] };
+        visible[vi] = char_project(a->pos, world, &px_buf[vi], &py_buf[vi], &z_buf[vi]);
     }
 }
 
-/* F3 debug view only: David rasterized into the 8-bit room frame. */
+/* F3 debug view only: the characters rasterized into the 8-bit room frame. */
 static void render_3d_character(void) {
     if (!g_has_3d_character) return;
     static float px_buf[DAVID_MAX_VERTS], py_buf[DAVID_MAX_VERTS], z_buf[DAVID_MAX_VERTS];
     static int visible[DAVID_MAX_VERTS];
-    david_project(px_buf, py_buf, z_buf, visible);
-
-    /* Per-pixel Z-buffer test in fill_triangle_textured now handles
-       both David's own self-occlusion AND occlusion against real room
-       geometry (in 3D debug view mode) -- draw order no longer matters
-       for correctness, unlike the old painter's-algorithm sort. */
-    int n_tris = DAVID_INDEX_COUNT / 3;
-    for (int t = 0; t < n_tris; t++) {
-        int i0 = david_indices[t * 3], i1 = david_indices[t * 3 + 1], i2 = david_indices[t * 3 + 2];
-        if (!visible[i0] || !visible[i1] || !visible[i2]) continue;
-        fill_triangle_textured(px_buf[i0], py_buf[i0], px_buf[i1], py_buf[i1], px_buf[i2], py_buf[i2],
-                                z_buf[i0], z_buf[i1], z_buf[i2],
-                                david_uvs_px[i0][0], david_uvs_px[i0][1],
-                                david_uvs_px[i1][0], david_uvs_px[i1][1],
-                                david_uvs_px[i2][0], david_uvs_px[i2][1],
-                                g_depth_buffer_char);
+    for (int k = 0; k < MAX_ACTORS; k++) {
+        Actor *a = &g_actors[k];
+        if (!a->used) continue;
+        const CharModel *m = a->model;
+        actor_project(a, px_buf, py_buf, z_buf, visible);
+        /* the Z-buffer test in fill_triangle_textured handles self-occlusion,
+           the other characters AND the room geometry: draw order doesn't matter */
+        for (int t = 0; t < m->index_count / 3; t++) {
+            int i0 = m->indices[t * 3], i1 = m->indices[t * 3 + 1], i2 = m->indices[t * 3 + 2];
+            if (!visible[i0] || !visible[i1] || !visible[i2]) continue;
+            fill_triangle_textured(m, px_buf[i0], py_buf[i0], px_buf[i1], py_buf[i1], px_buf[i2], py_buf[i2],
+                                    z_buf[i0], z_buf[i1], z_buf[i2],
+                                    m->uvs_px[i0][0], m->uvs_px[i0][1],
+                                    m->uvs_px[i1][0], m->uvs_px[i1][1],
+                                    m->uvs_px[i2][0], m->uvs_px[i2][1],
+                                    g_depth_buffer_char);
+        }
     }
 }
 
@@ -2143,9 +2174,17 @@ static void clamp_camera(void) {
     if (g_cam_y > max_y) g_cam_y = max_y;
 }
 
+static int g_room_gen = 0;      /* bumped on every room load */
+static int g_room_entered = 0;  /* a room was just loaded: game_tick starts its arrival / auto script */
+static char g_arrival_script[64] = ""; /* script of the connector David just came through */
+static void room_scripts_load(const char *label); /* SCRIPTS */
+static int g_sv_pick = 0;       /* a script action's point being picked in the room (SV_PICK_*) */
+static void actors_clear_npcs(void);
+
 static void unload_room(void) {
     free_room_mesh();
     free(g_dib_pixels); g_dib_pixels = NULL;
+    free(g_dib_own); g_dib_own = NULL;
     free(g_render_pixels); g_render_pixels = NULL;
     free(g_depth_buffer); g_depth_buffer = NULL;
     free(g_depth_buffer_char); g_depth_buffer_char = NULL;
@@ -2181,9 +2220,41 @@ static int load_room(const char *label) {
     g_cam_y = 0;
 
     g_has_3d_character = 0;
+    actors_clear_npcs();
     try_start_3d_character_for_room(label);
+    room_scripts_load(label);
+    g_room_gen++;
+    g_room_entered = 1; /* game_tick: the room's arrival / auto script */
     resize_window_to_room();
     center_view_on_david();
+    return 1;
+}
+
+/* Script action BACKGROUND: the room shows another picture (a path under
+   assets/levels, stretched to the room's size if it differs), "" = its own
+   picture again. Only the picture: geometry, depth, shapes stay the room's. */
+static int background_set(const char *file) {
+    if (!g_loaded) return 0;
+    size_t npix = (size_t)g_hdr.width * g_hdr.height;
+    if (!file || !file[0]) {
+        if (g_dib_own) { memcpy(g_dib_pixels, g_dib_own, npix * sizeof(uint32_t)); free(g_dib_own); g_dib_own = NULL; }
+        return 1;
+    }
+    char path[1024];
+    root_path(path, sizeof(path), "assets/levels/%s", file);
+    int w = 0, h = 0;
+    uint32_t *px = image_load(path, &w, &h);
+    if (!px) { snprintf(g_status, sizeof(g_status), "script: picture not found: assets/levels/%s", file); return 0; }
+    if (!g_dib_own) {
+        g_dib_own = (uint32_t *)malloc(npix * sizeof(uint32_t));
+        if (g_dib_own) memcpy(g_dib_own, g_dib_pixels, npix * sizeof(uint32_t));
+    }
+    int W = (int)g_hdr.width, H = (int)g_hdr.height;
+    for (int y = 0; y < H; y++) {
+        const uint32_t *src = px + (size_t)(y * h / H) * w;
+        for (int x = 0; x < W; x++) g_dib_pixels[(size_t)y * g_dib_stride + x] = src[x * w / W] & 0x00FFFFFFu;
+    }
+    free(px);
     return 1;
 }
 
@@ -2588,6 +2659,135 @@ static void run_camera_calibration(void) {
 }
 
 /* =====================================================================
+   MOVESETS: the animations a character walks with
+   ---------------------------------------------------------------------
+   13 slots (MC_*): stand / walk / run cycles and the start / turn clips
+   played when it sets off or changes direction (see move_clip_for).
+   Each character model (folder of assets/chars) has one moveset:
+   the HUMAN preset -- David's own clips -- or none, plus per-slot
+   overrides (another clip, or "no animation") that never change the
+   preset itself. Saved in data/movesets/<model>.cfg (only when it
+   differs from "human preset, no override"):
+     preset human|none
+     <slot key> <source>/<clip name>   (or  -  = no animation)
+   A clip only plays on a skeleton with the same bone count.
+   ===================================================================== */
+static const char *MOVE_SLOT_KEY[MC_COUNT] = {
+    "run_turn_left", "run_turn_right", "run_back_left", "run_back_right",
+    "walk_turn_left", "walk_turn_right", "start_walk", "start_run", "walk_back_left", "walk_back_right",
+    "stand", "walk", "run" };
+static const char *MOVE_SLOT_LABEL[MC_COUNT] = {
+    "Run: turn left", "Run: turn right", "Run: back via left", "Run: back via right",
+    "Walk: turn left", "Walk: turn right", "Start walking", "Start running", "Walk: back via left", "Walk: back via right",
+    "Stand", "Walk", "Run" };
+static const char *MOVE_SLOT_DESC[MC_COUNT] = {
+    "Running, the new direction is 45-135 degrees to its left: played while it turns, then the run cycle.",
+    "Running, the new direction is 45-135 degrees to its right.",
+    "Running, the new direction is behind it: turns around via its left.",
+    "Running, the new direction is behind it: turns around via its right.",
+    "Walking (or standing), the new direction is 45-135 degrees to its left.",
+    "Walking (or standing), the new direction is 45-135 degrees to its right.",
+    "Standing still, it sets off walking straight ahead.",
+    "Standing still, it sets off running straight ahead.",
+    "Walking, the new direction is behind it: turns around via its left.",
+    "Walking, the new direction is behind it: turns around via its right.",
+    "Standing still (loops).", "The walk cycle (loops).", "The run cycle (loops)." };
+static const char *HUMAN_PRESET[MC_COUNT] = { "run90a", "run90c", "run180a", "run180c", "towalka", "towalkc", "towalk", "torun", "to180a", "to180c",
+                                             "stand", "walk", "run" };
+typedef struct {
+    char model[48];
+    int human;                   /* preset: 1 human, 0 none */
+    char slot[MC_COUNT][100];    /* "" = the preset's, "-" = no animation, else "source/name" */
+} Moveset;
+#define MAX_MOVESETS 64
+static Moveset g_movesets[MAX_MOVESETS];
+static int g_moveset_count = 0;
+static int g_moveset_gen = 1;    /* bumped on every change: characters re-resolve their clips */
+
+static void moveset_path(char *out, size_t n, const char *model) { root_path(out, n, "data/movesets/%s.cfg", model); }
+
+static Moveset *moveset_get(const char *model) {
+    for (int i = 0; i < g_moveset_count; i++) if (!strcmp(g_movesets[i].model, model)) return &g_movesets[i];
+    if (g_moveset_count >= MAX_MOVESETS) return &g_movesets[0];
+    Moveset *ms = &g_movesets[g_moveset_count++];
+    memset(ms, 0, sizeof(*ms));
+    snprintf(ms->model, sizeof(ms->model), "%s", model);
+    ms->human = 1;
+    char path[1024], line[256], key[64], val[128];
+    moveset_path(path, sizeof(path), model);
+    FILE *f = fopen(path, "r");
+    if (f) {
+        while (fgets(line, sizeof(line), f)) {
+            if (sscanf(line, "%63s %127s", key, val) != 2 || key[0] == '#') continue;
+            if (!strcmp(key, "preset")) { ms->human = !strcmp(val, "human"); continue; }
+            for (int k = 0; k < MC_COUNT; k++) if (!strcmp(key, MOVE_SLOT_KEY[k])) snprintf(ms->slot[k], sizeof(ms->slot[k]), "%s", val);
+        }
+        fclose(f);
+    }
+    return ms;
+}
+
+static void moveset_save(const Moveset *ms) {
+    char path[1024];
+    moveset_path(path, sizeof(path), ms->model);
+    int custom = !ms->human;
+    for (int k = 0; k < MC_COUNT; k++) if (ms->slot[k][0]) custom = 1;
+    g_moveset_gen++;
+    if (!custom) { remove(path); return; }
+    ensure_parent_dir(path);
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+    fprintf(f, "# Silver Remaster: %s's moveset (walking animations). Only the slots differing from the preset.\n", ms->model);
+    fprintf(f, "preset %s\n", ms->human ? "human" : "none");
+    for (int k = 0; k < MC_COUNT; k++) if (ms->slot[k][0]) fprintf(f, "%s %s\n", MOVE_SLOT_KEY[k], ms->slot[k]);
+    fclose(f);
+}
+
+/* "source/name" -> library clip */
+static int anim_lib_find_ref(const char *ref) {
+    const char *sl = strchr(ref, '/');
+    if (!sl) return anim_lib_find(ref);
+    for (int i = 0; i < anim_lib_count(); i++)
+        if (!strcmp(anim_lib_name(i), sl + 1) && !strncmp(anim_lib_source(i), ref, (size_t)(sl - ref)) && anim_lib_source(i)[sl - ref] == 0) return i;
+    return -1;
+}
+
+/* The clip a slot plays (-1: none). *how: 0 preset, 1 custom, 2 no animation */
+static int moveset_clip(const Moveset *ms, int slot, int *how) {
+    const char *v = ms->slot[slot];
+    if (!strcmp(v, "-")) { if (how) *how = 2; return -1; }
+    if (v[0]) { if (how) *how = 1; return anim_lib_find_ref(v); }
+    if (how) *how = ms->human ? 0 : 2;
+    return ms->human ? anim_lib_find(HUMAN_PRESET[slot]) : -1;
+}
+
+static void actor_resolve_clips(Actor *a) {
+    if (a->clips_gen == g_moveset_gen) return;
+    a->clips_gen = g_moveset_gen;
+    const Moveset *ms = moveset_get(a->model->name[0] ? a->model->name : "david");
+    for (int k = 0; k < MC_COUNT; k++) {
+        int c = moveset_clip(ms, k, NULL);
+        a->clips[k] = (c >= 0 && anim_lib_fits(c, a->model->node_count)) ? c : -1;
+    }
+}
+
+/* ---- the characters of the room ---- */
+static void actor_reset(Actor *a, CharModel *m, int place_id) {
+    memset(a, 0, sizeof(*a));
+    a->used = 1; a->model = m; a->place_id = place_id;
+    a->turn_clip = -1; a->pending_door = -1;
+}
+/* script characters leave with the room */
+static void actors_clear_npcs(void) {
+    for (int k = 1; k < MAX_ACTORS; k++) g_actors[k].used = 0;
+}
+static Actor *actor_by_place_id(int id) {
+    if (id == 0) return DAVID_ACTOR;
+    for (int k = 1; k < MAX_ACTORS; k++) if (g_actors[k].used && g_actors[k].place_id == id) return &g_actors[k];
+    return NULL;
+}
+
+/* =====================================================================
    SCENE EDITOR + TOOL UI
    ---------------------------------------------------------------------
    Everything the user authors per room is a SHAPE drawn on the room
@@ -2625,6 +2825,7 @@ typedef struct {
     float step[3], arrival[3];   /* world points on this room's floor */
     char target[128];            /* target room label ("level/room"), "" = none yet */
     int target_door;             /* id of the linked shape in the target room, -1 = none */
+    char script[64];             /* script of the target room played when David arrives through it, "" = none */
 } Shape;
 
 static Shape g_shapes[SHAPE_MAX];
@@ -2761,6 +2962,11 @@ static int shapes_read_file(const char *room, Shape *out, int max) {
         else if (sscanf(s, "step %f %f %f", &d.step[0], &d.step[1], &d.step[2]) == 3) d.has_step = 1;
         else if (sscanf(s, "arrival %f %f %f", &d.arrival[0], &d.arrival[1], &d.arrival[2]) == 3) d.has_arrival = 1;
         else if (strncmp(s, "target ", 7) == 0) { sscanf(s + 7, "%127s %d", d.target, &d.target_door); if (strcmp(d.target, "-") == 0) d.target[0] = 0; }
+        else if (strncmp(s, "script ", 7) == 0) {
+            snprintf(d.script, sizeof(d.script), "%s", s + 7);
+            size_t l = strlen(d.script);
+            while (l > 0 && (d.script[l - 1] == '\n' || d.script[l - 1] == '\r')) d.script[--l] = 0;
+        }
         else if (strncmp(s, "end", 3) == 0) { if (n < max) out[n++] = d; in = 0; }
     }
     fclose(f);
@@ -2772,7 +2978,7 @@ static void shapes_write_file(const char *room, const Shape *s, int n) {
     ensure_parent_dir(path);
     FILE *f = fopen(path, "w");
     if (!f) return;
-    fprintf(f, "# Silver Remaster scene shapes (editor: E). Roles: nav red|green, foreground, connector.\n");
+    fprintf(f, "# Silver Remaster scene shapes (editor: E). Roles: nav red|green, foreground, connector (script = played on arrival).\n");
     for (int i = 0; i < n; i++) {
         const Shape *z = &s[i];
         fprintf(f, "shape %d\ngeom ", z->id); write_geom(f, z);
@@ -2784,6 +2990,7 @@ static void shapes_write_file(const char *room, const Shape *s, int n) {
             if (z->has_step) fprintf(f, "step %.4f %.4f %.4f\n", z->step[0], z->step[1], z->step[2]);
             if (z->has_arrival) fprintf(f, "arrival %.4f %.4f %.4f\n", z->arrival[0], z->arrival[1], z->arrival[2]);
             fprintf(f, "target %s %d\n", z->target[0] ? z->target : "-", z->target_door);
+            if (z->script[0]) fprintf(f, "script %s\n", z->script);
         }
         fprintf(f, "end\n");
     }
@@ -2992,14 +3199,43 @@ static void far_side_set_target(const char *room_label, int id, const char *targ
 static void far_side_unlink(const char *room_label, int id) {
     static Shape tmp[SHAPE_MAX];
     int n = shapes_read_file(room_of_label(room_label), tmp, SHAPE_MAX);
-    for (int i = 0; i < n; i++) if (tmp[i].id == id) { tmp[i].door = 0; tmp[i].target[0] = 0; tmp[i].target_door = -1; tmp[i].has_step = tmp[i].has_arrival = 0; }
+    for (int i = 0; i < n; i++) if (tmp[i].id == id) { tmp[i].door = 0; tmp[i].target[0] = 0; tmp[i].target_door = -1; tmp[i].has_step = tmp[i].has_arrival = 0; tmp[i].script[0] = 0; }
     shapes_write_file(room_of_label(room_label), tmp, n);
 }
 
 static void connector_clear(int i) {
     Shape *s = &g_shapes[i];
     if (s->target[0] && s->target_door >= 0) far_side_unlink(s->target, s->target_door); /* both sides */
-    s->door = 0; s->target[0] = 0; s->target_door = -1; s->has_step = s->has_arrival = 0;
+    s->door = 0; s->target[0] = 0; s->target_door = -1; s->has_step = s->has_arrival = 0; s->script[0] = 0;
+}
+
+/* data/rooms/<level>/<room>_scripts.cfg */
+static void scripts_file_path(char *out, size_t n, const char *room_label) { root_path(out, n, "data/rooms/%s_scripts.cfg", room_label); }
+
+/* "Which script plays when David arrives in <room_label> through this
+   connector?" -- a menu of that room's scripts. Returns 1 if one was
+   picked (out = its name, "" = none), 0 if the menu was dismissed. */
+static int ask_arrival_script(const char *room_label, char *out, size_t n) {
+    char path[1024];
+    scripts_file_path(path, sizeof(path), room_label);
+    Script *sc = NULL;
+    int ns = scripts_load(path, &sc);
+    HMENU m = CreatePopupMenu();
+    char head[200];
+    snprintf(head, sizeof(head), "When David arrives in %s through this connector, play:", room_label);
+    AppendMenuA(m, MF_STRING | MF_GRAYED, 0, head);
+    AppendMenuA(m, MF_SEPARATOR, 0, NULL);
+    AppendMenuA(m, MF_STRING | (!out[0] ? MF_CHECKED : 0), 1, "None");
+    for (int i = 0; i < ns && i < 200; i++) AppendMenuA(m, MF_STRING | (!strcmp(out, sc[i].name) ? MF_CHECKED : 0), 2 + i, sc[i].name);
+    if (ns == 0) AppendMenuA(m, MF_STRING | MF_GRAYED, 0, "(that room has no script yet -- Scripts screen: S)");
+    POINT pt; GetCursorPos(&pt);
+    int cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_NONOTIFY, pt.x, pt.y, 0, g_hwnd, NULL);
+    DestroyMenu(m);
+    if (cmd == 1) out[0] = 0;
+    else if (cmd >= 2 && cmd - 2 < ns) snprintf(out, n, "%s", sc[cmd - 2].name);
+    for (int i = 0; i < ns; i++) script_free(&sc[i]);
+    free(sc);
+    return cmd >= 1;
 }
 
 static void wizard_cancel(const char *why) {
@@ -3067,6 +3303,8 @@ static void wizard_click(float px, float py) {
         shapes_changed(0);
         if (g_wiz_repick_only) { g_wiz = WIZ_NONE; g_wiz_shape = -1; g_wiz_repick_only = 0; snprintf(g_status, sizeof(g_status), "connector points updated"); return; }
         if (g_wiz_other_side) {
+            ask_arrival_script(g_wiz_src_room, d->script, sizeof(d->script));
+            shapes_changed(0);
             far_side_set_target(g_wiz_src_room, g_wiz_src_id, current_room_label(), d->id);
             snprintf(g_status, sizeof(g_status), "connector linked both ways: %s <-> %s", g_wiz_src_room, current_room_label());
             g_wiz = WIZ_NONE; g_wiz_shape = -1; g_wiz_other_side = 0;
@@ -3084,6 +3322,7 @@ static void wizard_target_chosen(HWND hwnd, int map_index) {
     if (d->target[0] && d->target_door >= 0) far_side_unlink(d->target, d->target_door); /* re-target: old far side released */
     snprintf(d->target, sizeof(d->target), "%s", e->label);
     d->target_door = -1;
+    ask_arrival_script(e->label, d->script, sizeof(d->script));
     shapes_changed(0);
     snprintf(g_wiz_src_room, sizeof(g_wiz_src_room), "%s", current_room_label());
     g_wiz_src_id = d->id;
@@ -3107,6 +3346,7 @@ static void door_travel(HWND hwnd, int di) {
     snprintf(title, sizeof(title), "Silver Remaster -- %s  [%d/%d]", g_map_rooms[ti].label, ti + 1, g_map_room_count);
     change_room(g_map_rooms[ti].label);
     SetWindowTextA(hwnd, title);
+    snprintf(g_arrival_script, sizeof(g_arrival_script), "%s", d.script);
     int j = shape_index_by_id(d.target_door);
     if (g_has_3d_character && j >= 0 && g_shapes[j].door && g_shapes[j].has_step) {
         /* appear on the other side's doorstep, then walk in */
@@ -3227,9 +3467,9 @@ static void fg_restore(void) {
 /* Tints into the room frame: P reachable floor (green), and in the
    editor the shapes by role. Called before David, so he's not tinted. */
 static void apply_nav_overlays(void) {
-    if (!g_has_3d_character || (!g_show_walkable && !g_edit_mode)) return;
+    if (!g_has_3d_character || (!g_show_walkable && !g_edit_mode && !g_sv_pick)) return;
     int W = (int)g_hdr.width, H = (int)g_hdr.height;
-    int picking = wizard_picking_points();
+    int picking = wizard_picking_points() || g_sv_pick;
     g_walk_mask_all = picking;
     if ((g_show_walkable || picking) && g_room_mesh_tri_count > 0) {
         ensure_walk_mask();
@@ -3259,14 +3499,16 @@ enum {
     B_NONE = 0, B_PREV, B_NEXT, B_LIST,
     B_WALK, B_HITBOX, B_MESH, B_COLL, B_FULL,
     B_EDIT, B_T_SELECT, B_T_RECT, B_T_CIRCLE, B_T_POLY, B_UNDO, B_DELETE,
-    B_R_RED, B_R_GREEN, B_R_FG, B_R_DOOR, B_R_REDO, B_R_RETARGET, B_W_CANCEL, B_SETTINGS, B_SET_RESET,
-    B_ANIMS, B_AV_MODEL, B_AV_PREV, B_AV_PLAY, B_AV_NEXT, B_AV_STEPB, B_AV_STEPF, B_AV_SLOWER, B_AV_FASTER, B_AV_FOLLOW, B_AV_RESET, B_AV_CLOSE,
-    B_SET_BASE = 100 /* + 2*i (-), + 2*i+1 (+) */
+    B_R_RED, B_R_GREEN, B_R_FG, B_R_DOOR, B_R_REDO, B_R_RETARGET, B_R_SCRIPT, B_W_CANCEL, B_SETTINGS, B_SET_RESET, B_SCRIPTS,
+    B_ANIMS, B_AV_MODEL, B_AV_MOVESET, B_AV_PREV, B_AV_PLAY, B_AV_NEXT, B_AV_STEPB, B_AV_STEPF, B_AV_SLOWER, B_AV_FASTER, B_AV_FOLLOW, B_AV_RESET, B_AV_CLOSE,
+    B_SET_BASE = 100, /* + 2*i (-), + 2*i+1 (+) */
+    B_SV_FIRST_ID = 300, B_SV_LAST_ID = 899 /* the scripts screen's (sv_action) */
 };
 typedef struct { int id; RECT r; const char *label; const char *key; const char *desc; int on; int enabled; int kind; } UiButton;
-#define UI_MAX_BTN 64
+#define UI_MAX_BTN 200
 static UiButton g_btn[UI_MAX_BTN];
 static int g_btn_count = 0;
+static char g_btn_text[UI_MAX_BTN][96]; /* labels built on the fly (ui_addf) */
 static int g_hover_btn = B_NONE;
 static RECT g_panel_left, g_panel_right;  /* g_panel_right empty in windowed mode */
 /* info column (right bar in fullscreen, under the buttons in windowed):
@@ -3277,6 +3519,11 @@ static int g_ui_caps_y = 0, g_ui_sel_y = 0, g_ui_next_y = 0;
 
 static int g_show_settings = 0; /* N: David & navigation settings panel */
 static int g_anim_view = 0;     /* A: animation viewer (full window) */
+static int g_script_view = 0;   /* S: scripts screen (full window) */
+static int g_ms_view = 0;       /* moveset screen (full window, over the others) */
+static int g_pick_for_script = 0; /* the character picker chooses a script action's model */
+static void script_view_toggle(void);
+static int screen_view(void) { return g_anim_view || g_script_view || g_ms_view; }
 static void anim_view_layout(HWND hwnd);
 static void anim_view_toggle(void);
 static void anim_view_action(int id);
@@ -3288,11 +3535,22 @@ static void ui_add(int id, int x, int y, int w, int h, const char *label, const 
     b->id = id; b->r.left = x; b->r.top = y; b->r.right = x + w; b->r.bottom = y + h;
     b->label = label; b->key = key; b->desc = desc; b->on = on; b->enabled = enabled; b->kind = kind;
 }
+/* same, with a label that doesn't have to outlive the call */
+static void ui_addf(int id, int x, int y, int w, int h, const char *label, const char *key, const char *desc, int on, int enabled, int kind) {
+    if (g_btn_count >= UI_MAX_BTN) return;
+    snprintf(g_btn_text[g_btn_count], sizeof(g_btn_text[0]), "%s", label);
+    ui_add(id, x, y, w, h, g_btn_text[g_btn_count], key, desc, on, enabled, kind);
+}
 
 /* Lays out every button for the current window/mode. Called before
    painting AND before hit-testing, so both always agree. */
+static void sv_layout(HWND hwnd);
+static void ms_layout(HWND hwnd);
+static void sv_action(HWND hwnd, int id);
 static void ui_layout(HWND hwnd) {
+    if (g_ms_view) { ms_layout(hwnd); return; }
     if (g_anim_view) { anim_view_layout(hwnd); return; }
+    if (g_script_view) { sv_layout(hwnd); return; }
     RECT rc; GetClientRect(hwnd, &rc);
     int win_w, win_h, ox, oy; float sc;
     get_view_window(&win_w, &win_h, &sc, &ox, &oy);
@@ -3324,6 +3582,8 @@ static void ui_layout(HWND hwnd) {
     y += h + gap;
     ui_add(B_ANIMS, x + half + 6, y, half, h, "Animations", "A", "Watch every animation of the chars folder played on David (list, play/pause, frame by frame, rotate, zoom).", 0, 1, 0);
     ui_add(B_FULL, x, y, half, h, g_is_fullscreen ? "Windowed" : "Fullscreen", "F11", "Switch between window and fullscreen (4:3 picture, tools in the side bars).", g_is_fullscreen, 1, 0);
+    y += h + gap;
+    ui_add(B_SCRIPTS, x, y, w, h, "Scripts...", "S", "This room's scripts (cutscenes): a grid of actions -- waits, music, sounds, ambiences, pictures, characters placed and moved. Play them from there.", 0, g_has_3d_character, 0);
     y += h + gap + 18;
     (void)vy;
     /* editor */
@@ -3381,8 +3641,10 @@ static void ui_layout(HWND hwnd) {
             ui_add(B_R_REDO, rx, ry, rhalf, rh, "Redo points", "", "Pick again the doorstep (1) and the arrival point (2) of this connector.", 0, 1, 0);
             ui_add(B_R_RETARGET, rx + rhalf + 6, ry, rhalf, rh, "Change room", "", "Choose another target room for this connector.", 0, 1, 0);
             ry += rh + gap;
+            ui_add(B_R_SCRIPT, rx, ry, rw, rh, "Arrival script...", "", "The script of the target room played when David arrives there through this connector (None = none).", s->script[0] != 0, s->target[0] != 0, 0);
+            ry += rh + gap;
         }
-        g_ui_next_y = ry + (s->door ? 24 : 4); /* + the connector's 'Leads to' line */
+        g_ui_next_y = ry + (s->door ? 44 : 4); /* + the connector's 'Leads to' / 'Plays' lines */
     }
     if (g_wiz != WIZ_NONE && g_wiz != WIZ_TARGET) {
         int rx, rw, ry;
@@ -3436,6 +3698,7 @@ static void settings_applied(int nav) {
 
 /* One place for every action (buttons and keyboard shortcuts alike). */
 static void ui_action(HWND hwnd, int id) {
+    if (id >= B_SV_FIRST_ID && id <= B_SV_LAST_ID) { sv_action(hwnd, id); InvalidateRect(hwnd, NULL, FALSE); return; }
     switch (id) {
         case B_PREV: go_to_room_index(hwnd, g_current_map_room < 0 ? 0 : g_current_map_room - 1); break;
         case B_NEXT: go_to_room_index(hwnd, g_current_map_room + 1); break;
@@ -3476,9 +3739,17 @@ static void ui_action(HWND hwnd, int id) {
         case B_R_DOOR: if (g_sel >= 0) shape_toggle_door(g_sel); break;
         case B_R_REDO: if (g_sel >= 0 && g_shapes[g_sel].door) { g_wiz = WIZ_STEP; g_wiz_shape = g_sel; g_wiz_repick_only = 1; g_wiz_other_side = 0; } break;
         case B_R_RETARGET: if (g_sel >= 0 && g_shapes[g_sel].door) { g_wiz_shape = g_sel; g_wiz_repick_only = 0; g_wiz_other_side = 0; wizard_open_target_list(); } break;
+        case B_R_SCRIPT:
+            if (g_sel >= 0 && g_shapes[g_sel].door && g_shapes[g_sel].target[0] &&
+                ask_arrival_script(g_shapes[g_sel].target, g_shapes[g_sel].script, sizeof(g_shapes[g_sel].script))) {
+                shapes_changed(0);
+                snprintf(g_status, sizeof(g_status), "arrival script: %s", g_shapes[g_sel].script[0] ? g_shapes[g_sel].script : "none");
+            }
+            break;
+        case B_SCRIPTS: script_view_toggle(); break;
         case B_SETTINGS: g_show_settings = !g_show_settings; break;
         case B_ANIMS: anim_view_toggle(); break;
-        case B_AV_MODEL: case B_AV_PREV: case B_AV_PLAY: case B_AV_NEXT: case B_AV_STEPB: case B_AV_STEPF:
+        case B_AV_MODEL: case B_AV_MOVESET: case B_AV_PREV: case B_AV_PLAY: case B_AV_NEXT: case B_AV_STEPB: case B_AV_STEPF:
         case B_AV_SLOWER: case B_AV_FASTER: case B_AV_FOLLOW: case B_AV_RESET: case B_AV_CLOSE:
             anim_view_action(id); break;
         case B_SET_RESET: {
@@ -3553,7 +3824,10 @@ static void ui_draw_buttons(HDC hdc) {
     }
 }
 
+static const char *script_step_text(char *buf, size_t n, const char **sub); /* SCRIPTS */
 static const char *wizard_step_text(char *buf, size_t n, const char **sub) {
+    const char *st = script_step_text(buf, n, sub);
+    if (st) return st;
     *sub = "";
     switch (g_wiz) {
         case WIZ_STEP:
@@ -3642,6 +3916,8 @@ static void ui_draw_panels(HWND hwnd, HDC hdc) {
             SelectObject(hdc, fn);
             snprintf(t, sizeof(t), "Leads to: %s%s", s->target[0] ? s->target : "(not set)", s->target[0] && s->target_door < 0 ? " -- one-way" : "");
             ui_text(hdc, ix, ty, iw, 18, t, RGB(140, 200, 255), DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
+            snprintf(t, sizeof(t), "Plays on arrival: %s", s->script[0] ? s->script : "no script");
+            ui_text(hdc, ix, ty + 20, iw, 18, t, s->script[0] ? RGB(255, 210, 110) : RGB(140, 140, 150), DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
         }
     }
     iy = g_ui_next_y + 6;
@@ -3762,10 +4038,13 @@ static void draw_world_point(HDC hdc, const float w[3], const char *label, COLOR
     SelectObject(hdc, of);
 }
 
+static int sv_pick_marker(float out[3]); /* SCRIPTS */
 static void draw_editor_overlays(HDC hdc) {
     if (!g_has_3d_character) return;
-    int show = g_edit_mode || g_show_walkable;
+    int show = g_edit_mode || g_show_walkable || g_sv_pick;
     if (!show) return;
+    float pm[3];
+    if (sv_pick_marker(pm)) draw_world_point(hdc, pm, "1 the character", RGB(255, 220, 60));
     HBRUSH ob = (HBRUSH)SelectObject(hdc, GetStockObject(NULL_BRUSH));
     HFONT f = ui_font(13, 0); HFONT of = (HFONT)SelectObject(hdc, f);
     SetBkMode(hdc, TRANSPARENT);
@@ -3966,6 +4245,7 @@ static void edit_context_menu(HWND hwnd, float rx, float ry, int client_x, int c
         AppendMenuA(m, MF_SEPARATOR, 0, NULL);
         AppendMenuA(m, MF_STRING, 11, "Redo the doorstep / arrival points");
         AppendMenuA(m, MF_STRING, 12, "Change target room...");
+        AppendMenuA(m, MF_STRING | (s->target[0] ? 0 : MF_GRAYED), 13, "Arrival script...");
     }
     AppendMenuA(m, MF_SEPARATOR, 0, NULL);
     if (vertex >= 0) AppendMenuA(m, MF_STRING, 6, "Delete this corner");
@@ -3980,6 +4260,7 @@ static void edit_context_menu(HWND hwnd, float rx, float ry, int client_x, int c
         case 4: shape_toggle_door(i); break;
         case 11: ui_action(hwnd, B_R_REDO); break;
         case 12: ui_action(hwnd, B_R_RETARGET); break;
+        case 13: ui_action(hwnd, B_R_SCRIPT); break;
         case 5: shape_delete(i); break;
         case 6:
             undo_push();
@@ -4076,7 +4357,7 @@ static void load_game_cursors(void) {
 static void update_cursor_clip(HWND hwnd) {
     static int no_clip = -1; /* SILVER_NO_CLIP=1: automated test runs never trap the mouse */
     if (no_clip < 0) no_clip = getenv("SILVER_NO_CLIP") != NULL;
-    int want = !no_clip && g_loaded && !caps_on() && !g_map_mode && !g_anim_view && GetForegroundWindow() == hwnd && !IsIconic(hwnd);
+    int want = !no_clip && g_loaded && !caps_on() && !g_map_mode && !screen_view() && GetForegroundWindow() == hwnd && !IsIconic(hwnd);
     if (!want) {
         if (g_clip_active) { ClipCursor(NULL); g_clip_active = 0; }
         return;
@@ -4093,7 +4374,7 @@ static int mouse_in_game(int cx, int cy) { RECT r; game_rect_client(&r); return 
 /* Which way the view would scroll with the mouse here (0 = none): only
    directions the view can actually still move in. */
 static int pan_direction(int cx, int cy) {
-    if (caps_on() || g_map_mode || g_anim_view || !g_loaded || g_drag != DRAG_NONE) return 0;
+    if (caps_on() || g_map_mode || screen_view() || script_playing() || !g_loaded || g_drag != DRAG_NONE) return 0;
     RECT r; game_rect_client(&r);
     if (!(cx >= r.left && cx < r.right && cy >= r.top && cy < r.bottom)) return 0;
     const int EDGE = 18;
@@ -4113,8 +4394,9 @@ static int pan_direction(int cx, int cy) {
 }
 
 static HCURSOR cursor_for(int cx, int cy) {
-    if (g_anim_view) return ui_hit(cx, cy) != B_NONE ? LoadCursorA(NULL, IDC_HAND) : g_cursor_arrow;
+    if (screen_view()) return ui_hit(cx, cy) != B_NONE ? LoadCursorA(NULL, IDC_HAND) : g_cursor_arrow;
     if (g_map_mode) return g_cursor_arrow;
+    if (g_sv_pick && mouse_in_game(cx, cy)) return LoadCursorA(NULL, IDC_CROSS);
     if (!mouse_in_game(cx, cy)) return ui_hit(cx, cy) != B_NONE ? LoadCursorA(NULL, IDC_HAND) : g_cursor_arrow;
     if (g_edit_mode) { /* editor: standard Windows cursors, never the game's */
         if (g_pan_dir) {
@@ -4176,6 +4458,24 @@ static int g_mouse_x = 0, g_mouse_y = 0;
 
 static int g_anim_view_lib_n = 0;
 static void anim_view_filter(void);
+static void sv_model_chosen(const char *name); /* SCRIPTS */
+static void ms_open(CharModel *m);            /* moveset screen */
+
+/* A character's own clips join the animation library once (the picker
+   and the scripts' characters both need them). Returns how many it has. */
+static int char_clips_add(const char *name, const char *dir) {
+    static char added[512][48];
+    static int n_added = 0;
+    int known = 0;
+    for (int i = 0; i < n_added; i++) if (!strcmp(added[i], name)) known = 1;
+    if (!known) {
+        if (n_added < 512) snprintf(added[n_added++], sizeof(added[0]), "%s", name);
+        return anim_lib_add_dir(dir, name);
+    }
+    int c = 0;
+    for (int k = 0; k < anim_lib_count(); k++) if (!strcmp(anim_lib_source(k), name)) c++;
+    return c;
+}
 
 static int pick_name_cmp(const void *a, const void *b) { return strcmp(((const PickEntry *)a)->model.name, ((const PickEntry *)b)->model.name); }
 
@@ -4202,7 +4502,7 @@ static void pick_scan(void) {
         for (char *q = lower; *q; q++) if (*q >= 'A' && *q <= 'Z') *q += 32;
         if (!char_model_load(&e->model, dir, lower) || e->model.node_count <= 6) { char_model_free(&e->model); continue; }
         /* its own clips join the library (David's are in it already) */
-        e->own_clips = strcmp(lower, "david") ? anim_lib_add_dir(dir, lower) : 0;
+        e->own_clips = strcmp(lower, "david") ? char_clips_add(lower, dir) : 0;
         g_pick_count++;
     } while (FindNextFileA(h, &fd));
     FindClose(h);
@@ -4215,6 +4515,25 @@ static void pick_scan(void) {
         e->preview_clip = -2; /* chosen on first draw */
     }
     g_anim_view_lib_n = anim_lib_count();
+}
+
+/* The model of a character of assets/chars by its folder name (David's
+   own, the picker's if it was opened, else loaded now -- once). */
+static CharModel *model_by_name(const char *name) {
+    if (!name || !name[0]) return NULL;
+    if (!strcmp(name, "david")) return &g_david;
+    for (int i = 0; i < g_pick_count; i++) if (!strcmp(g_pick[i].model.name, name)) return &g_pick[i].model;
+    static CharModel *loaded[64];
+    static int n_loaded = 0;
+    for (int i = 0; i < n_loaded; i++) if (!strcmp(loaded[i]->name, name)) return loaded[i];
+    if (n_loaded >= 64) return NULL;
+    char dir[1024];
+    root_path(dir, sizeof(dir), "assets/chars/%s", name);
+    CharModel *m = (CharModel *)calloc(1, sizeof(CharModel));
+    if (!m || !char_model_load(m, dir, name) || m->node_count <= 6) { if (m) { char_model_free(m); free(m); } return NULL; }
+    char_clips_add(name, dir);
+    loaded[n_loaded++] = m;
+    return m;
 }
 
 /* A standing pose for the card: an own clip named like an idle, the shared
@@ -4235,7 +4554,7 @@ static int pick_preview_clip(const PickEntry *e) {
 }
 
 static void anim_view_rects(HWND hwnd);
-#define ANIM_BUTTONS_W 1090 /* total width of the button row */
+#define ANIM_BUTTONS_W 1192 /* total width of the button row */
 static void anim_view_rects(HWND hwnd) {
     RECT rc; GetClientRect(hwnd, &rc);
     int two_rows = (rc.right - 10 - 300) < ANIM_BUTTONS_W;
@@ -4504,6 +4823,11 @@ static void picker_open(void) {
 static void picker_choose(void) {
     if (g_pick_filtered_count <= 0) return;
     PickEntry *e = &g_pick[g_pick_filtered[g_pick_sel]];
+    if (g_pick_for_script) { /* a script's "Place character": back to the scripts screen */
+        g_pick_for_script = 0; g_picker = 0; g_anim_view = 0;
+        sv_model_chosen(e->model.name);
+        return;
+    }
     g_view_model = !strcmp(e->model.name, "david") ? &g_david : &e->model;
     g_picker = 0;
     g_anim_filter[0] = 0; g_anim_filter_len = 0;
@@ -4593,6 +4917,7 @@ static void anim_view_layout(HWND hwnd) {
     snprintf(model_lbl, sizeof(model_lbl), "Model: %s", g_view_model->name);
     struct { int id, w; const char *label, *key, *desc; int on; } b[] = {
         { B_AV_MODEL, 130, model_lbl, "Tab", "Choose another character of the game (grid with previews).", 0 },
+        { B_AV_MOVESET, 96, "Moveset...", "", "The animations this character walks with (stand, walk, run, starts and turns), as a graph -- change any of them.", 0 },
         { B_AV_PREV, 92, "< Prev", "Up", "Previous animation in the list.", 0 },
         { B_AV_PLAY, 104, g_anim_paused ? "Play" : "Pause", "Space", "Play / pause the animation (it loops).", g_anim_paused },
         { B_AV_NEXT, 92, "Next >", "Down", "Next animation in the list.", 0 },
@@ -4614,6 +4939,7 @@ static void anim_view_layout(HWND hwnd) {
 static void anim_view_action(int id) {
     switch (id) {
         case B_AV_MODEL: picker_open(); break;
+        case B_AV_MOVESET: ms_open(g_view_model); break;
         case B_AV_PREV: anim_select(g_anim_sel - 1); break;
         case B_AV_NEXT: anim_select(g_anim_sel + 1); break;
         case B_AV_PLAY: g_anim_paused = !g_anim_paused; break;
@@ -4703,7 +5029,7 @@ static int anim_view_key(int vk) {
     if (g_picker) {
         int cols = pick_cols(), page = cols * pick_rows_visible();
         switch (vk) {
-            case VK_ESCAPE: case VK_TAB: g_picker = 0; return 1;
+            case VK_ESCAPE: case VK_TAB: g_picker = 0; if (g_pick_for_script) { g_pick_for_script = 0; g_anim_view = 0; } return 1;
             case VK_RETURN: picker_choose(); return 1;
             case VK_LEFT: pick_select(g_pick_sel - 1); return 1;
             case VK_RIGHT: pick_select(g_pick_sel + 1); return 1;
@@ -4822,6 +5148,1637 @@ static void anim_view_wheel(int x, int y, int delta) {
     if (g_anim_zoom > 4.0f) g_anim_zoom = 4.0f;
 }
 
+/* =====================================================================
+   SCRIPTS (S): the room's cutscenes
+   ---------------------------------------------------------------------
+   A script is a grid of actions (see script.h). Played row by row: every
+   action of a row starts at once, the next row starts when all of them are
+   finished. While a script plays the player can do nothing but left-click
+   to skip the current row -- not a row that moves a character (it waits
+   for the character to arrive). Esc stops it (testing).
+   A script plays when David arrives through a connector that names it,
+   or -- entering the room any other way -- the room's first script
+   marked "auto". The Scripts screen (S) edits them and plays them.
+   ===================================================================== */
+
+/* ---- this room's scripts (data/rooms/<level>/<room>_scripts.cfg) ---- */
+static Script *g_scripts = NULL;
+static int g_script_count = 0;
+static char g_scripts_room[128] = "";
+
+static void room_scripts_free(void) {
+    for (int i = 0; i < g_script_count; i++) script_free(&g_scripts[i]);
+    free(g_scripts);
+    g_scripts = NULL; g_script_count = 0;
+}
+static void room_scripts_load(const char *label) {
+    room_scripts_free();
+    snprintf(g_scripts_room, sizeof(g_scripts_room), "%s", label);
+    char path[1024];
+    scripts_file_path(path, sizeof(path), label);
+    g_script_count = scripts_load(path, &g_scripts);
+}
+static void room_scripts_save(void) {
+    if (!g_scripts_room[0]) return;
+    char path[1024];
+    scripts_file_path(path, sizeof(path), g_scripts_room);
+    ensure_parent_dir(path);
+    scripts_save(path, g_scripts, g_script_count);
+}
+static int room_script_find(const char *name) {
+    for (int i = 0; i < g_script_count; i++) if (!strcmp(g_scripts[i].name, name)) return i;
+    return -1;
+}
+
+/* ---- playing ---- */
+#define RUN_MAX_VOICES 64
+typedef struct {
+    int done;
+    int voice;          /* SOUND / AMBIENCE */
+    float timer;        /* WAIT */
+    Actor *actor;       /* MOVE */
+    int door, room_gen; /* MOVE through a connector */
+} CellRun;
+static struct {
+    int active;
+    Script s;           /* a copy: editing or leaving the room doesn't touch it */
+    int row, row_started;
+    CellRun cell[SCRIPT_MAX_COLS];
+    int voice_action[RUN_MAX_VOICES], voice_id[RUN_MAX_VOICES], nvoices;
+} g_run;
+
+static int script_playing(void) { return g_run.active; }
+
+static void script_stop(const char *why) {
+    if (!g_run.active) return;
+    snprintf(g_status, sizeof(g_status), "script \"%s\" %s", g_run.s.name, why ? why : "finished");
+    g_run.active = 0;
+    script_free(&g_run.s);
+}
+
+static void script_start(const Script *sc, int from_row) {
+    script_stop("stopped");
+    memset(&g_run, 0, sizeof(g_run));
+    script_copy(&g_run.s, sc);
+    g_run.active = 1;
+    g_run.row = from_row < 0 ? 0 : from_row;
+    DAVID_ACTOR->pending_door = -1; /* the player's last order is over */
+    g_click_marker_active = 0;
+    snprintf(g_status, sizeof(g_status), "playing script \"%s\"", sc->name);
+}
+
+/* A character comes in (or is put back) where the action says. */
+static Actor *actor_place(const ScriptAction *a) {
+    if (!g_has_3d_character) return NULL;
+    if (!a->model[0] || !a->has_pos) { snprintf(g_status, sizeof(g_status), "script: a 'Place character' has no character or position"); return NULL; }
+    CharModel *m = model_by_name(a->model);
+    if (!m) { snprintf(g_status, sizeof(g_status), "script: character '%s' not found in assets/chars", a->model); return NULL; }
+    Actor *ac = actor_by_place_id(a->id);
+    if (!ac) for (int k = 1; k < MAX_ACTORS && !ac; k++) if (!g_actors[k].used) ac = &g_actors[k];
+    if (!ac) { snprintf(g_status, sizeof(g_status), "script: too many characters in the room (max %d)", MAX_ACTORS - 1); return NULL; }
+    actor_reset(ac, m, a->id);
+    memcpy(ac->pos, a->pos, sizeof(ac->pos));
+    memcpy(ac->target, a->pos, sizeof(ac->target));
+    ac->facing = a->facing;
+    return ac;
+}
+
+static void run_start_move(const ScriptAction *a, CellRun *c) {
+    char who[96];
+    script_actor_name(&g_run.s, a->actor, who, sizeof(who));
+    Actor *ac = actor_by_place_id(a->actor);
+    if (!ac) { snprintf(g_status, sizeof(g_status), "script: %s isn't in the room", who); return; }
+    c->actor = ac;
+    int ok = 0, no_door = 0;
+    actor_begin(ac);
+    if (a->door) {
+        int di = shape_index_by_id(a->door);
+        if (di >= 0 && g_shapes[di].door && g_shapes[di].has_step) {
+            g_click_fail = 0;
+            ok = move_to_world_point(g_shapes[di].step, a->run);
+            if (ok) {
+                c->door = 1; c->room_gen = g_room_gen;
+                g_pending_door = di;
+                if (!g_char_moving) { /* already on the doorstep */
+                    if (ac == DAVID_ACTOR) g_door_travel_request = di; else ac->used = 0;
+                    g_pending_door = -1;
+                }
+            }
+        } else no_door = 1;
+    } else if (a->has_pos) ok = move_to_world_point(a->pos, a->run);
+    actor_end();
+    if (no_door) { snprintf(g_status, sizeof(g_status), "script: connector #%d isn't in this room", a->door); return; }
+    if (!ok) { snprintf(g_status, sizeof(g_status), "script: %s can't get there", who); return; }
+    c->done = 0;
+}
+
+static int *run_voice_slot(int action_id) {
+    for (int i = 0; i < g_run.nvoices; i++) if (g_run.voice_action[i] == action_id) return &g_run.voice_id[i];
+    if (g_run.nvoices >= RUN_MAX_VOICES) return NULL;
+    g_run.voice_action[g_run.nvoices] = action_id;
+    return &g_run.voice_id[g_run.nvoices++];
+}
+
+static void run_start(const ScriptAction *a, CellRun *c) {
+    c->done = 1;
+    switch (a->type) {
+        case ACT_WAIT: c->timer = a->seconds; c->done = a->seconds <= 0.0f; break;
+        case ACT_BACKGROUND: background_set(a->file); break;
+        case ACT_MUSIC: {
+            AudioTrack t[AUDIO_MAX_TRACKS];
+            for (int i = 0; i < a->ntracks; i++) { snprintf(t[i].file, sizeof(t[i].file), "%s", a->track[i]); t[i].loop = a->track_loop[i]; }
+            audio_music_play(t, a->ntracks);
+            break;
+        }
+        case ACT_SOUND: case ACT_AMBIENCE: {
+            int snd = a->type == ACT_SOUND;
+            c->voice = audio_play(a->file, snd ? AUDIO_SOUND : AUDIO_AMBIENCE, snd ? a->repeat : 0, !snd && a->loop);
+            int *slot = run_voice_slot(a->id);
+            if (slot) *slot = c->voice;
+            if (snd && a->wait_end && c->voice) c->done = 0;
+            break;
+        }
+        case ACT_STOP:
+            if (a->stop_kind == STOP_MUSIC) audio_music_stop();
+            else if (a->stop_kind == STOP_ALL_SOUNDS) { audio_stop_kind(AUDIO_SOUND); audio_stop_kind(AUDIO_AMBIENCE); }
+            else for (int i = 0; i < g_run.nvoices; i++) if (g_run.voice_action[i] == a->stop_ref) audio_stop(g_run.voice_id[i]);
+            break;
+        case ACT_PLACE: actor_place(a); break;
+        case ACT_MOVE: run_start_move(a, c); break;
+    }
+}
+
+static int run_cell_done(const ScriptAction *a, CellRun *c, float dt) {
+    if (c->done) return 1;
+    switch (a->type) {
+        case ACT_WAIT: c->timer -= dt; if (c->timer <= 0.0f) c->done = 1; break;
+        case ACT_SOUND: if (!audio_playing(c->voice)) c->done = 1; break;
+        case ACT_MOVE: {
+            Actor *ac = c->actor;
+            int gone = !ac->used || ac->place_id != a->actor;
+            if (c->door && ac == DAVID_ACTOR)
+                /* only once in the other room -- or if he stopped without going through (a
+                   connector without target room: the row would otherwise never end) */
+                c->done = g_room_gen != c->room_gen || (!ac->moving && ac->pending_door < 0 && g_door_travel_request < 0);
+            else if (c->door) c->done = gone;
+            else c->done = gone || !ac->moving;
+            break;
+        }
+        default: c->done = 1;
+    }
+    return c->done;
+}
+
+static int script_row_has_move(const Script *s, int row) {
+    for (int c = 0; c < s->cols; c++) { ScriptAction *a = script_at((Script *)s, row, c); if (a && a->type == ACT_MOVE) return 1; }
+    return 0;
+}
+
+/* Left-click while a script plays. */
+static void script_skip_row(void) {
+    if (!g_run.active) return;
+    if (script_row_has_move(&g_run.s, g_run.row)) {
+        snprintf(g_status, sizeof(g_status), "this row can't be skipped: a character is moving");
+        return;
+    }
+    for (int c = 0; c < SCRIPT_MAX_COLS; c++) { g_run.cell[c].done = 1; g_run.cell[c].timer = 0.0f; }
+    if (!g_run.row_started) { g_run.row++; }
+}
+
+/* Every game step: a room just entered starts its script, then the one
+   playing goes on (several rows in one step if they finish at once). */
+static void script_tick(HWND hwnd, float dt) {
+    (void)hwnd;
+    if (g_room_entered) {
+        g_room_entered = 0;
+        if (!g_run.active && !g_edit_mode && !g_script_view && g_has_3d_character) {
+            int i = -1;
+            if (g_arrival_script[0]) i = room_script_find(g_arrival_script);
+            else for (int k = 0; k < g_script_count && i < 0; k++) if (g_scripts[k].auto_run) i = k;
+            if (i >= 0) script_start(&g_scripts[i], 0);
+        }
+        g_arrival_script[0] = 0;
+    }
+    for (int guard = 0; g_run.active && guard < 100000; guard++) {
+        Script *s = &g_run.s;
+        if (g_run.row >= s->rows) { script_stop(NULL); break; }
+        if (!g_run.row_started) {
+            memset(g_run.cell, 0, sizeof(g_run.cell));
+            g_run.row_started = 1;
+            for (int c = 0; c < s->cols; c++) {
+                const ScriptAction *a = script_at(s, g_run.row, c);
+                if (a->type == ACT_NONE) g_run.cell[c].done = 1;
+                else run_start(a, &g_run.cell[c]);
+            }
+        }
+        int all = 1;
+        for (int c = 0; c < s->cols; c++) {
+            const ScriptAction *a = script_at(s, g_run.row, c);
+            if (a->type != ACT_NONE && !run_cell_done(a, &g_run.cell[c], dt)) all = 0;
+        }
+        if (!all) break;
+        g_run.row++; g_run.row_started = 0;
+    }
+}
+
+enum { SV_PICK_NONE, SV_PICK_PLACE_POS, SV_PICK_PLACE_FACE, SV_PICK_MOVE };
+
+/* The yellow step box of the side panel while a script plays or a point
+   is being picked (see wizard_step_text). */
+static const char *script_step_text(char *buf, size_t n, const char **sub) {
+    static char sb[400];
+    *sub = sb;
+    if (g_sv_pick == SV_PICK_PLACE_POS) {
+        snprintf(sb, sizeof(sb), "Click the floor where the character appears (the green floor). Esc: cancel.");
+        return "Script -- place a character: its position";
+    }
+    if (g_sv_pick == SV_PICK_PLACE_FACE) {
+        snprintf(sb, sizeof(sb), "Click the point it looks toward. Right-click or Esc: keep its current direction.");
+        return "Script -- place a character: where it faces";
+    }
+    if (g_sv_pick == SV_PICK_MOVE) {
+        snprintf(sb, sizeof(sb), "Click the floor where the character goes, or click a CONNECTOR (blue) to make it leave the room through it. Esc: cancel.");
+        return "Script -- move a character: its destination";
+    }
+    if (g_run.active) {
+        snprintf(buf, n, "Script \"%s\" -- row %d / %d", g_run.s.name, g_run.row + 1, g_run.s.rows);
+        snprintf(sb, sizeof(sb), "%s\nEsc: stop the script (testing).",
+                 script_row_has_move(&g_run.s, g_run.row) ? "This row can't be skipped: a character is moving." : "Left-click: skip this row.");
+        return buf;
+    }
+    return NULL;
+}
+
+/* =====================================================================
+   SCRIPTS SCREEN (S)
+   Left: the room's scripts. Middle: the grid (one action per cell).
+   Right: the selected cell's action and its settings.
+   ===================================================================== */
+enum {
+    B_SV_FIRST = 300,
+    B_SV_NEW = B_SV_FIRST, B_SV_RENAME, B_SV_DUP, B_SV_DELETE, B_SV_AUTO, B_SV_CLOSE,
+    B_SV_PLAY, B_SV_PLAY_ROW, B_SV_ROW_INS, B_SV_ROW_DEL, B_SV_COL_ADD, B_SV_COL_DEL, B_SV_COPY, B_SV_PASTE, B_SV_CLEAR,
+    B_SV_TYPE, B_SV_W_M1, B_SV_W_M01, B_SV_W_P01, B_SV_W_P1, B_SV_BG_CHOOSE, B_SV_BG_OWN, B_SV_MU_ADD,
+    B_SV_FILE, B_SV_LISTEN, B_SV_REP_M, B_SV_REP_P, B_SV_WAITEND, B_SV_LOOP, B_SV_ST_ALL, B_SV_ST_MUSIC,
+    B_SV_PL_MODEL, B_SV_PL_POS, B_SV_FACE_L, B_SV_FACE_R, B_SV_MV_DEST, B_SV_MV_WALK, B_SV_MV_RUN, B_SV_MOVESET,
+    B_CH_OK, B_CH_CANCEL, B_CH_LISTEN, B_CH_SCOPE0, B_CH_SCOPE1, B_CH_SCOPE2,
+    B_SV_ADD = 400,     /* + action type */
+    B_SV_TRACK = 500,   /* + track * 8 + op (0 listen, 1 loop, 2 up, 3 down, 4 remove) */
+    B_SV_STOPREF = 600, /* + index in the script's sounds / ambiences */
+    B_SV_ACTOR = 700,   /* + index: 0 David, then the script's placed characters */
+    B_SV_LAST = 899
+};
+#define SV_ROW_H 46
+#define SV_HDR_H 24
+#define SV_ROWHDR_W 44
+#define SV_LIST_ROW_H 26
+#define CH_ROW_H 22
+
+static int g_sv_script = 0, g_sv_row = 0, g_sv_col = 0, g_sv_scroll = 0, g_sv_list_scroll = 0;
+static int g_sv_hover = -1;                 /* hovered cell: row * SCRIPT_MAX_COLS + col */
+static ScriptAction g_sv_clip;              /* copy / paste */
+static int g_sv_has_clip = 0;
+static int g_sv_text = 0;                   /* typing a script name: 1 new, 2 rename */
+static char g_sv_text_buf[64];
+static RECT g_sv_list_rc, g_sv_grid_rc, g_sv_insp_rc, g_sv_thumb_rc;
+
+/* labels of the screen, built with its buttons (sv_layout) */
+typedef struct { RECT r; char text[220]; COLORREF col; int font; UINT flags; } SvLabel;
+static SvLabel g_svl[160];
+static int g_svl_n = 0;
+static void svl(int x, int y, int w, int h, int font, COLORREF col, UINT flags, const char *fmt, ...) {
+    if (g_svl_n >= (int)(sizeof(g_svl) / sizeof(g_svl[0]))) return;
+    SvLabel *l = &g_svl[g_svl_n++];
+    SetRect(&l->r, x, y, x + w, y + h);
+    va_list ap; va_start(ap, fmt); vsnprintf(l->text, sizeof(l->text), fmt, ap); va_end(ap);
+    l->col = col; l->font = font; l->flags = flags;
+}
+static HFONT svl_font(int f) {
+    switch (f) { case 1: return ui_font(12, 1); case 2: return ui_font(20, 1); case 3: return ui_font(16, 1); default: return ui_font(14, 0); }
+}
+static void svl_draw(HDC hdc) {
+    for (int i = 0; i < g_svl_n; i++) {
+        SvLabel *l = &g_svl[i];
+        SelectObject(hdc, svl_font(l->font));
+        ui_text(hdc, l->r.left, l->r.top, l->r.right - l->r.left, l->r.bottom - l->r.top, l->text, l->col, l->flags | DT_NOPREFIX);
+    }
+}
+#define SVL_SECTION RGB(120, 150, 190)
+#define SVL_TEXT RGB(215, 215, 220)
+#define SVL_VALUE RGB(150, 200, 255)
+#define SVL_DIM RGB(140, 140, 150)
+#define SV_ONE (DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS)
+
+static COLORREF action_color(int type) {
+    static const COLORREF c[ACT_COUNT] = { RGB(90, 90, 100), RGB(160, 160, 170), RGB(190, 130, 255), RGB(90, 160, 255), RGB(255, 160, 60),
+                                           RGB(60, 205, 190), RGB(255, 90, 90), RGB(240, 210, 80), RGB(110, 220, 110) };
+    return (type >= 0 && type < ACT_COUNT) ? c[type] : RGB(200, 200, 200);
+}
+
+static Script *sv_cur(void) { return (g_sv_script >= 0 && g_sv_script < g_script_count) ? &g_scripts[g_sv_script] : NULL; }
+/* the selected cell (NULL: no script, or past the last row and !make) */
+static ScriptAction *sv_cell(int make) {
+    Script *s = sv_cur();
+    if (!s) return NULL;
+    if (make) script_ensure_rows(s, g_sv_row + 1);
+    return script_at(s, g_sv_row, g_sv_col);
+}
+static void sv_changed(void) { room_scripts_save(); }
+
+/* every SOUND / AMBIENCE action (STOP targets) or PLACE action (MOVE characters) of a script */
+static int sv_actions_of(Script *s, int t1, int t2, ScriptAction **out, int *rows, int max) {
+    int n = 0;
+    for (int r = 0; r < s->rows; r++)
+        for (int c = 0; c < s->cols; c++) {
+            ScriptAction *a = script_at(s, r, c);
+            if ((a->type == t1 || a->type == t2) && n < max) { rows[n] = r; out[n++] = a; }
+        }
+    return n;
+}
+
+/* ---- choosers: sound files, pictures ---- */
+enum { CH_NONE, CH_SOUND, CH_TRACK, CH_PICTURE };
+static int g_ch = CH_NONE, g_ch_sel = 0, g_ch_scroll = 0, g_ch_scope = 0;
+static char g_ch_filter[48] = "";
+static int g_ch_filter_len = 0;
+static RECT g_ch_rc, g_ch_list_rc, g_ch_prev_rc;
+typedef struct { char name[160]; int w, h; float secs; } ChEntry; /* w = -1 / secs = -2: not read yet */
+static ChEntry *g_ch_all = NULL;
+static int g_ch_all_n = 0, g_ch_all_kind = -1, g_ch_all_scope = -1;
+static int *g_ch_list = NULL, g_ch_n = 0;
+
+static void ch_add(const char *name, int *cap) {
+    if (g_ch_all_n == *cap) { *cap = *cap ? *cap * 2 : 1024; g_ch_all = (ChEntry *)realloc(g_ch_all, sizeof(ChEntry) * *cap); }
+    ChEntry *e = &g_ch_all[g_ch_all_n++];
+    snprintf(e->name, sizeof(e->name), "%s", name);
+    e->w = -1; e->h = 0; e->secs = -2.0f;
+}
+static int ch_name_cmp(const void *a, const void *b) { return strcmp(((const ChEntry *)a)->name, ((const ChEntry *)b)->name); }
+/* the pictures of one room folder (level/room), main one first */
+static void ch_scan_room_pictures(const char *label, int *cap, int main_only) {
+    char level[64], room[64], pat[1024], name[200];
+    split_label(label, level, sizeof(level), room, sizeof(room));
+    if (main_only) {
+        snprintf(name, sizeof(name), "%s/%s/%s.png", level, room, room);
+        ch_add(name, cap);
+        return;
+    }
+    root_path(pat, sizeof(pat), "assets/levels/%s/%s/*.png", level, room);
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(pat, &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    int first = g_ch_all_n;
+    do {
+        if (strstr(fd.cFileName, ".mask.")) continue;
+        char lower[128]; snprintf(lower, sizeof(lower), "%s", fd.cFileName);
+        for (char *q = lower; *q; q++) if (*q >= 'A' && *q <= 'Z') *q += 32;
+        snprintf(name, sizeof(name), "%s/%s/%s", level, room, lower);
+        ch_add(name, cap);
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+    qsort(g_ch_all + first, g_ch_all_n - first, sizeof(ChEntry), ch_name_cmp);
+}
+static void ch_build(void) {
+    static char room[128] = "";
+    int kind = g_ch == CH_PICTURE ? 1 : 0, scope = kind ? g_ch_scope : 0;
+    if (g_ch_all_kind == kind && g_ch_all_scope == scope && (kind == 0 || scope == 1 || !strcmp(room, current_room_label()))) return; /* scanned already */
+    snprintf(room, sizeof(room), "%s", current_room_label());
+    g_ch_all_n = 0;
+    int cap = 0;
+    free(g_ch_all); g_ch_all = NULL;
+    g_ch_all_kind = kind; g_ch_all_scope = scope;
+    if (!kind) {
+        char pat[1024]; root_path(pat, sizeof(pat), "assets/sound/*.ogg");
+        WIN32_FIND_DATAA fd;
+        HANDLE h = FindFirstFileA(pat, &fd);
+        if (h != INVALID_HANDLE_VALUE) {
+            do {
+                char lower[128]; snprintf(lower, sizeof(lower), "%s", fd.cFileName);
+                for (char *q = lower; *q; q++) if (*q >= 'A' && *q <= 'Z') *q += 32;
+                ch_add(lower, &cap);
+            } while (FindNextFileA(h, &fd));
+            FindClose(h);
+        }
+        qsort(g_ch_all, g_ch_all_n, sizeof(ChEntry), ch_name_cmp);
+    } else if (scope == 0) ch_scan_room_pictures(current_room_label(), &cap, 0);
+    else if (scope == 1) { for (int i = 0; i < g_map_room_count; i++) ch_scan_room_pictures(g_map_rooms[i].label, &cap, 1); }
+    else {
+        char level[64], room[64];
+        split_label(current_room_label(), level, sizeof(level), room, sizeof(room));
+        for (int i = 0; i < g_map_room_count; i++) {
+            char l2[64], r2[64];
+            split_label(g_map_rooms[i].label, l2, sizeof(l2), r2, sizeof(r2));
+            if (!strcmp(l2, level)) ch_scan_room_pictures(g_map_rooms[i].label, &cap, 0);
+        }
+    }
+}
+static int ch_rows_visible(void) { int n = (g_ch_list_rc.bottom - g_ch_list_rc.top) / CH_ROW_H; return n < 1 ? 1 : n; }
+static void ch_filter(void) {
+    ch_build();
+    g_ch_list = (int *)realloc(g_ch_list, sizeof(int) * (g_ch_all_n + 1));
+    g_ch_n = 0;
+    for (int i = 0; i < g_ch_all_n; i++) if (ci_strstr(g_ch_all[i].name, g_ch_filter)) g_ch_list[g_ch_n++] = i;
+    if (g_ch_sel >= g_ch_n) g_ch_sel = g_ch_n > 0 ? g_ch_n - 1 : 0;
+    g_ch_scroll = 0;
+}
+static void ch_select(int k) {
+    if (g_ch_n <= 0) return;
+    if (k < 0) k = 0;
+    if (k >= g_ch_n) k = g_ch_n - 1;
+    g_ch_sel = k;
+    int rows = ch_rows_visible();
+    if (g_ch_sel < g_ch_scroll) g_ch_scroll = g_ch_sel;
+    if (g_ch_sel >= g_ch_scroll + rows) g_ch_scroll = g_ch_sel - rows + 1;
+}
+static const char *ch_current(void) { return (g_ch_n > 0 && g_ch_sel < g_ch_n) ? g_ch_all[g_ch_list[g_ch_sel]].name : NULL; }
+static void ch_open(int kind, const char *current) {
+    g_ch = kind;
+    g_ch_filter[0] = 0; g_ch_filter_len = 0;
+    if (kind == CH_PICTURE) g_ch_scope = 0;
+    g_ch_sel = 0;
+    ch_filter();
+    if (current && current[0])
+        for (int k = 0; k < g_ch_n; k++) if (!strcmp(g_ch_all[g_ch_list[k]].name, current)) { g_ch_sel = k; break; }
+    g_ch_scroll = g_ch_sel - 8; if (g_ch_scroll < 0) g_ch_scroll = 0;
+}
+static void ch_close(void) { g_ch = CH_NONE; audio_preview(NULL); }
+static void ch_choose(void) {
+    const char *name = ch_current();
+    ScriptAction *a = sv_cell(1);
+    if (!name || !a) { ch_close(); return; }
+    if (g_ch == CH_PICTURE && a->type == ACT_BACKGROUND) snprintf(a->file, sizeof(a->file), "%s", name);
+    else if (g_ch == CH_SOUND && (a->type == ACT_SOUND || a->type == ACT_AMBIENCE)) snprintf(a->file, sizeof(a->file), "%s", name);
+    else if (g_ch == CH_TRACK && a->type == ACT_MUSIC && a->ntracks < AUDIO_MAX_TRACKS) {
+        snprintf(a->track[a->ntracks], sizeof(a->track[0]), "%s", name);
+        a->track_loop[a->ntracks] = 0;
+        a->ntracks++;
+    }
+    sv_changed();
+    ch_close();
+}
+
+/* picture preview (the chooser, the inspector): one picture kept */
+static void blit_picture(HDC hdc, const RECT *r, const char *file) {
+    static char cached[160] = "";
+    static uint32_t *px = NULL;
+    static int pw = 0, ph = 0;
+    if (strcmp(cached, file) != 0) {
+        free(px); px = NULL; pw = ph = 0;
+        snprintf(cached, sizeof(cached), "%s", file);
+        char path[1024];
+        if (file[0]) root_path(path, sizeof(path), "assets/levels/%s", file);
+        else { char l[64], rm[64]; split_label(current_room_label(), l, sizeof(l), rm, sizeof(rm)); root_path(path, sizeof(path), "assets/levels/%s/%s/%s.png", l, rm, rm); }
+        px = image_load(path, &pw, &ph);
+    }
+    ui_fill(hdc, r, RGB(10, 10, 14));
+    if (!px || pw <= 0 || ph <= 0) { ui_text(hdc, r->left, r->top, r->right - r->left, r->bottom - r->top, "(no picture)", SVL_DIM, DT_CENTER | DT_VCENTER | DT_SINGLELINE); return; }
+    int W = r->right - r->left, H = r->bottom - r->top;
+    float k = fminf((float)W / pw, (float)H / ph);
+    int dw = (int)(pw * k), dh = (int)(ph * k);
+    if (dw < 1 || dh < 1) return;
+    BITMAPINFO bi; memset(&bi, 0, sizeof(bi));
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER); bi.bmiHeader.biWidth = pw; bi.bmiHeader.biHeight = -ph;
+    bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32; bi.bmiHeader.biCompression = BI_RGB;
+    SetStretchBltMode(hdc, HALFTONE);
+    StretchDIBits(hdc, r->left + (W - dw) / 2, r->top + (H - dh) / 2, dw, dh, 0, 0, pw, ph, px, &bi, DIB_RGB_COLORS, SRCCOPY);
+}
+static void png_size(const char *file, int *w, int *h) {
+    char path[1024];
+    root_path(path, sizeof(path), "assets/levels/%s", file);
+    *w = 0; *h = 0;
+    FILE *f = fopen(path, "rb");
+    if (!f) return;
+    unsigned char b[24];
+    if (fread(b, 1, 24, f) == 24) { *w = (b[16] << 24) | (b[17] << 16) | (b[18] << 8) | b[19]; *h = (b[20] << 24) | (b[21] << 16) | (b[22] << 8) | b[23]; }
+    fclose(f);
+}
+
+/* ---- the screen ---- */
+static void sv_open_view(void) {
+    g_script_view = 1;
+    g_map_mode = 0; g_anim_view = 0;
+    ClipCursor(NULL); g_clip_active = 0;
+    if (g_sv_script >= g_script_count) g_sv_script = g_script_count - 1;
+    if (g_sv_script < 0) g_sv_script = 0;
+}
+static void script_view_toggle(void) {
+    if (g_script_view) { g_script_view = 0; ch_close(); g_sv_text = 0; return; }
+    if (!g_has_3d_character || script_playing()) return;
+    if (g_edit_mode && g_wiz != WIZ_NONE) wizard_cancel(NULL);
+    sv_open_view();
+}
+
+static int sv_grid_rows_visible(void) { int n = (g_sv_grid_rc.bottom - g_sv_grid_rc.top - SV_HDR_H) / SV_ROW_H; return n < 1 ? 1 : n; }
+static int sv_grid_rows_total(void) {
+    Script *s = sv_cur();
+    int n = s ? script_used_rows(s) + 1 : 1;
+    if (n < g_sv_row + 1) n = g_sv_row + 1;
+    return n;
+}
+static void sv_select(int row, int col) {
+    Script *s = sv_cur();
+    if (!s) return;
+    if (row < 0) row = 0;
+    if (col < 0) col = 0;
+    if (col >= s->cols) col = s->cols - 1;
+    g_sv_row = row; g_sv_col = col;
+    int vis = sv_grid_rows_visible();
+    if (g_sv_row < g_sv_scroll) g_sv_scroll = g_sv_row;
+    if (g_sv_row >= g_sv_scroll + vis) g_sv_scroll = g_sv_row - vis + 1;
+}
+static void sv_cell_rect(int row, int col, RECT *r) {
+    Script *s = sv_cur();
+    int cols = s ? s->cols : SCRIPT_DEFAULT_COLS;
+    int cw = (g_sv_grid_rc.right - g_sv_grid_rc.left - SV_ROWHDR_W) / cols;
+    int x = g_sv_grid_rc.left + SV_ROWHDR_W + col * cw, y = g_sv_grid_rc.top + SV_HDR_H + (row - g_sv_scroll) * SV_ROW_H;
+    SetRect(r, x + 2, y + 2, x + cw - 2, y + SV_ROW_H - 2);
+}
+static int sv_cell_at(int x, int y, int *row, int *col) {
+    Script *s = sv_cur();
+    if (!s || x < g_sv_grid_rc.left + SV_ROWHDR_W || x >= g_sv_grid_rc.right || y < g_sv_grid_rc.top + SV_HDR_H || y >= g_sv_grid_rc.bottom) return 0;
+    int cw = (g_sv_grid_rc.right - g_sv_grid_rc.left - SV_ROWHDR_W) / s->cols;
+    int c = (x - g_sv_grid_rc.left - SV_ROWHDR_W) / cw, r = g_sv_scroll + (y - g_sv_grid_rc.top - SV_HDR_H) / SV_ROW_H;
+    if (c >= s->cols) return 0;
+    *row = r; *col = c;
+    return 1;
+}
+
+static void sv_new_script(void) {
+    Script *ns = (Script *)realloc(g_scripts, sizeof(Script) * (g_script_count + 1));
+    if (!ns) return;
+    g_scripts = ns;
+    char name[64];
+    for (int k = g_script_count + 1;; k++) { snprintf(name, sizeof(name), "Script %d", k); if (room_script_find(name) < 0) break; }
+    script_init(&g_scripts[g_script_count], name);
+    g_sv_script = g_script_count++;
+    g_sv_row = g_sv_col = g_sv_scroll = 0;
+    sv_changed();
+    g_sv_text = 2; g_sv_text_buf[0] = 0; /* type its name right away */
+}
+static void sv_text_commit(void) {
+    Script *s = sv_cur();
+    int mode = g_sv_text;
+    g_sv_text = 0;
+    if (!s || mode == 0 || !g_sv_text_buf[0]) return;
+    char name[64];
+    snprintf(name, sizeof(name), "%s", g_sv_text_buf);
+    int i = room_script_find(name);
+    if (i >= 0 && i != g_sv_script) { snprintf(g_status, sizeof(g_status), "a script is already called \"%s\"", name); return; }
+    snprintf(s->name, sizeof(s->name), "%s", name);
+    sv_changed();
+}
+static void sv_set_type(int type) {
+    ScriptAction *a = sv_cell(1);
+    if (!a) return;
+    Script *s = sv_cur();
+    action_init(s, a, type);
+    if (type == ACT_STOP) { /* the last sound / ambience before it, if any */
+        ScriptAction *list[64]; int rows[64];
+        int n = sv_actions_of(s, ACT_SOUND, ACT_AMBIENCE, list, rows, 64);
+        for (int k = 0; k < n; k++) if (rows[k] < g_sv_row) { a->stop_kind = STOP_ACTION; a->stop_ref = list[k]->id; }
+    }
+    sv_changed();
+}
+
+/* right-click / double-click on a cell */
+static void sv_cell_menu(HWND hwnd, int client_x, int client_y) {
+    Script *s = sv_cur();
+    if (!s) return;
+    ScriptAction *a = sv_cell(0);
+    int empty = !a || a->type == ACT_NONE;
+    HMENU m = CreatePopupMenu();
+    char head[80];
+    snprintf(head, sizeof(head), "Row %d, column %d", g_sv_row + 1, g_sv_col + 1);
+    AppendMenuA(m, MF_STRING | MF_GRAYED, 0, head);
+    AppendMenuA(m, MF_SEPARATOR, 0, NULL);
+    for (int t = ACT_WAIT; t < ACT_COUNT; t++) {
+        char lab[64]; snprintf(lab, sizeof(lab), "%s%s", empty ? "" : "Replace with: ", action_type_name(t));
+        AppendMenuA(m, MF_STRING | (!empty && a->type == t ? MF_CHECKED : 0), 100 + t, lab);
+    }
+    AppendMenuA(m, MF_SEPARATOR, 0, NULL);
+    AppendMenuA(m, MF_STRING | (empty ? MF_GRAYED : 0), 1, "Copy\tCtrl+C");
+    AppendMenuA(m, MF_STRING | (g_sv_has_clip ? 0 : MF_GRAYED), 2, "Paste\tCtrl+V");
+    AppendMenuA(m, MF_STRING | (empty ? MF_GRAYED : 0), 3, "Clear the cell\tDel");
+    AppendMenuA(m, MF_SEPARATOR, 0, NULL);
+    AppendMenuA(m, MF_STRING, 4, "Insert a row here\tIns");
+    AppendMenuA(m, MF_STRING | (g_sv_row < s->rows ? 0 : MF_GRAYED), 5, "Delete this row\tShift+Del");
+    POINT pt = { client_x, client_y }; ClientToScreen(hwnd, &pt);
+    int cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY, pt.x, pt.y, 0, hwnd, NULL);
+    DestroyMenu(m);
+    if (cmd >= 100 + ACT_WAIT && cmd < 100 + ACT_COUNT) sv_set_type(cmd - 100);
+    else if (cmd == 1) ui_action(hwnd, B_SV_COPY);
+    else if (cmd == 2) ui_action(hwnd, B_SV_PASTE);
+    else if (cmd == 3) ui_action(hwnd, B_SV_CLEAR);
+    else if (cmd == 4) ui_action(hwnd, B_SV_ROW_INS);
+    else if (cmd == 5) ui_action(hwnd, B_SV_ROW_DEL);
+}
+
+/* Point picking in the room for PLACE / MOVE: the scripts screen hides
+   until the click (step box in the side panel, green floor shown). */
+static void sv_pick_start(int mode) {
+    g_sv_pick = mode;
+    g_script_view = 0;
+    g_status[0] = 0;
+}
+static void sv_pick_end(void) { g_sv_pick = SV_PICK_NONE; g_script_view = 1; }
+static void sv_pick_click(float rx, float ry, int right) {
+    ScriptAction *a = sv_cell(1);
+    if (!a) { sv_pick_end(); return; }
+    if (g_sv_pick == SV_PICK_PLACE_FACE) {
+        float w[3];
+        if (!right && pick_floor_point(rx, ry, w)) a->facing = atan2f(w[0] - a->pos[0], w[2] - a->pos[2]);
+        sv_changed();
+        sv_pick_end();
+        return;
+    }
+    if (right) { sv_pick_end(); return; }
+    if (g_sv_pick == SV_PICK_MOVE) {
+        int di = door_at_pixel(rx, ry);
+        if (di >= 0) {
+            if (!g_shapes[di].has_step) { snprintf(g_status, sizeof(g_status), "that connector isn't set up (no doorstep)"); return; }
+            a->door = g_shapes[di].id;
+            sv_changed(); sv_pick_end();
+            return;
+        }
+    }
+    float w[3];
+    if (!pick_floor_point(rx, ry, w)) { snprintf(g_status, sizeof(g_status), "no floor a character can stand on there -- click on the GREEN floor"); return; }
+    memcpy(a->pos, w, sizeof(w));
+    a->has_pos = 1;
+    if (g_sv_pick == SV_PICK_MOVE) { a->door = 0; sv_changed(); sv_pick_end(); return; }
+    sv_changed();
+    g_sv_pick = SV_PICK_PLACE_FACE; /* then where it looks */
+}
+
+static void sv_model_chosen(const char *name) {
+    ScriptAction *a = sv_cell(1);
+    if (a && a->type == ACT_PLACE) { snprintf(a->model, sizeof(a->model), "%s", name); sv_changed(); }
+    g_script_view = 1;
+}
+
+static void sv_play(int from_row) {
+    Script *s = sv_cur();
+    if (!s) return;
+    if (script_used_rows(s) == 0) { snprintf(g_status, sizeof(g_status), "this script is empty"); return; }
+    /* a clean start: characters, picture and sounds of a previous test are gone */
+    actors_clear_npcs();
+    background_set("");
+    audio_stop_kind(AUDIO_SOUND); audio_stop_kind(AUDIO_AMBIENCE); audio_music_stop();
+    ch_close();
+    g_script_view = 0; g_sv_text = 0;
+    script_start(s, from_row);
+}
+
+/* the characters a MOVE can pick: David + the script's PLACE actions */
+static int sv_actor_list(Script *s, int *ids, int *rows, int max) {
+    ScriptAction *pl[64]; int pr[64];
+    int n = sv_actions_of(s, ACT_PLACE, ACT_PLACE, pl, pr, 64), k = 0;
+    ids[k] = 0; rows[k] = -1; k++;
+    for (int i = 0; i < n && k < max; i++) { ids[k] = pl[i]->id; rows[k] = pr[i]; k++; }
+    return k;
+}
+
+static void sv_action(HWND hwnd, int id) {
+    Script *s = sv_cur();
+    ScriptAction *a = sv_cell(0);
+    int has = a && a->type != ACT_NONE;
+    switch (id) {
+        case B_SV_CLOSE: script_view_toggle(); return;
+        case B_SV_NEW: sv_new_script(); return;
+        case B_SV_RENAME: if (s) { g_sv_text = 2; snprintf(g_sv_text_buf, sizeof(g_sv_text_buf), "%s", s->name); } return;
+        case B_SV_DUP:
+            if (s) {
+                Script *ns = (Script *)realloc(g_scripts, sizeof(Script) * (g_script_count + 1));
+                if (!ns) return;
+                g_scripts = ns; s = &g_scripts[g_sv_script];
+                script_copy(&g_scripts[g_script_count], s);
+                char name[64];
+                for (int k = 1;; k++) { snprintf(name, sizeof(name), k == 1 ? "%.50s copy" : "%.50s copy %d", s->name, k); if (room_script_find(name) < 0) break; }
+                snprintf(g_scripts[g_script_count].name, sizeof(name), "%s", name);
+                g_scripts[g_script_count].auto_run = 0;
+                g_sv_script = g_script_count++;
+                sv_changed();
+            }
+            return;
+        case B_SV_DELETE:
+            if (s) {
+                char q[200]; snprintf(q, sizeof(q), "Delete the script \"%s\"?", s->name);
+                if (MessageBoxA(hwnd, q, "Silver Remaster -- scripts", MB_YESNO | MB_ICONQUESTION) != IDYES) return;
+                script_free(s);
+                memmove(&g_scripts[g_sv_script], &g_scripts[g_sv_script + 1], sizeof(Script) * (g_script_count - g_sv_script - 1));
+                g_script_count--;
+                if (g_sv_script >= g_script_count) g_sv_script = g_script_count - 1;
+                if (g_sv_script < 0) g_sv_script = 0;
+                g_sv_row = g_sv_col = g_sv_scroll = 0;
+                sv_changed();
+            }
+            return;
+        case B_SV_AUTO: if (s) { s->auto_run = !s->auto_run; sv_changed(); } return;
+        case B_SV_PLAY: sv_play(0); return;
+        case B_SV_PLAY_ROW: sv_play(g_sv_row); return;
+        case B_SV_ROW_INS: if (s) { script_insert_row(s, g_sv_row); sv_changed(); } return;
+        case B_SV_ROW_DEL: if (s && g_sv_row < s->rows) { script_delete_row(s, g_sv_row); sv_changed(); } return;
+        case B_SV_COL_ADD: if (s) { script_add_col(s); sv_changed(); } return;
+        case B_SV_COL_DEL:
+            if (s && s->cols > 1) {
+                int any = 0;
+                for (int r = 0; r < s->rows; r++) if (script_at(s, r, g_sv_col)->type != ACT_NONE) any = 1;
+                if (any && MessageBoxA(hwnd, "Delete this column and the actions in it?", "Silver Remaster -- scripts", MB_YESNO | MB_ICONQUESTION) != IDYES) return;
+                script_delete_col(s, g_sv_col);
+                if (g_sv_col >= s->cols) g_sv_col = s->cols - 1;
+                sv_changed();
+            }
+            return;
+        case B_SV_COPY: if (has) { g_sv_clip = *a; g_sv_has_clip = 1; snprintf(g_status, sizeof(g_status), "action copied"); } return;
+        case B_SV_PASTE:
+            if (g_sv_has_clip && s) { a = sv_cell(1); int nid = s->next_id++; *a = g_sv_clip; a->id = nid; sv_changed(); }
+            return;
+        case B_SV_CLEAR: if (has) { memset(a, 0, sizeof(*a)); sv_changed(); } return;
+        case B_SV_TYPE: { RECT r; sv_cell_rect(g_sv_row, g_sv_col, &r); sv_cell_menu(hwnd, r.left + 10, r.bottom); return; }
+        case B_CH_OK: ch_choose(); return;
+        case B_CH_CANCEL: ch_close(); return;
+        case B_CH_LISTEN: if (audio_preview_playing()) audio_preview(NULL); else audio_preview(ch_current()); return;
+        case B_CH_SCOPE0: case B_CH_SCOPE1: case B_CH_SCOPE2: g_ch_scope = id - B_CH_SCOPE0; g_ch_sel = 0; ch_filter(); return;
+    }
+    if (id >= B_SV_ADD && id < B_SV_ADD + ACT_COUNT) { sv_set_type(id - B_SV_ADD); return; }
+    if (!has) return;
+    switch (id) {
+        case B_SV_W_M1: a->seconds -= 1.0f; break;
+        case B_SV_W_M01: a->seconds -= 0.1f; break;
+        case B_SV_W_P01: a->seconds += 0.1f; break;
+        case B_SV_W_P1: a->seconds += 1.0f; break;
+        case B_SV_BG_CHOOSE: ch_open(CH_PICTURE, a->file); return;
+        case B_SV_BG_OWN: a->file[0] = 0; break;
+        case B_SV_MU_ADD: ch_open(CH_TRACK, NULL); return;
+        case B_SV_FILE: ch_open(CH_SOUND, a->file); return;
+        case B_SV_LISTEN: if (audio_preview_playing()) audio_preview(NULL); else audio_preview(a->file); return;
+        case B_SV_REP_M: if (a->repeat > 0) a->repeat--; break;
+        case B_SV_REP_P: if (a->repeat < 99) a->repeat++; break;
+        case B_SV_WAITEND: a->wait_end = !a->wait_end; break;
+        case B_SV_LOOP: a->loop = !a->loop; break;
+        case B_SV_ST_ALL: a->stop_kind = STOP_ALL_SOUNDS; break;
+        case B_SV_ST_MUSIC: a->stop_kind = STOP_MUSIC; break;
+        case B_SV_PL_MODEL: g_pick_for_script = 1; g_anim_view = 1; picker_open(); return;
+        case B_SV_PL_POS: sv_pick_start(SV_PICK_PLACE_POS); return;
+        case B_SV_FACE_L: a->facing = wrap_angle(a->facing + 0.785398f); break;
+        case B_SV_FACE_R: a->facing = wrap_angle(a->facing - 0.785398f); break;
+        case B_SV_MV_DEST: sv_pick_start(SV_PICK_MOVE); return;
+        case B_SV_MV_WALK: a->run = 0; break;
+        case B_SV_MV_RUN: a->run = 1; break;
+        case B_SV_MOVESET: {
+            const char *model = "david";
+            if (a->type == ACT_PLACE) model = a->model;
+            else if (a->type == ACT_MOVE && a->actor) { ScriptAction *p = script_find(s, a->actor, NULL, NULL); if (p) model = p->model; }
+            CharModel *m = model_by_name(model);
+            if (m) ms_open(m); else snprintf(g_status, sizeof(g_status), "choose the character first");
+            return;
+        }
+        default:
+            if (id >= B_SV_TRACK && id < B_SV_TRACK + AUDIO_MAX_TRACKS * 8 && a->type == ACT_MUSIC) {
+                int t = (id - B_SV_TRACK) / 8, op = (id - B_SV_TRACK) % 8;
+                if (t >= a->ntracks) return;
+                if (op == 0) { if (audio_preview_playing()) audio_preview(NULL); else audio_preview(a->track[t]); return; }
+                if (op == 1) a->track_loop[t] = !a->track_loop[t];
+                if ((op == 2 && t > 0) || (op == 3 && t < a->ntracks - 1)) {
+                    int u = op == 2 ? t - 1 : t + 1;
+                    char tmp[64]; int tl = a->track_loop[t];
+                    memcpy(tmp, a->track[t], 64); memcpy(a->track[t], a->track[u], 64); memcpy(a->track[u], tmp, 64);
+                    a->track_loop[t] = a->track_loop[u]; a->track_loop[u] = tl;
+                }
+                if (op == 4) {
+                    memmove(&a->track[t], &a->track[t + 1], sizeof(a->track[0]) * (a->ntracks - t - 1));
+                    memmove(&a->track_loop[t], &a->track_loop[t + 1], sizeof(int) * (a->ntracks - t - 1));
+                    a->ntracks--;
+                }
+            } else if (id >= B_SV_STOPREF && id < B_SV_STOPREF + 64 && a->type == ACT_STOP) {
+                ScriptAction *list[64]; int rows[64];
+                int n = sv_actions_of(s, ACT_SOUND, ACT_AMBIENCE, list, rows, 64);
+                int k = id - B_SV_STOPREF;
+                if (k < n) { a->stop_kind = STOP_ACTION; a->stop_ref = list[k]->id; }
+            } else if (id >= B_SV_ACTOR && id < B_SV_ACTOR + 64 && a->type == ACT_MOVE) {
+                int ids[64], rows[64];
+                int n = sv_actor_list(s, ids, rows, 64), k = id - B_SV_ACTOR;
+                if (k < n) a->actor = ids[k];
+            } else return;
+    }
+    if (a->type == ACT_WAIT) { a->seconds = roundf(a->seconds * 10.0f) / 10.0f; if (a->seconds < 0.0f) a->seconds = 0.0f; if (a->seconds > 3600.0f) a->seconds = 3600.0f; }
+    sv_changed();
+}
+
+static void sv_layout_main(HWND hwnd);
+/* The screen's buttons and labels; with a chooser open, only its buttons. */
+static void sv_layout(HWND hwnd) {
+    sv_layout_main(hwnd);
+    if (g_ch == CH_NONE) return;
+    RECT rc; GetClientRect(hwnd, &rc);
+    g_btn_count = 0;
+    SetRect(&g_ch_rc, g_sv_grid_rc.left, 44, rc.right - 10, rc.bottom - 10);
+    int pic = g_ch == CH_PICTURE;
+    int lw = pic ? (g_ch_rc.right - g_ch_rc.left) * 45 / 100 : (g_ch_rc.right - g_ch_rc.left) - 20;
+    if (!pic && lw > 700) lw = 700;
+    SetRect(&g_ch_list_rc, g_ch_rc.left + 10, g_ch_rc.top + 70, g_ch_rc.left + 10 + lw, g_ch_rc.bottom - 50);
+    SetRect(&g_ch_prev_rc, g_ch_list_rc.right + 16, g_ch_list_rc.top, g_ch_rc.right - 10, g_ch_list_rc.bottom);
+    int bx = g_ch_rc.left + 10, by = g_ch_rc.bottom - 40;
+    ui_add(B_CH_OK, bx, by, 120, 28, "Choose", "Enter", "Use the selected file.", 0, g_ch_n > 0, 0); bx += 126;
+    ui_add(B_CH_CANCEL, bx, by, 100, 28, "Cancel", "Esc", "Back without changing anything.", 0, 1, 0); bx += 106;
+    if (!pic) ui_add(B_CH_LISTEN, bx, by, 150, 28, audio_preview_playing() ? "Stop listening" : "Listen", "Space", "Hear the selected file (again: stop).", audio_preview_playing(), g_ch_n > 0, 0);
+    else {
+        ui_add(B_CH_SCOPE0, bx, by, 150, 28, "This room's folder", "", "The pictures of this room's folder (its picture, its animation frames).", g_ch_scope == 0, 1, 3); bx += 156;
+        ui_add(B_CH_SCOPE1, bx, by, 150, 28, "Every room's picture", "", "The main picture of every room of the game.", g_ch_scope == 1, 1, 3); bx += 156;
+        ui_add(B_CH_SCOPE2, bx, by, 150, 28, "This whole level", "", "Every picture of this room's level (many files).", g_ch_scope == 2, 1, 3);
+    }
+}
+static void sv_layout_main(HWND hwnd) {
+    RECT rc; GetClientRect(hwnd, &rc);
+    int W = rc.right, H = rc.bottom;
+    g_btn_count = 0; g_svl_n = 0;
+    int list_w = W / 6; if (list_w < 180) list_w = 180; if (list_w > 240) list_w = 240;
+    int insp_w = W / 4; if (insp_w < 300) insp_w = 300; if (insp_w > 400) insp_w = 400;
+    SetRect(&g_sv_list_rc, 10, 66, 10 + list_w, H - 118);
+    SetRect(&g_sv_insp_rc, W - insp_w - 10, 44, W - 10, H - 10);
+    SetRect(&g_sv_grid_rc, g_sv_list_rc.right + 12, 112, g_sv_insp_rc.left - 12, H - 10);
+    Script *s = sv_cur();
+
+    /* header */
+    svl(12, 8, list_w + 400, 28, 2, RGB(255, 225, 120), SV_ONE, "Scripts -- %s", current_room_label());
+    ui_add(B_SV_CLOSE, W - 96, 8, 86, 26, "Close", "Esc", "Back to the game.", 0, 1, 0);
+
+    /* left: the room's scripts */
+    svl(10, 46, list_w, 16, 1, SVL_SECTION, SV_ONE, "SCRIPTS OF THIS ROOM (%d)", g_script_count);
+    int bx = 10, by = g_sv_list_rc.bottom + 8, bh = 26, bw = (list_w - 6) / 2;
+    ui_add(B_SV_NEW, bx, by, bw, bh, "New", "", "A new empty script for this room (then type its name, Enter).", 0, 1, 0);
+    ui_add(B_SV_RENAME, bx + bw + 6, by, bw, bh, "Rename", "F2", "Rename the selected script (type, Enter). A connector playing it must be pointed at the new name again.", 0, s != NULL, 0);
+    by += bh + 5;
+    ui_add(B_SV_DUP, bx, by, bw, bh, "Duplicate", "", "A copy of the selected script.", 0, s != NULL, 0);
+    ui_add(B_SV_DELETE, bx + bw + 6, by, bw, bh, "Delete", "", "Delete the selected script (asks first).", 0, s != NULL, 0);
+    by += bh + 5;
+    ui_add(B_SV_AUTO, bx, by, list_w, bh, s && s->auto_run ? "Auto on entry: ON" : "Auto on entry: off", "",
+           "ON: played whenever David enters this room without a connector script of its own (the first 'auto' script of the list). Not while the scene editor is on.",
+           s && s->auto_run, s != NULL, 1);
+
+    /* middle: toolbar + grid */
+    int tx = g_sv_grid_rc.left, ty = 44, th = 28, gap = 6;
+    struct { int id, w; const char *label, *key, *desc; int enabled; } tb[] = {
+        { B_SV_PLAY, 100, "Play", "F5", "Play this script from its first row, in the game (a clean start: script characters, picture, sounds and music of a previous test are removed).", s != NULL },
+        { B_SV_PLAY_ROW, 150, "Play from this row", "F6", "Play it from the selected row (characters placed by the rows above won't be there).", s != NULL },
+        { B_SV_ROW_INS, 100, "Insert row", "Ins", "Insert an empty row at the selected one (the rows below move down).", s != NULL },
+        { B_SV_ROW_DEL, 100, "Delete row", "", "Delete the selected row and its actions (the rows below move up).", s && g_sv_row < s->rows },
+        { B_SV_COL_ADD, 96, "+ Column", "", "Add a column: more actions played at the same time in a row.", s && s->cols < SCRIPT_MAX_COLS },
+        { B_SV_COL_DEL, 96, "- Column", "", "Delete the selected column (asks first if it holds actions).", s && s->cols > 1 },
+        { B_SV_COPY, 70, "Copy", "Ctrl+C", "Copy the selected action.", s != NULL },
+        { B_SV_PASTE, 70, "Paste", "Ctrl+V", "Paste the copied action into the selected cell.", s && g_sv_has_clip },
+        { B_SV_CLEAR, 70, "Clear", "Del", "Empty the selected cell.", s != NULL },
+    };
+    for (int i = 0; i < (int)(sizeof(tb) / sizeof(tb[0])); i++) {
+        if (tx + tb[i].w > g_sv_grid_rc.right) { tx = g_sv_grid_rc.left; ty += th + gap; }
+        ui_add(tb[i].id, tx, ty, tb[i].w, th, tb[i].label, tb[i].key, tb[i].desc, 0, tb[i].enabled, 0);
+        tx += tb[i].w + gap;
+    }
+    g_sv_grid_rc.top = ty + th + 12;
+
+    /* right: the selected cell */
+    int ix = g_sv_insp_rc.left + 12, iw = g_sv_insp_rc.right - g_sv_insp_rc.left - 24, iy = g_sv_insp_rc.top + 10;
+    int rh = 26, half = (iw - 6) / 2;
+    SetRect(&g_sv_thumb_rc, 0, 0, 0, 0);
+    if (!s) {
+        svl(ix, iy, iw, 60, 0, SVL_TEXT, DT_LEFT | DT_WORDBREAK, "This room has no script yet. Click New (left) to make one.");
+        return;
+    }
+    ScriptAction *a = sv_cell(0);
+    int type = a ? a->type : ACT_NONE;
+    svl(ix, iy, iw, 16, 1, SVL_SECTION, SV_ONE, "ROW %d, COLUMN %d", g_sv_row + 1, g_sv_col + 1);
+    iy += 20;
+    if (type == ACT_NONE) {
+        svl(ix, iy, iw, 22, 3, SVL_TEXT, SV_ONE, "Empty cell -- add an action:");
+        iy += 28;
+        static const char *add_desc[ACT_COUNT] = { "",
+            "Wait a given time. The game goes on meanwhile.",
+            "Show another picture as the room's background (the geometry and masks stay the room's).",
+            "Change the music: a playlist of tracks, each looped or not. Replaces the music playing.",
+            "Play a sound (repeated or not). The music isn't touched.",
+            "Play an atmosphere sound, looped or not. The music isn't touched.",
+            "Stop a sound or ambience started by this script (or all of them, or the music).",
+            "Bring a character into the room, at a point you click, facing a direction.",
+            "Make a character (David or one placed by this script) walk / run to a point you click, or through a connector." };
+        for (int t = ACT_WAIT; t < ACT_COUNT; t++) {
+            ui_add(B_SV_ADD + t, ix + ((t - 1) % 2) * (half + 6), iy, half, rh, action_type_name(t), "", add_desc[t], 0, 1, 0);
+            if ((t - 1) % 2 == 1) iy += rh + 6;
+        }
+        iy += rh + 12;
+        svl(ix, iy, iw, 80, 0, SVL_DIM, DT_LEFT | DT_WORDBREAK,
+            "Every action of a row starts at the same time; the next row starts when they are all finished. Right-click a cell for more.");
+        return;
+    }
+    svl(ix, iy, iw - 110, 26, 2, action_color(type), SV_ONE, "%s", action_type_name(type));
+    ui_add(B_SV_TYPE, ix + iw - 104, iy, 104, 24, "Change...", "", "Replace this action by another kind (or copy / clear / rows).", 0, 1, 0);
+    iy += 36;
+    char t[256];
+    switch (type) {
+        case ACT_WAIT:
+            svl(ix, iy, iw, 16, 1, SVL_SECTION, SV_ONE, "DURATION");
+            iy += 20;
+            svl(ix, iy, iw, 30, 2, SVL_VALUE, SV_ONE, "%.1f seconds", a->seconds);
+            iy += 36;
+            { int q = (iw - 18) / 4;
+              ui_add(B_SV_W_M1, ix, iy, q, rh, "-1 s", "", "One second less.", 0, a->seconds > 0, 0);
+              ui_add(B_SV_W_M01, ix + (q + 6), iy, q, rh, "-0.1 s", "", "A tenth of a second less.", 0, a->seconds > 0, 0);
+              ui_add(B_SV_W_P01, ix + 2 * (q + 6), iy, q, rh, "+0.1 s", "", "A tenth of a second more.", 0, 1, 0);
+              ui_add(B_SV_W_P1, ix + 3 * (q + 6), iy, q, rh, "+1 s", "", "One second more.", 0, 1, 0); }
+            iy += rh + 12;
+            svl(ix, iy, iw, 60, 0, SVL_DIM, DT_LEFT | DT_WORDBREAK, "Nothing happens meanwhile: the game goes on normally. A left-click skips it (the whole row).");
+            break;
+        case ACT_BACKGROUND:
+            svl(ix, iy, iw, 16, 1, SVL_SECTION, SV_ONE, "PICTURE");
+            iy += 20;
+            svl(ix, iy, iw, 20, 0, SVL_VALUE, SV_ONE, "%s", a->file[0] ? a->file : "the room's own picture");
+            iy += 26;
+            ui_add(B_SV_BG_CHOOSE, ix, iy, half, rh, "Choose picture...", "", "Pick a picture of the blockouts (this room's, any room's, or its whole level). Stretched to the room's size if it differs.", 0, 1, 0);
+            ui_add(B_SV_BG_OWN, ix + half + 6, iy, half, rh, "Room's own picture", "", "Put the room's own picture back.", !a->file[0], 1, 0);
+            iy += rh + 10;
+            SetRect(&g_sv_thumb_rc, ix, iy, ix + iw, iy + iw * 3 / 4);
+            iy += iw * 3 / 4 + 8;
+            svl(ix, iy, iw, 60, 0, SVL_DIM, DT_LEFT | DT_WORDBREAK, "Only the picture changes: walls, floors, depth and foreground shapes stay the room's. It lasts until the room is left.");
+            break;
+        case ACT_MUSIC:
+            svl(ix, iy, iw, 16, 1, SVL_SECTION, SV_ONE, "PLAYLIST (played in order)");
+            iy += 22;
+            for (int i = 0; i < a->ntracks; i++) {
+                int bw = 26, lw = 58;
+                svl(ix, iy, iw - (bw * 4 + lw + 30), rh, 0, SVL_TEXT, SV_ONE, "%d. %s", i + 1, a->track[i]);
+                int x = ix + iw - (bw * 4 + lw + 24);
+                ui_add(B_SV_TRACK + i * 8 + 0, x, iy, bw, rh, ">", "", "Listen to this track (again: stop).", 0, 1, 0); x += bw + 6;
+                ui_add(B_SV_TRACK + i * 8 + 1, x, iy, lw, rh, a->track_loop[i] ? "Loop" : "Once", "", "Loop: this track plays forever (the ones after it never come). Once: plays once, then the next track.", a->track_loop[i], 1, 1); x += lw + 6;
+                ui_add(B_SV_TRACK + i * 8 + 2, x, iy, bw, rh, "^", "", "Move it up.", 0, i > 0, 0); x += bw + 3;
+                ui_add(B_SV_TRACK + i * 8 + 3, x, iy, bw, rh, "v", "", "Move it down.", 0, i < a->ntracks - 1, 0); x += bw + 3;
+                ui_add(B_SV_TRACK + i * 8 + 4, x, iy, bw, rh, "x", "", "Remove it from the playlist.", 0, 1, 0);
+                iy += rh + 5;
+            }
+            if (a->ntracks == 0) { svl(ix, iy, iw, 20, 0, RGB(255, 150, 120), SV_ONE, "No track: this action STOPS the music."); iy += 26; }
+            ui_add(B_SV_MU_ADD, ix, iy, iw, rh, "Add a track...", "", "Choose a music file (assets/sound) to add at the end of the playlist.", 0, a->ntracks < AUDIO_MAX_TRACKS, 0);
+            iy += rh + 12;
+            svl(ix, iy, iw, 90, 0, SVL_DIM, DT_LEFT | DT_WORDBREAK,
+                "Starting it stops the music playing and its playlist, and plays this one instead. The row doesn't wait for it: the music goes on while the next rows play.");
+            break;
+        case ACT_SOUND: case ACT_AMBIENCE:
+            svl(ix, iy, iw, 16, 1, SVL_SECTION, SV_ONE, "FILE");
+            iy += 20;
+            svl(ix, iy, iw, 20, 0, SVL_VALUE, SV_ONE, "%s", a->file[0] ? a->file : "(none yet)");
+            iy += 26;
+            ui_add(B_SV_FILE, ix, iy, half, rh, "Choose file...", "", "Choose a sound of assets/sound (type to filter, Space to listen).", 0, 1, 0);
+            ui_add(B_SV_LISTEN, ix + half + 6, iy, half, rh, audio_preview_playing() ? "Stop listening" : "Listen", "", "Hear it (again: stop).", audio_preview_playing(), a->file[0] != 0, 0);
+            iy += rh + 14;
+            if (type == ACT_SOUND) {
+                svl(ix, iy, iw, 16, 1, SVL_SECTION, SV_ONE, "REPEAT");
+                iy += 20;
+                ui_add(B_SV_REP_M, ix, iy, 34, rh, "-", "", "One repeat less.", 0, a->repeat > 0, 0);
+                snprintf(t, sizeof(t), "%d  (plays %d time%s)", a->repeat, a->repeat + 1, a->repeat ? "s" : "");
+                svl(ix + 42, iy, iw - 84, rh, 0, SVL_VALUE, SV_ONE | DT_CENTER, "%s", t);
+                ui_add(B_SV_REP_P, ix + iw - 34, iy, 34, rh, "+", "", "One repeat more.", 0, a->repeat < 99, 0);
+                iy += rh + 14;
+                svl(ix, iy, iw, 16, 1, SVL_SECTION, SV_ONE, "WAIT UNTIL IT'S OVER");
+                iy += 20;
+                ui_add(B_SV_WAITEND, ix, iy, iw, rh, a->wait_end ? "Yes: the next row waits for it" : "No: the next row doesn't wait", "",
+                       "Yes: the row isn't finished until the sound (and its repeats) is over. No: it plays on while the next rows start.", a->wait_end, 1, 1);
+                iy += rh + 12;
+            } else {
+                svl(ix, iy, iw, 16, 1, SVL_SECTION, SV_ONE, "LOOP");
+                iy += 20;
+                ui_add(B_SV_LOOP, ix, iy, iw, rh, a->loop ? "Loops until stopped" : "Plays once", "", "Loop: the ambience plays until a 'Stop sound' action stops it.", a->loop, 1, 1);
+                iy += rh + 12;
+            }
+            svl(ix, iy, iw, 60, 0, SVL_DIM, DT_LEFT | DT_WORDBREAK, "The music isn't touched. A 'Stop sound' action can stop it while it plays.");
+            break;
+        case ACT_STOP: {
+            svl(ix, iy, iw, 16, 1, SVL_SECTION, SV_ONE, "STOP WHAT?");
+            iy += 22;
+            ui_add(B_SV_ST_ALL, ix, iy, iw, rh, "All sounds & ambiences", "", "Every sound and ambience playing (not the music).", a->stop_kind == STOP_ALL_SOUNDS, 1, 3);
+            iy += rh + 5;
+            ui_add(B_SV_ST_MUSIC, ix, iy, iw, rh, "The music", "", "Stop the music and its playlist.", a->stop_kind == STOP_MUSIC, 1, 3);
+            iy += rh + 12;
+            ScriptAction *list[64]; int rows[64];
+            int n = sv_actions_of(s, ACT_SOUND, ACT_AMBIENCE, list, rows, 64);
+            svl(ix, iy, iw, 16, 1, SVL_SECTION, SV_ONE, "OR ONE OF THIS SCRIPT'S SOUNDS");
+            iy += 22;
+            if (n == 0) { svl(ix, iy, iw, 20, 0, SVL_DIM, SV_ONE, "(this script plays no sound / ambience)"); iy += 24; }
+            for (int k = 0; k < n && iy < g_sv_insp_rc.bottom - 60; k++) {
+                snprintf(t, sizeof(t), "%s %s  (row %d)", list[k]->type == ACT_SOUND ? "Sound" : "Ambience", list[k]->file[0] ? list[k]->file : "?", rows[k] + 1);
+                ui_addf(B_SV_STOPREF + k, ix, iy, iw, rh, t, "", "Stop this one if it's still playing.", a->stop_kind == STOP_ACTION && a->stop_ref == list[k]->id, 1, 3);
+                iy += rh + 5;
+            }
+            break;
+        }
+        case ACT_PLACE:
+            svl(ix, iy, iw, 16, 1, SVL_SECTION, SV_ONE, "CHARACTER");
+            iy += 20;
+            svl(ix, iy, iw, 20, 0, SVL_VALUE, SV_ONE, "%s", a->model[0] ? a->model : "(none yet)");
+            iy += 26;
+            ui_add(B_SV_PL_MODEL, ix, iy, half, rh, "Choose...", "", "Pick a character of the game (grid with previews).", 0, 1, 0);
+            ui_add(B_SV_MOVESET, ix + half + 6, iy, half, rh, "Moveset...", "", "The animations this character walks with (graph), and change them.", 0, a->model[0] != 0, 0);
+            iy += rh + 14;
+            svl(ix, iy, iw, 16, 1, SVL_SECTION, SV_ONE, "POSITION");
+            iy += 20;
+            if (a->has_pos) svl(ix, iy, iw, 20, 0, SVL_VALUE, SV_ONE, "set  (%.1f, %.1f, %.1f)", a->pos[0], a->pos[1], a->pos[2]);
+            else svl(ix, iy, iw, 20, 0, RGB(255, 150, 120), SV_ONE, "not set yet");
+            iy += 26;
+            ui_add(B_SV_PL_POS, ix, iy, iw, rh, "Pick in the room...", "", "Click the floor where it appears, then the point it looks toward.", 0, 1, 0);
+            iy += rh + 14;
+            svl(ix, iy, iw, 16, 1, SVL_SECTION, SV_ONE, "FACING");
+            iy += 20;
+            ui_add(B_SV_FACE_L, ix, iy, 44, rh, "<", "", "Turn it 45 degrees left.", 0, 1, 0);
+            svl(ix + 50, iy, iw - 100, rh, 0, SVL_VALUE, SV_ONE | DT_CENTER, "%.0f deg", a->facing * 57.29578f);
+            ui_add(B_SV_FACE_R, ix + iw - 44, iy, 44, rh, ">", "", "Turn it 45 degrees right.", 0, 1, 0);
+            iy += rh + 12;
+            svl(ix, iy, iw, 60, 0, SVL_DIM, DT_LEFT | DT_WORDBREAK, "It stands there until a 'Move character' action moves it. It leaves with the room.");
+            break;
+        case ACT_MOVE: {
+            svl(ix, iy, iw, 16, 1, SVL_SECTION, SV_ONE, "CHARACTER");
+            iy += 22;
+            int ids[64], rows[64];
+            int n = sv_actor_list(s, ids, rows, 64);
+            for (int k = 0; k < n && k < 8; k++) {
+                if (ids[k] == 0) snprintf(t, sizeof(t), "David");
+                else { ScriptAction *p = script_find(s, ids[k], NULL, NULL); snprintf(t, sizeof(t), "%s  (placed row %d)", p && p->model[0] ? p->model : "?", rows[k] + 1); }
+                ui_addf(B_SV_ACTOR + k, ix, iy, iw, rh - 2, t, "", "The character this action moves. Placed characters must be brought in by an earlier row.", a->actor == ids[k], 1, 3);
+                iy += rh + 3;
+            }
+            iy += 10;
+            svl(ix, iy, iw, 16, 1, SVL_SECTION, SV_ONE, "DESTINATION");
+            iy += 20;
+            if (a->door) {
+                int di = shape_index_by_id(a->door);
+                if (di >= 0) snprintf(t, sizeof(t), "connector #%d -> %s", a->door, g_shapes[di].target[0] ? g_shapes[di].target : "(no target room)");
+                else snprintf(t, sizeof(t), "connector #%d (not in this room!)", a->door);
+                svl(ix, iy, iw, 20, 0, SVL_VALUE, SV_ONE, "%s", t);
+            } else if (a->has_pos) svl(ix, iy, iw, 20, 0, SVL_VALUE, SV_ONE, "a point  (%.1f, %.1f, %.1f)", a->pos[0], a->pos[1], a->pos[2]);
+            else svl(ix, iy, iw, 20, 0, RGB(255, 150, 120), SV_ONE, "not set yet");
+            iy += 26;
+            ui_add(B_SV_MV_DEST, ix, iy, iw, rh, "Pick in the room...", "", "Click the floor where it goes, or a connector to make it leave the room through it.", 0, 1, 0);
+            iy += rh + 12;
+            ui_add(B_SV_MV_WALK, ix, iy, half, rh, "Walk", "", "It walks there.", !a->run, 1, 3);
+            ui_add(B_SV_MV_RUN, ix + half + 6, iy, half, rh, "Run", "", "It runs there.", a->run, 1, 3);
+            iy += rh + 8;
+            ui_add(B_SV_MOVESET, ix, iy, iw, rh, "Moveset of this character...", "", "The animations it walks with (graph), and change them.", 0, 1, 0);
+            iy += rh + 12;
+            svl(ix, iy, iw, 90, 0, SVL_DIM, DT_LEFT | DT_WORDBREAK,
+                "The row can't be skipped: it waits until the character arrives -- through a connector, until David is in the other room (another character leaves the room).");
+            break;
+        }
+    }
+}
+
+static void sv_paint(HWND hwnd, HDC hdc) {
+    sv_layout(hwnd);
+    RECT rc; GetClientRect(hwnd, &rc);
+    ui_fill(hdc, &rc, RGB(14, 14, 18));
+    Script *s = sv_cur();
+    char t[300];
+    /* scripts list */
+    ui_fill(hdc, &g_sv_list_rc, RGB(22, 22, 28));
+    int lrows = (g_sv_list_rc.bottom - g_sv_list_rc.top) / SV_LIST_ROW_H;
+    if (g_sv_script < g_sv_list_scroll) g_sv_list_scroll = g_sv_script;
+    if (g_sv_script >= g_sv_list_scroll + lrows) g_sv_list_scroll = g_sv_script - lrows + 1;
+    for (int r = 0; r < lrows; r++) {
+        int k = g_sv_list_scroll + r;
+        if (k >= g_script_count) break;
+        int y = g_sv_list_rc.top + r * SV_LIST_ROW_H;
+        RECT row = { g_sv_list_rc.left, y, g_sv_list_rc.right, y + SV_LIST_ROW_H };
+        if (k == g_sv_script) ui_fill(hdc, &row, RGB(60, 50, 10));
+        SelectObject(hdc, ui_font(15, k == g_sv_script));
+        const char *name = g_scripts[k].name;
+        if (k == g_sv_script && g_sv_text) { snprintf(t, sizeof(t), "%s_", g_sv_text_buf); name = t; }
+        ui_text(hdc, row.left + 8, y, row.right - row.left - 56, SV_LIST_ROW_H, name, k == g_sv_script ? RGB(255, 230, 90) : RGB(220, 220, 225), SV_ONE);
+        if (g_scripts[k].auto_run) { SelectObject(hdc, ui_font(12, 1)); ui_text(hdc, row.right - 48, y, 42, SV_LIST_ROW_H, "AUTO", RGB(120, 230, 140), DT_RIGHT | DT_VCENTER | DT_SINGLELINE); }
+    }
+    if (g_script_count == 0) { SelectObject(hdc, ui_font(14, 0)); ui_text(hdc, g_sv_list_rc.left + 8, g_sv_list_rc.top + 8, g_sv_list_rc.right - g_sv_list_rc.left - 16, 40, "(no script)", SVL_DIM, DT_LEFT | DT_WORDBREAK); }
+    if (g_sv_text) {
+        SelectObject(hdc, ui_font(12, 1));
+        ui_text(hdc, g_sv_list_rc.left, g_sv_list_rc.bottom - 20, g_sv_list_rc.right - g_sv_list_rc.left, 18, "TYPE THE NAME, ENTER / ESC", RGB(255, 210, 60), DT_CENTER | DT_SINGLELINE);
+    }
+
+    /* grid */
+    ui_fill(hdc, &g_sv_grid_rc, RGB(20, 20, 26));
+    if (s) {
+        int cw = (g_sv_grid_rc.right - g_sv_grid_rc.left - SV_ROWHDR_W) / s->cols;
+        SelectObject(hdc, ui_font(12, 1));
+        for (int c = 0; c < s->cols; c++) {
+            snprintf(t, sizeof(t), "COLUMN %d", c + 1);
+            ui_text(hdc, g_sv_grid_rc.left + SV_ROWHDR_W + c * cw, g_sv_grid_rc.top, cw, SV_HDR_H, t, c == g_sv_col ? RGB(255, 210, 90) : SVL_SECTION, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        }
+        int vis = sv_grid_rows_visible(), total = sv_grid_rows_total();
+        for (int r = g_sv_scroll; r < g_sv_scroll + vis && r < total + vis; r++) {
+            int y = g_sv_grid_rc.top + SV_HDR_H + (r - g_sv_scroll) * SV_ROW_H;
+            int beyond = r >= total;
+            SelectObject(hdc, ui_font(15, 1));
+            snprintf(t, sizeof(t), "%d", r + 1);
+            ui_text(hdc, g_sv_grid_rc.left, y, SV_ROWHDR_W - 6, SV_ROW_H - 14, t, beyond ? RGB(70, 70, 80) : r == g_sv_row ? RGB(255, 210, 90) : RGB(170, 170, 180), DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+            if (!beyond && script_row_has_move(s, r)) { SelectObject(hdc, ui_font(11, 0)); ui_text(hdc, g_sv_grid_rc.left, y + SV_ROW_H - 18, SV_ROWHDR_W - 6, 14, "no skip", RGB(150, 130, 90), DT_RIGHT | DT_SINGLELINE); }
+            for (int c = 0; c < s->cols; c++) {
+                RECT cr; sv_cell_rect(r, c, &cr);
+                ScriptAction *a = script_at(s, r, c);
+                int sel = r == g_sv_row && c == g_sv_col, hov = g_sv_hover == r * SCRIPT_MAX_COLS + c;
+                if (a && a->type != ACT_NONE) {
+                    ui_fill(hdc, &cr, hov ? RGB(46, 46, 56) : RGB(36, 36, 44));
+                    RECT st = { cr.left, cr.top, cr.left + 5, cr.bottom };
+                    ui_fill(hdc, &st, action_color(a->type));
+                    SelectObject(hdc, ui_font(13, 1));
+                    ui_text(hdc, cr.left + 12, cr.top + 3, cr.right - cr.left - 16, 18, action_type_name(a->type), action_color(a->type), SV_ONE);
+                    action_summary(s, a, t, sizeof(t));
+                    SelectObject(hdc, ui_font(14, 0));
+                    ui_text(hdc, cr.left + 12, cr.top + 20, cr.right - cr.left - 16, 20, t, RGB(225, 225, 230), SV_ONE);
+                } else {
+                    ui_fill(hdc, &cr, beyond ? RGB(22, 22, 28) : RGB(27, 27, 33));
+                    if (sel || hov) { SelectObject(hdc, ui_font(14, 0)); ui_text(hdc, cr.left, cr.top, cr.right - cr.left, cr.bottom - cr.top, "+ add (double-click)", RGB(110, 110, 125), DT_CENTER | DT_VCENTER | DT_SINGLELINE); }
+                }
+                if (sel) { ui_frame(hdc, &cr, RGB(255, 210, 60)); RECT in = cr; InflateRect(&in, -1, -1); ui_frame(hdc, &in, RGB(255, 210, 60)); }
+            }
+        }
+        /* scrollbar */
+        int tot = total + 1;
+        if (tot > vis) {
+            int th = g_sv_grid_rc.bottom - g_sv_grid_rc.top - SV_HDR_H;
+            int bh = th * vis / tot; if (bh < 24) bh = 24;
+            int by = g_sv_grid_rc.top + SV_HDR_H + (th - bh) * g_sv_scroll / (tot - vis > 0 ? tot - vis : 1);
+            RECT sb = { g_sv_grid_rc.right - 6, by, g_sv_grid_rc.right - 2, by + bh };
+            ui_fill(hdc, &sb, RGB(90, 90, 100));
+        }
+    }
+
+    /* inspector */
+    ui_fill(hdc, &g_sv_insp_rc, RGB(22, 22, 28));
+    ui_frame(hdc, &g_sv_insp_rc, RGB(50, 50, 60));
+    ScriptAction *a = sv_cell(0);
+    if (g_sv_thumb_rc.right > g_sv_thumb_rc.left && a) blit_picture(hdc, &g_sv_thumb_rc, a->file);
+    svl_draw(hdc);
+    ui_draw_buttons(hdc);
+    /* help: hovered button, then the status line */
+    int hy = g_sv_insp_rc.bottom - 110;
+    const UiButton *hb = ui_find(g_hover_btn);
+    SelectObject(hdc, ui_font(14, 0));
+    if (hb && hb->desc && hb->desc[0]) {
+        RECT hr = { g_sv_insp_rc.left + 1, hy - 4, g_sv_insp_rc.right - 1, g_sv_insp_rc.bottom - 1 };
+        ui_fill(hdc, &hr, RGB(28, 28, 36));
+        ui_para(hdc, g_sv_insp_rc.left + 12, hy, g_sv_insp_rc.right - g_sv_insp_rc.left - 24, hb->desc, RGB(230, 230, 235));
+    } else if (g_status[0]) ui_para(hdc, g_sv_insp_rc.left + 12, hy + 40, g_sv_insp_rc.right - g_sv_insp_rc.left - 24, g_status, RGB(150, 150, 150));
+
+    /* chooser, over the grid and the inspector */
+    if (g_ch != CH_NONE) {
+        int pic = g_ch == CH_PICTURE, lw = g_ch_list_rc.right - g_ch_list_rc.left;
+        ui_fill(hdc, &g_ch_rc, RGB(16, 16, 22));
+        ui_frame(hdc, &g_ch_rc, RGB(255, 210, 60));
+        SelectObject(hdc, ui_font(20, 1));
+        ui_text(hdc, g_ch_rc.left + 12, g_ch_rc.top + 8, 600, 26, pic ? "Choose a picture" : g_ch == CH_TRACK ? "Add a music track" : "Choose a sound",
+                RGB(255, 225, 120), SV_ONE);
+        SelectObject(hdc, ui_font(14, 0));
+        snprintf(t, sizeof(t), "filter: %s_   (%d files)", g_ch_filter, g_ch_n);
+        ui_text(hdc, g_ch_rc.left + 12, g_ch_rc.top + 40, 400, 20, t, RGB(200, 200, 200), SV_ONE);
+        SelectObject(hdc, ui_font(12, 1));
+        ui_text(hdc, g_ch_rc.right - 620, g_ch_rc.top + 12, 606, 16,
+                pic ? "TYPE = FILTER   ARROWS = SELECT   ENTER / DOUBLE-CLICK = CHOOSE   ESC = CANCEL" : "TYPE = FILTER   SPACE = LISTEN   ENTER / DOUBLE-CLICK = CHOOSE   ESC = CANCEL",
+                SVL_SECTION, DT_RIGHT | DT_SINGLELINE);
+        ui_fill(hdc, &g_ch_list_rc, RGB(24, 24, 30));
+        int rows = ch_rows_visible();
+        for (int r = 0; r < rows; r++) {
+            int k = g_ch_scroll + r;
+            if (k >= g_ch_n) break;
+            ChEntry *e = &g_ch_all[g_ch_list[k]];
+            int y = g_ch_list_rc.top + r * CH_ROW_H;
+            if (k == g_ch_sel) { RECT hl = { g_ch_list_rc.left, y, g_ch_list_rc.right, y + CH_ROW_H }; ui_fill(hdc, &hl, RGB(60, 50, 10)); }
+            SelectObject(hdc, ui_font(14, 0));
+            ui_text(hdc, g_ch_list_rc.left + 8, y, lw - 110, CH_ROW_H, e->name, k == g_ch_sel ? RGB(255, 230, 60) : RGB(215, 215, 220), SV_ONE);
+            if (pic) {
+                if (e->w < 0) png_size(e->name, &e->w, &e->h);
+                snprintf(t, sizeof(t), "%dx%d", e->w, e->h);
+                int same = e->w == (int)g_hdr.width && e->h == (int)g_hdr.height;
+                ui_text(hdc, g_ch_list_rc.right - 100, y, 92, CH_ROW_H, t, same ? RGB(120, 220, 140) : RGB(130, 130, 140), DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+            } else {
+                if (e->secs < -1.5f) e->secs = audio_file_seconds(e->name);
+                if (e->secs >= 0) snprintf(t, sizeof(t), "%d:%04.1f", (int)(e->secs / 60), fmodf(e->secs, 60.0f)); else snprintf(t, sizeof(t), "?");
+                ui_text(hdc, g_ch_list_rc.right - 100, y, 92, CH_ROW_H, t, RGB(130, 130, 140), DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+            }
+        }
+        if (pic) {
+            const char *cur = ch_current();
+            if (cur) {
+                RECT pr = g_ch_prev_rc; pr.bottom = pr.top + (pr.right - pr.left) * 3 / 4;
+                if (pr.bottom > g_ch_prev_rc.bottom) pr.bottom = g_ch_prev_rc.bottom;
+                blit_picture(hdc, &pr, cur);
+                SelectObject(hdc, ui_font(14, 0));
+                ChEntry *e = &g_ch_all[g_ch_list[g_ch_sel]];
+                snprintf(t, sizeof(t), "%s   %dx%d%s", cur, e->w, e->h, (e->w == (int)g_hdr.width && e->h == (int)g_hdr.height) ? "   (same size as the room)" : "   (will be stretched to the room's size)");
+                ui_text(hdc, pr.left, pr.bottom + 6, pr.right - pr.left, 20, t, SVL_TEXT, SV_ONE);
+            }
+        }
+        ui_draw_buttons(hdc);
+    }
+    SelectObject(hdc, GetStockObject(SYSTEM_FONT));
+}
+
+static int sv_key(HWND hwnd, int vk) {
+    int ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0, shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+    if (g_ch != CH_NONE) {
+        int page = ch_rows_visible();
+        switch (vk) {
+            case VK_ESCAPE: ch_close(); return 1;
+            case VK_RETURN: ch_choose(); return 1;
+            case VK_UP: ch_select(g_ch_sel - 1); return 1;
+            case VK_DOWN: ch_select(g_ch_sel + 1); return 1;
+            case VK_PRIOR: ch_select(g_ch_sel - page); return 1;
+            case VK_NEXT: ch_select(g_ch_sel + page); return 1;
+            case VK_HOME: ch_select(0); return 1;
+            case VK_END: ch_select(g_ch_n - 1); return 1;
+            case VK_SPACE: if (g_ch != CH_PICTURE) sv_action(hwnd, B_CH_LISTEN); return 1;
+            case VK_BACK: if (g_ch_filter_len > 0) { g_ch_filter[--g_ch_filter_len] = 0; ch_filter(); } return 1;
+        }
+        return 0;
+    }
+    if (g_sv_text) {
+        if (vk == VK_RETURN) sv_text_commit();
+        else if (vk == VK_ESCAPE) g_sv_text = 0;
+        else if (vk == VK_BACK) { size_t l = strlen(g_sv_text_buf); if (l) g_sv_text_buf[l - 1] = 0; }
+        return 1;
+    }
+    Script *s = sv_cur();
+    switch (vk) {
+        case VK_ESCAPE: script_view_toggle(); return 1;
+        case VK_F2: sv_action(hwnd, B_SV_RENAME); return 1;
+        case VK_F5: sv_action(hwnd, B_SV_PLAY); return 1;
+        case VK_F6: sv_action(hwnd, B_SV_PLAY_ROW); return 1;
+        case VK_UP: if (ctrl) { if (g_sv_script > 0) { g_sv_script--; sv_select(0, 0); g_sv_scroll = 0; } } else sv_select(g_sv_row - 1, g_sv_col); return 1;
+        case VK_DOWN: if (ctrl) { if (g_sv_script < g_script_count - 1) { g_sv_script++; sv_select(0, 0); g_sv_scroll = 0; } } else sv_select(g_sv_row + 1, g_sv_col); return 1;
+        case VK_LEFT: sv_select(g_sv_row, g_sv_col - 1); return 1;
+        case VK_RIGHT: sv_select(g_sv_row, g_sv_col + 1); return 1;
+        case VK_PRIOR: sv_select(g_sv_row - sv_grid_rows_visible(), g_sv_col); return 1;
+        case VK_NEXT: sv_select(g_sv_row + sv_grid_rows_visible(), g_sv_col); return 1;
+        case VK_HOME: sv_select(0, g_sv_col); return 1;
+        case VK_INSERT: sv_action(hwnd, B_SV_ROW_INS); return 1;
+        case VK_DELETE: sv_action(hwnd, shift ? B_SV_ROW_DEL : B_SV_CLEAR); return 1;
+        case VK_RETURN: if (s) sv_action(hwnd, B_SV_TYPE); return 1;
+        case 'C': if (ctrl) sv_action(hwnd, B_SV_COPY); return 1;
+        case 'V': if (ctrl) sv_action(hwnd, B_SV_PASTE); return 1;
+    }
+    return 0;
+}
+static void sv_char(char c) {
+    if (g_ch != CH_NONE) {
+        if (c > 32 && c < 127 && g_ch_filter_len < (int)sizeof(g_ch_filter) - 1) { g_ch_filter[g_ch_filter_len++] = c; g_ch_filter[g_ch_filter_len] = 0; ch_filter(); }
+        return;
+    }
+    if (g_sv_text) {
+        size_t l = strlen(g_sv_text_buf);
+        if (c >= 32 && c < 127 && l < sizeof(g_sv_text_buf) - 1) { g_sv_text_buf[l] = c; g_sv_text_buf[l + 1] = 0; }
+    }
+}
+static void sv_mouse_down(HWND hwnd, int x, int y, int dbl) {
+    sv_layout(hwnd);
+    if (g_ch != CH_NONE) {
+        int b = ui_hit(x, y);
+        if (b != B_NONE) { sv_action(hwnd, b); return; }
+        if (x >= g_ch_list_rc.left && x < g_ch_list_rc.right && y >= g_ch_list_rc.top && y < g_ch_list_rc.bottom) {
+            int k = g_ch_scroll + (y - g_ch_list_rc.top) / CH_ROW_H;
+            if (k < g_ch_n) {
+                int again = k == g_ch_sel;
+                ch_select(k);
+                if (dbl) ch_choose();
+                else if (g_ch != CH_PICTURE && again) sv_action(hwnd, B_CH_LISTEN);
+            }
+        }
+        return;
+    }
+    if (g_sv_text && !(x >= g_sv_list_rc.left && x < g_sv_list_rc.right)) sv_text_commit();
+    int b = ui_hit(x, y);
+    if (b != B_NONE) { ui_action(hwnd, b); return; }
+    if (x >= g_sv_list_rc.left && x < g_sv_list_rc.right && y >= g_sv_list_rc.top && y < g_sv_list_rc.bottom) {
+        int k = g_sv_list_scroll + (y - g_sv_list_rc.top) / SV_LIST_ROW_H;
+        if (k < g_script_count) {
+            if (k != g_sv_script) { if (g_sv_text) sv_text_commit(); g_sv_script = k; g_sv_row = g_sv_col = g_sv_scroll = 0; }
+            else if (dbl) sv_action(hwnd, B_SV_RENAME);
+        }
+        return;
+    }
+    int r, c;
+    if (sv_cell_at(x, y, &r, &c)) {
+        sv_select(r, c);
+        ScriptAction *a = sv_cell(0);
+        if (dbl && (!a || a->type == ACT_NONE)) sv_cell_menu(hwnd, x, y);
+    }
+}
+static void sv_mouse_move(int x, int y) {
+    int r, c;
+    g_sv_hover = sv_cell_at(x, y, &r, &c) ? r * SCRIPT_MAX_COLS + c : -1;
+}
+static void sv_right_click(HWND hwnd, int x, int y) {
+    sv_layout(hwnd);
+    if (g_ch != CH_NONE) return;
+    int r, c;
+    if (sv_cell_at(x, y, &r, &c)) { sv_select(r, c); sv_cell_menu(hwnd, x, y); }
+}
+static void sv_wheel(int x, int y, int delta) {
+    int n = delta / 120;
+    if (g_ch != CH_NONE) {
+        g_ch_scroll -= n * 3;
+        if (g_ch_scroll > g_ch_n - ch_rows_visible()) g_ch_scroll = g_ch_n - ch_rows_visible();
+        if (g_ch_scroll < 0) g_ch_scroll = 0;
+        return;
+    }
+    if (x >= g_sv_list_rc.left && x < g_sv_list_rc.right) {
+        g_sv_list_scroll -= n;
+        if (g_sv_list_scroll < 0) g_sv_list_scroll = 0;
+        return;
+    }
+    (void)y;
+    g_sv_scroll -= n * 2;
+    int maxs = sv_grid_rows_total() + 1 - sv_grid_rows_visible();
+    if (g_sv_scroll > maxs) g_sv_scroll = maxs;
+    if (g_sv_scroll < 0) g_sv_scroll = 0;
+}
+
+/* =====================================================================
+   MOVESET SCREEN: the animations a character walks with, as a graph
+   (stand -> start -> walk / run cycles -> turns), the selected slot's
+   clip playing on the character, and the clips it can use instead.
+   ===================================================================== */
+enum { B_MS_FIRST = 900, B_MS_HUMAN = B_MS_FIRST, B_MS_EMPTY, B_MS_CLOSE, B_MS_NONE, B_MS_PRESET, B_MS_USE, B_MS_LAST = 950 };
+static CharModel *g_ms_model = NULL;
+static int g_ms_slot = MC_WALK, g_ms_sel = 0, g_ms_scroll = 0, g_ms_preview = 0; /* g_ms_preview: the list's clip plays instead of the slot's */
+static float g_ms_t = 0.0f;
+static char g_ms_filter[32] = "";
+static int g_ms_filter_len = 0;
+static int g_ms_list[4096], g_ms_n = 0;
+static RECT g_ms_graph_rc, g_ms_stage_rc, g_ms_list_rc, g_ms_node_rc[MC_COUNT];
+#define MS_ROW_H 20
+
+static void ms_filter(void) {
+    const CharModel *m = g_ms_model;
+    g_ms_n = 0;
+    for (int pass = 0; pass < 2; pass++)
+        for (int i = 0; i < anim_lib_count() && g_ms_n < 4096; i++) {
+            const char *src = anim_lib_source(i);
+            if (pass == 0 ? strcmp(src, m->name) != 0 : strcmp(src, "anims") != 0) continue;
+            if (g_ms_filter[0] && !ci_strstr(anim_lib_name(i), g_ms_filter)) continue;
+            if (anim_lib_fits(i, m->node_count)) g_ms_list[g_ms_n++] = i;
+        }
+    if (g_ms_sel >= g_ms_n) g_ms_sel = g_ms_n > 0 ? g_ms_n - 1 : 0;
+    g_ms_scroll = 0;
+}
+static int ms_rows_visible(void) { int n = (g_ms_list_rc.bottom - g_ms_list_rc.top) / MS_ROW_H; return n < 1 ? 1 : n; }
+static void ms_select(int k) {
+    if (g_ms_n <= 0) return;
+    if (k < 0) k = 0;
+    if (k >= g_ms_n) k = g_ms_n - 1;
+    g_ms_sel = k; g_ms_preview = 1; g_ms_t = 0.0f;
+    int rows = ms_rows_visible();
+    if (g_ms_sel < g_ms_scroll) g_ms_scroll = g_ms_sel;
+    if (g_ms_sel >= g_ms_scroll + rows) g_ms_scroll = g_ms_sel - rows + 1;
+}
+/* the list on the slot's clip */
+static void ms_select_slot(int slot) {
+    g_ms_slot = slot; g_ms_preview = 0; g_ms_t = 0.0f;
+    int clip = moveset_clip(moveset_get(g_ms_model->name), slot, NULL);
+    for (int k = 0; k < g_ms_n; k++) if (g_ms_list[k] == clip) {
+        g_ms_sel = k;
+        int rows = ms_rows_visible();
+        g_ms_scroll = k - rows / 2; if (g_ms_scroll < 0) g_ms_scroll = 0;
+        return;
+    }
+}
+static void ms_open(CharModel *m) {
+    if (!m) return;
+    g_ms_model = m;
+    g_ms_view = 1;
+    g_ms_filter[0] = 0; g_ms_filter_len = 0;
+    ms_filter();
+    ms_select_slot(MC_WALK);
+    ClipCursor(NULL); g_clip_active = 0;
+}
+static void ms_assign(int clip) {
+    Moveset *ms = moveset_get(g_ms_model->name);
+    if (clip < 0) snprintf(ms->slot[g_ms_slot], sizeof(ms->slot[0]), "-");
+    else {
+        char ref[100]; snprintf(ref, sizeof(ref), "%s/%s", anim_lib_source(clip), anim_lib_name(clip));
+        /* the preset's own clip for this slot: no override needed */
+        if (ms->human && clip == anim_lib_find(HUMAN_PRESET[g_ms_slot])) ms->slot[g_ms_slot][0] = 0;
+        else snprintf(ms->slot[g_ms_slot], sizeof(ms->slot[0]), "%s", ref);
+    }
+    moveset_save(ms);
+    g_ms_preview = 0;
+}
+
+static void ms_action(int id) {
+    Moveset *ms = moveset_get(g_ms_model->name);
+    switch (id) {
+        case B_MS_CLOSE: g_ms_view = 0; break;
+        case B_MS_HUMAN: ms->human = 1; for (int k = 0; k < MC_COUNT; k++) ms->slot[k][0] = 0; moveset_save(ms); snprintf(g_status, sizeof(g_status), "%s: Human preset loaded", ms->model); break;
+        case B_MS_EMPTY: ms->human = 0; for (int k = 0; k < MC_COUNT; k++) ms->slot[k][0] = 0; moveset_save(ms); break;
+        case B_MS_NONE: ms_assign(-1); break;
+        case B_MS_PRESET: ms->slot[g_ms_slot][0] = 0; moveset_save(ms); g_ms_preview = 0; break;
+        case B_MS_USE: if (g_ms_n > 0) ms_assign(g_ms_list[g_ms_sel]); break;
+    }
+}
+
+static void ms_layout(HWND hwnd) {
+    RECT rc; GetClientRect(hwnd, &rc);
+    g_btn_count = 0;
+    int gw = rc.right * 55 / 100;
+    SetRect(&g_ms_graph_rc, 10, 84, gw, rc.bottom - 10);
+    int rx = gw + 14, rw = rc.right - 10 - rx;
+    int stage_h = (rc.bottom - 84) * 45 / 100;
+    SetRect(&g_ms_stage_rc, rx, 84, rc.right - 10, 84 + stage_h);
+    int by = g_ms_stage_rc.bottom + 62;
+    int bw = (rw - 12) / 3;
+    const Moveset *ms = moveset_get(g_ms_model->name);
+    int how = 0; moveset_clip(ms, g_ms_slot, &how);
+    ui_add(B_MS_USE, rx, by, bw, 26, "Use this clip", "Enter", "The clip selected in the list below plays for this slot (double-click a clip does the same).", 0, g_ms_n > 0 && g_ms_preview, 0);
+    ui_add(B_MS_NONE, rx + bw + 6, by, bw, 26, "No animation", "", "This slot plays nothing: a start / turn just turns the character, a cycle shows it in its rest pose.", how == 2 && ms->slot[g_ms_slot][0], 1, 0);
+    ui_add(B_MS_PRESET, rx + 2 * (bw + 6), by, bw, 26, "Back to preset", "", "Forget this slot's change: it plays the preset's clip again.", 0, ms->slot[g_ms_slot][0] != 0, 0);
+    SetRect(&g_ms_list_rc, rx, by + 62, rc.right - 10, rc.bottom - 10);
+    ui_add(B_MS_HUMAN, rc.right - 440, 10, 170, 28, "Load Human preset", "", "Every slot gets David's own clip (the changes of this character are forgotten). The preset itself never changes.", 0, 1, 0);
+    ui_add(B_MS_EMPTY, rc.right - 264, 10, 150, 28, "Empty moveset", "", "No preset: every slot plays nothing until you give it a clip.", 0, 1, 0);
+    ui_add(B_MS_CLOSE, rc.right - 106, 10, 96, 28, "Close", "Esc", "Back.", 0, 1, 0);
+    /* graph nodes */
+    int gx = g_ms_graph_rc.left, gy = g_ms_graph_rc.top, gwid = g_ms_graph_rc.right - g_ms_graph_rc.left, gh = g_ms_graph_rc.bottom - g_ms_graph_rc.top;
+    int nw = gwid / 5, nh = 48;
+    if (nw < 130) nw = 130;
+    #define MS_NODE(k, fx, fy) SetRect(&g_ms_node_rc[k], gx + (int)(gwid * (fx)) - nw / 2, gy + (int)(gh * (fy)) - nh / 2, gx + (int)(gwid * (fx)) + nw / 2, gy + (int)(gh * (fy)) + nh / 2)
+    MS_NODE(MC_STAND, 0.11f, 0.50f);
+    MS_NODE(MC_TOWALK, 0.35f, 0.22f);
+    MS_NODE(MC_TORUN, 0.35f, 0.78f);
+    MS_NODE(MC_WALK, 0.58f, 0.22f);
+    MS_NODE(MC_RUN, 0.58f, 0.78f);
+    MS_NODE(MC_TOWALKA, 0.87f, 0.06f);
+    MS_NODE(MC_TOWALKC, 0.87f, 0.17f);
+    MS_NODE(MC_TO180A, 0.87f, 0.28f);
+    MS_NODE(MC_TO180C, 0.87f, 0.39f);
+    MS_NODE(MC_RUN90A, 0.87f, 0.61f);
+    MS_NODE(MC_RUN90C, 0.87f, 0.72f);
+    MS_NODE(MC_RUN180A, 0.87f, 0.83f);
+    MS_NODE(MC_RUN180C, 0.87f, 0.94f);
+    #undef MS_NODE
+    /* the turn nodes are smaller */
+    static const int turns[8] = { MC_TOWALKA, MC_TOWALKC, MC_TO180A, MC_TO180C, MC_RUN90A, MC_RUN90C, MC_RUN180A, MC_RUN180C };
+    for (int i = 0; i < 8; i++) InflateRect(&g_ms_node_rc[turns[i]], 0, -5);
+}
+
+static void ms_arrow(HDC hdc, int x0, int y0, int x1, int y1, COLORREF col, int dashed) {
+    HPEN pen = CreatePen(dashed ? PS_DOT : PS_SOLID, 1, col);
+    HPEN old = (HPEN)SelectObject(hdc, pen);
+    SetBkMode(hdc, TRANSPARENT);
+    MoveToEx(hdc, x0, y0, NULL); LineTo(hdc, x1, y1);
+    float dx = (float)(x1 - x0), dy = (float)(y1 - y0), l = sqrtf(dx * dx + dy * dy);
+    if (l > 1) {
+        dx /= l; dy /= l;
+        POINT p[3] = { { x1, y1 }, { (int)(x1 - dx * 10 - dy * 5), (int)(y1 - dy * 10 + dx * 5) }, { (int)(x1 - dx * 10 + dy * 5), (int)(y1 - dy * 10 - dx * 5) } };
+        HBRUSH br = CreateSolidBrush(col); HBRUSH ob = (HBRUSH)SelectObject(hdc, br);
+        Polygon(hdc, p, 3);
+        SelectObject(hdc, ob); DeleteObject(br);
+    }
+    SelectObject(hdc, old); DeleteObject(pen);
+}
+
+static void ms_paint(HWND hwnd, HDC hdc) {
+    ms_layout(hwnd);
+    RECT rc; GetClientRect(hwnd, &rc);
+    ui_fill(hdc, &rc, RGB(14, 14, 18));
+    const Moveset *ms = moveset_get(g_ms_model->name);
+    char t[300];
+    SelectObject(hdc, ui_font(20, 1));
+    snprintf(t, sizeof(t), "Moveset -- %s", g_ms_model->name);
+    ui_text(hdc, 12, 10, 600, 28, t, RGB(255, 225, 120), SV_ONE);
+    SelectObject(hdc, ui_font(14, 0));
+    snprintf(t, sizeof(t), "The animations %s walks with. Preset: %s. Click a box to see its clip, then pick another one in the list (right).", g_ms_model->name, ms->human ? "Human (David's clips)" : "none");
+    ui_text(hdc, 12, 42, rc.right - 470, 20, t, RGB(200, 200, 205), SV_ONE);
+    /* graph */
+    ui_fill(hdc, &g_ms_graph_rc, RGB(20, 20, 26));
+    RECT *n = g_ms_node_rc;
+    COLORREF ac = RGB(110, 110, 125);
+    #define CX(k) ((n[k].left + n[k].right) / 2)
+    #define CY(k) ((n[k].top + n[k].bottom) / 2)
+    ms_arrow(hdc, n[MC_STAND].right, CY(MC_STAND) - 8, n[MC_TOWALK].left, CY(MC_TOWALK), ac, 0);
+    ms_arrow(hdc, n[MC_STAND].right, CY(MC_STAND) + 8, n[MC_TORUN].left, CY(MC_TORUN), ac, 0);
+    ms_arrow(hdc, n[MC_TOWALK].right, CY(MC_TOWALK), n[MC_WALK].left, CY(MC_WALK), ac, 0);
+    ms_arrow(hdc, n[MC_TORUN].right, CY(MC_TORUN), n[MC_RUN].left, CY(MC_RUN), ac, 0);
+    static const int wt[4] = { MC_TOWALKA, MC_TOWALKC, MC_TO180A, MC_TO180C }, rt[4] = { MC_RUN90A, MC_RUN90C, MC_RUN180A, MC_RUN180C };
+    for (int i = 0; i < 4; i++) {
+        ms_arrow(hdc, n[MC_WALK].right, CY(MC_WALK), n[wt[i]].left, CY(wt[i]), ac, 0);
+        ms_arrow(hdc, n[MC_RUN].right, CY(MC_RUN), n[rt[i]].left, CY(rt[i]), ac, 0);
+    }
+    ms_arrow(hdc, CX(MC_WALK), n[MC_WALK].bottom, CX(MC_STAND) + 20, n[MC_STAND].top, RGB(80, 80, 95), 1);
+    ms_arrow(hdc, CX(MC_RUN), n[MC_RUN].top, CX(MC_STAND) + 20, n[MC_STAND].bottom, RGB(80, 80, 95), 1);
+    ms_arrow(hdc, CX(MC_WALK) - 20, n[MC_WALK].bottom, CX(MC_RUN) - 20, n[MC_RUN].top, RGB(80, 80, 95), 1);
+    ms_arrow(hdc, CX(MC_RUN) + 20, n[MC_RUN].top, CX(MC_WALK) + 20, n[MC_WALK].bottom, RGB(80, 80, 95), 1);
+    SelectObject(hdc, ui_font(12, 0));
+    ui_text(hdc, (CX(MC_STAND) + CX(MC_WALK)) / 2 - 90, (CY(MC_WALK) + CY(MC_RUN)) / 2 - 30, 150, 16, "arrives (no clip)", RGB(120, 120, 135), DT_CENTER | DT_SINGLELINE);
+    ui_text(hdc, CX(MC_WALK) - 70, (CY(MC_WALK) + CY(MC_RUN)) / 2 - 8, 140, 16, "walk <-> run (no clip)", RGB(120, 120, 135), DT_CENTER | DT_SINGLELINE);
+    SelectObject(hdc, ui_font(12, 1));
+    ui_text(hdc, g_ms_graph_rc.left + 8, g_ms_graph_rc.bottom - 20, 600, 16, "CHANGES OF DIRECTION (45 DEG OR MORE) PLAY THE TURN CLIPS, THEN BACK TO THE CYCLE", RGB(90, 110, 140), DT_LEFT | DT_SINGLELINE);
+    #undef CX
+    #undef CY
+    for (int k = 0; k < MC_COUNT; k++) {
+        int how = 0, clip = moveset_clip(ms, k, &how);
+        int fits = clip >= 0 && anim_lib_fits(clip, g_ms_model->node_count);
+        int big = k == MC_STAND || k == MC_WALK || k == MC_RUN;
+        COLORREF border = how == 1 ? RGB(230, 190, 70) : RGB(80, 110, 150);
+        ui_fill(hdc, &n[k], k == g_ms_slot ? RGB(60, 50, 12) : big ? RGB(34, 40, 52) : RGB(30, 30, 38));
+        ui_frame(hdc, &n[k], k == g_ms_slot ? RGB(255, 210, 60) : border);
+        if (k == g_ms_slot) { RECT in = n[k]; InflateRect(&in, -1, -1); ui_frame(hdc, &in, RGB(255, 210, 60)); }
+        SelectObject(hdc, ui_font(big ? 16 : 13, 1));
+        ui_text(hdc, n[k].left + 8, n[k].top + 2, n[k].right - n[k].left - 12, (n[k].bottom - n[k].top) / 2, MOVE_SLOT_LABEL[k], RGB(235, 235, 240), SV_ONE);
+        if (how == 2) snprintf(t, sizeof(t), "no animation");
+        else if (clip < 0) snprintf(t, sizeof(t), "missing clip");
+        else if (!fits) snprintf(t, sizeof(t), "%s -- doesn't fit", anim_lib_name(clip));
+        else snprintf(t, sizeof(t), "%s%s", anim_lib_name(clip), how == 1 ? "  (changed)" : "");
+        SelectObject(hdc, ui_font(12, 0));
+        ui_text(hdc, n[k].left + 8, (n[k].top + n[k].bottom) / 2, n[k].right - n[k].left - 12, (n[k].bottom - n[k].top) / 2 - 2, t,
+                how == 2 ? RGB(150, 110, 110) : (clip < 0 || !fits) ? RGB(255, 110, 100) : how == 1 ? RGB(255, 210, 110) : RGB(150, 200, 255), SV_ONE);
+    }
+    /* stage: the slot's clip (or the list's) on the character */
+    int how = 0, slot_clip = moveset_clip(ms, g_ms_slot, &how);
+    int clip = g_ms_preview && g_ms_n > 0 ? g_ms_list[g_ms_sel] : slot_clip;
+    int W = g_ms_stage_rc.right - g_ms_stage_rc.left, H = g_ms_stage_rc.bottom - g_ms_stage_rc.top;
+    if (W > 16 && H > 16) {
+        static uint32_t *px = NULL; static size_t cap = 0;
+        if (cap < (size_t)W * H) { free(px); px = (uint32_t *)malloc((size_t)W * H * 4); cap = (size_t)W * H; }
+        float dur = anim_lib_duration(clip);
+        render_char_view(g_ms_model, clip, dur > 0 ? fmodf(g_ms_t, dur) : 0.0f, px, W, H, ANIM_DEFAULT_YAW + g_ms_t * 0.25f, 0.15f, 1.0f, 1, 1);
+        blit_pixels(hdc, g_ms_stage_rc.left, g_ms_stage_rc.top, W, H, px);
+    }
+    ui_frame(hdc, &g_ms_stage_rc, RGB(60, 60, 70));
+    SelectObject(hdc, ui_font(16, 1));
+    snprintf(t, sizeof(t), "%s%s", g_ms_preview ? "Trying: " : "", clip >= 0 ? anim_lib_name(clip) : "(no animation: rest pose)");
+    ui_text(hdc, g_ms_stage_rc.left + 12, g_ms_stage_rc.top + 8, W - 24, 22, t, g_ms_preview ? RGB(255, 210, 90) : RGB(255, 255, 255), SV_ONE);
+    int ry = g_ms_stage_rc.bottom + 6;
+    SelectObject(hdc, ui_font(15, 1));
+    ui_text(hdc, g_ms_stage_rc.left, ry, W, 20, MOVE_SLOT_LABEL[g_ms_slot], RGB(255, 230, 90), SV_ONE);
+    SelectObject(hdc, ui_font(13, 0));
+    snprintf(t, sizeof(t), "%s  Now: %s%s", MOVE_SLOT_DESC[g_ms_slot], slot_clip >= 0 ? anim_lib_name(slot_clip) : "nothing",
+             how == 0 ? " (preset)" : how == 1 ? " (changed)" : " (no animation)");
+    ui_text(hdc, g_ms_stage_rc.left, ry + 22, W, 32, t, RGB(200, 200, 205), DT_LEFT | DT_WORDBREAK | DT_END_ELLIPSIS);
+    /* list */
+    SelectObject(hdc, ui_font(12, 1));
+    snprintf(t, sizeof(t), "CLIPS FOR THIS SKELETON (%d)   filter: %s_", g_ms_n, g_ms_filter);
+    ui_text(hdc, g_ms_list_rc.left, g_ms_list_rc.top - 20, g_ms_list_rc.right - g_ms_list_rc.left, 16, t, SVL_SECTION, SV_ONE);
+    ui_fill(hdc, &g_ms_list_rc, RGB(22, 22, 28));
+    int rows = ms_rows_visible();
+    for (int r = 0; r < rows; r++) {
+        int k = g_ms_scroll + r;
+        if (k >= g_ms_n) break;
+        int id = g_ms_list[k], y = g_ms_list_rc.top + r * MS_ROW_H;
+        if (k == g_ms_sel) { RECT hl = { g_ms_list_rc.left, y, g_ms_list_rc.right, y + MS_ROW_H }; ui_fill(hdc, &hl, RGB(60, 50, 10)); }
+        int own = strcmp(anim_lib_source(id), g_ms_model->name) == 0;
+        SelectObject(hdc, ui_font(14, id == slot_clip));
+        snprintf(t, sizeof(t), "%s%s%s", anim_lib_name(id), own ? "  (own)" : "", id == slot_clip ? "   <- this slot" : "");
+        ui_text(hdc, g_ms_list_rc.left + 8, y, g_ms_list_rc.right - g_ms_list_rc.left - 80, MS_ROW_H, t,
+                k == g_ms_sel ? RGB(255, 230, 60) : own ? RGB(140, 200, 255) : RGB(210, 210, 210), SV_ONE);
+        snprintf(t, sizeof(t), "%.2fs", anim_lib_duration(id));
+        ui_text(hdc, g_ms_list_rc.right - 70, y, 62, MS_ROW_H, t, RGB(130, 130, 140), DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+    }
+    /* hovered button */
+    const UiButton *hb = ui_find(g_hover_btn);
+    if (hb && hb->desc) { SelectObject(hdc, ui_font(14, 0)); ui_text(hdc, 12, 62, rc.right - 470, 18, hb->desc, RGB(255, 230, 150), SV_ONE); }
+    ui_draw_buttons(hdc);
+    SelectObject(hdc, GetStockObject(SYSTEM_FONT));
+}
+
+static int ms_key(int vk) {
+    switch (vk) {
+        case VK_ESCAPE: g_ms_view = 0; return 1;
+        case VK_UP: ms_select(g_ms_sel - 1); return 1;
+        case VK_DOWN: ms_select(g_ms_sel + 1); return 1;
+        case VK_PRIOR: ms_select(g_ms_sel - ms_rows_visible()); return 1;
+        case VK_NEXT: ms_select(g_ms_sel + ms_rows_visible()); return 1;
+        case VK_RETURN: ms_action(B_MS_USE); return 1;
+        case VK_TAB: ms_select_slot((g_ms_slot + 1) % MC_COUNT); return 1;
+        case VK_BACK: if (g_ms_filter_len > 0) { g_ms_filter[--g_ms_filter_len] = 0; ms_filter(); } return 1;
+    }
+    return 0;
+}
+static void ms_char(char c) {
+    if (c > 32 && c < 127 && g_ms_filter_len < (int)sizeof(g_ms_filter) - 1) { g_ms_filter[g_ms_filter_len++] = c; g_ms_filter[g_ms_filter_len] = 0; ms_filter(); }
+}
+static void ms_mouse_down(HWND hwnd, int x, int y, int dbl) {
+    ms_layout(hwnd);
+    int b = ui_hit(x, y);
+    if (b != B_NONE) { ms_action(b); return; }
+    POINT p = { x, y };
+    for (int k = 0; k < MC_COUNT; k++) if (PtInRect(&g_ms_node_rc[k], p)) { ms_select_slot(k); return; }
+    if (PtInRect(&g_ms_list_rc, p)) {
+        int k = g_ms_scroll + (y - g_ms_list_rc.top) / MS_ROW_H;
+        if (k < g_ms_n) { ms_select(k); if (dbl) ms_action(B_MS_USE); }
+    }
+}
+static void ms_wheel(int delta) {
+    g_ms_scroll -= (delta / 120) * 3;
+    if (g_ms_scroll > g_ms_n - ms_rows_visible()) g_ms_scroll = g_ms_n - ms_rows_visible();
+    if (g_ms_scroll < 0) g_ms_scroll = 0;
+}
+
+/* the point being given a facing (PLACE, second click): marked in the room */
+static int sv_pick_marker(float out[3]) {
+    ScriptAction *a = sv_cell(0);
+    if (g_sv_pick != SV_PICK_PLACE_FACE || !a || !a->has_pos) return 0;
+    memcpy(out, a->pos, sizeof(float) * 3);
+    return 1;
+}
+
 /* ===================================================================== */
 /* SILVER_PERF=<file>: once per second, appends frames drawn, average and
    worst paint time and the worst gap between frames (measuring tool). */
@@ -4851,20 +6808,20 @@ static void perf_frame(double paint_ms) {
     }
 }
 
-/* Normal view: David drawn straight into the SCALED picture (screen
+/* Normal view: the characters drawn straight into the SCALED picture (screen
    pixels, true colour from his real texture) instead of into the 8-bit
    640x480 room frame that is then stretched -- he stays sharp at any
    scale and keeps his real colours. Hidden by the room exactly as before
    (room depth sampled under each screen pixel) and by FOREGROUND shapes.
    px: 0x00RRGGBB top-down, W x H = the displayed part of the room;
    screen (x, y) <-> room (cam_x + x / sc, cam_y + y / sc). */
-static void render_david_hires(uint32_t *px, int W, int H, float sc) {
-    if (!g_has_3d_character || !g_loaded || W <= 0 || H <= 0) return;
+static void render_actor_hires(Actor *a, uint32_t *px, int W, int H, float sc, float *zb, uint32_t *zst, uint32_t stamp) {
+    const CharModel *m = a->model;
     static float vx[DAVID_MAX_VERTS], vy[DAVID_MAX_VERTS], vz[DAVID_MAX_VERTS];
     static int vis[DAVID_MAX_VERTS];
-    david_project(vx, vy, vz, vis);
+    actor_project(a, vx, vy, vz, vis);
     float bx0 = 1e9f, by0 = 1e9f, bx1 = -1e9f, by1 = -1e9f;
-    for (int i = 0; i < DAVID_VERTEX_COUNT; i++) {
+    for (int i = 0; i < m->vertex_count; i++) {
         if (!vis[i]) continue;
         vx[i] = (vx[i] - g_cam_x) * sc; vy[i] = (vy[i] - g_cam_y) * sc;
         bx0 = fminf(bx0, vx[i]); by0 = fminf(by0, vy[i]); bx1 = fmaxf(bx1, vx[i]); by1 = fmaxf(by1, vy[i]);
@@ -4875,15 +6832,12 @@ static void render_david_hires(uint32_t *px, int W, int H, float sc) {
     if (X1 >= W) X1 = W - 1;
     if (Y1 >= H) Y1 = H - 1;
     if (X0 > X1 || Y0 > Y1) return;
-    static float *zb = NULL; static size_t zbn = 0;
-    if (zbn < (size_t)W * H) { free(zb); zb = (float *)malloc((size_t)W * H * sizeof(float)); zbn = zb ? (size_t)W * H : 0; if (!zb) return; }
-    for (int y = Y0; y <= Y1; y++) for (int x = X0; x <= X1; x++) zb[(size_t)y * W + x] = 1e30f;
     const float *room_depth = room_depth_cached();
     ensure_fg_mask();
     int fg = g_fg_any && !g_view_mode_3d;
     int RW = (int)g_hdr.width, RH = (int)g_hdr.height;
-    for (int t = 0; t < DAVID_INDEX_COUNT / 3; t++) {
-        int i0 = david_indices[t * 3], i1 = david_indices[t * 3 + 1], i2 = david_indices[t * 3 + 2];
+    for (int t = 0; t < m->index_count / 3; t++) {
+        int i0 = m->indices[t * 3], i1 = m->indices[t * 3 + 1], i2 = m->indices[t * 3 + 2];
         if (!vis[i0] || !vis[i1] || !vis[i2]) continue;
         float x0 = vx[i0], y0 = vy[i0], x1 = vx[i1], y1 = vy[i1], x2 = vx[i2], y2 = vy[i2];
         float den = (y1 - y2) * (x0 - x2) + (x2 - x1) * (y0 - y2);
@@ -4895,8 +6849,8 @@ static void render_david_hires(uint32_t *px, int W, int H, float sc) {
         if (mx1 > X1) mx1 = X1;
         if (my1 > Y1) my1 = Y1;
         float iz0 = 1.0f / vz[i0], iz1 = 1.0f / vz[i1], iz2 = 1.0f / vz[i2];
-        float u0 = david_uvs_px[i0][0] * iz0, u1 = david_uvs_px[i1][0] * iz1, u2 = david_uvs_px[i2][0] * iz2;
-        float v0 = david_uvs_px[i0][1] * iz0, v1 = david_uvs_px[i1][1] * iz1, v2 = david_uvs_px[i2][1] * iz2;
+        float u0 = m->uvs_px[i0][0] * iz0, u1 = m->uvs_px[i1][0] * iz1, u2 = m->uvs_px[i2][0] * iz2;
+        float v0 = m->uvs_px[i0][1] * iz0, v1 = m->uvs_px[i1][1] * iz1, v2 = m->uvs_px[i2][1] * iz2;
         for (int y = my0; y <= my1; y++) {
             float fy = y + 0.5f;
             int ry = g_cam_y + (int)(fy / sc);
@@ -4909,24 +6863,40 @@ static void render_david_hires(uint32_t *px, int W, int H, float sc) {
                 float iz = w0 * iz0 + w1 * iz1 + w2 * iz2;
                 float z = 1.0f / iz;
                 size_t i = (size_t)y * W + x;
-                if (z >= zb[i]) continue;
+                if (zst[i] == stamp && z >= zb[i]) continue; /* a nearer triangle (this character or another) */
                 int rx = g_cam_x + (int)(fx / sc);
                 if (rx >= 0 && rx < RW && ry >= 0 && ry < RH) {
                     size_t ridx = (size_t)ry * g_dib_stride + rx;
                     if (room_depth && z >= room_depth[ridx]) continue; /* behind the scenery */
                     if (fg && g_fg_mask[ridx]) continue;              /* foreground shape */
                 }
-                zb[i] = z;
+                zb[i] = z; zst[i] = stamp;
                 int iu = (int)((w0 * u0 + w1 * u1 + w2 * u2) / iz), iv = (int)((w0 * v0 + w1 * v1 + w2 * v2) / iz);
                 if (iu < 0) iu = 0;
-                if (iu >= DAVID_TEX_W) iu = DAVID_TEX_W - 1;
+                if (iu >= m->tex_w) iu = m->tex_w - 1;
                 if (iv < 0) iv = 0;
-                if (iv >= DAVID_TEX_H) iv = DAVID_TEX_H - 1;
-                const uint8_t *col = DAVID_TEXEL(iv, iu);
+                if (iv >= m->tex_h) iv = m->tex_h - 1;
+                const uint8_t *col = m->tex_rgb + ((size_t)iv * m->tex_w + iu) * 3;
                 px[i] = ((uint32_t)col[0] << 16) | ((uint32_t)col[1] << 8) | col[2];
             }
         }
     }
+}
+/* Every character of the room. One depth buffer for all of them, never
+   cleared: a pixel's depth only counts if it was written this frame
+   (zst == stamp), so the characters hide each other correctly. */
+static void render_david_hires(uint32_t *px, int W, int H, float sc) {
+    if (!g_has_3d_character || !g_loaded || W <= 0 || H <= 0) return;
+    static float *zb = NULL; static uint32_t *zst = NULL; static size_t zbn = 0; static uint32_t stamp = 0;
+    if (zbn < (size_t)W * H) {
+        free(zb); free(zst);
+        zb = (float *)malloc((size_t)W * H * sizeof(float)); zst = (uint32_t *)calloc((size_t)W * H, sizeof(uint32_t));
+        zbn = (zb && zst) ? (size_t)W * H : 0;
+        if (!zbn) return;
+        stamp = 0;
+    }
+    stamp++;
+    for (int k = 0; k < MAX_ACTORS; k++) if (g_actors[k].used) render_actor_hires(&g_actors[k], px, W, H, sc, zb, zst, stamp);
 }
 
 /* The visible part of the 8-bit room frame -> the 32-bit view layer,
@@ -5054,9 +7024,20 @@ static void game_tick(HWND hwnd) {
         double dt = g_last_game_tick_ms > 0 ? (now - g_last_game_tick_ms) / 1000.0 : 0.0;
         g_last_game_tick_ms = now;
         if (dt > 0.1) dt = 0.1; /* clamp huge gaps (e.g. window drag) */
-        int need_repaint = g_has_3d_character ? advance_character((float)dt) : advance_player(dt);
+        script_tick(hwnd, (float)dt); /* a script playing: its rows, before the characters move */
+        int need_repaint = 0;
+        if (g_has_3d_character) {
+            for (int k = 0; k < MAX_ACTORS; k++) {
+                if (!g_actors[k].used) continue;
+                actor_begin(&g_actors[k]); need_repaint |= advance_character((float)dt); actor_end();
+            }
+        } else need_repaint = advance_player(dt);
         if (g_anim_view) { if (!g_anim_paused) g_anim_t += (float)dt * g_anim_speed; need_repaint = 1; }
-        int full_repaint = g_anim_view; /* the viewer is a whole-window screen */
+        if (g_ms_view) g_ms_t += (float)dt;
+        static int last_run_row = -1;
+        int run_row = script_playing() ? g_run.row : -1;
+        int full_repaint = screen_view() || run_row != last_run_row; /* whole-window screens; the script's row in the side panel */
+        last_run_row = run_row;
         if (g_door_travel_request >= 0) {
             int dreq = g_door_travel_request;
             g_door_travel_request = -1;
@@ -5100,6 +7081,7 @@ static void game_tick(HWND hwnd) {
 static LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
         case WM_DESTROY:
+            audio_shutdown();
             ClipCursor(NULL);
             PostQuitMessage(0);
             return 0;
@@ -5109,7 +7091,20 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
         case WM_KEYDOWN: {
             int ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
             if (wParam == VK_CAPITAL) { update_cursor_clip(hwnd); InvalidateRect(hwnd, NULL, FALSE); return 0; }
+            if (g_ms_view) { if (ms_key((int)wParam)) InvalidateRect(hwnd, NULL, FALSE); return 0; }
             if (g_anim_view) { if (anim_view_key((int)wParam)) InvalidateRect(hwnd, NULL, FALSE); return 0; }
+            if (g_script_view) { if (sv_key(hwnd, (int)wParam)) InvalidateRect(hwnd, NULL, FALSE); return 0; }
+            if (g_sv_pick) { /* picking a script action's point: Esc cancels (a facing: keeps it) */
+                if (wParam == VK_ESCAPE) sv_pick_click(0, 0, 1);
+                else if (wParam == VK_F11) ui_action(hwnd, B_FULL);
+                InvalidateRect(hwnd, NULL, FALSE);
+                return 0;
+            }
+            if (script_playing()) { /* a cutscene: nothing but a click to skip (and Esc to stop, for testing) */
+                if (wParam == VK_ESCAPE) script_stop("stopped");
+                InvalidateRect(hwnd, NULL, FALSE);
+                return 0;
+            }
             if (wParam == VK_TAB) {
                 if (g_map_pick_target) { wizard_cancel(NULL); g_map_mode = 0; InvalidateRect(hwnd, NULL, FALSE); return 0; }
                 if (g_map_mode) g_map_mode = 0; else ui_action(hwnd, B_LIST);
@@ -5168,6 +7163,7 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
                 case 'P': ui_action(hwnd, B_WALK); return 0;
                 case 'A': ui_action(hwnd, B_ANIMS); g_anim_skip_char = g_anim_view; return 0;
                 case 'E': ui_action(hwnd, B_EDIT); return 0;
+                case 'S': ui_action(hwnd, B_SCRIPTS); g_anim_skip_char = g_script_view; return 0;
                 case 'B': ui_action(hwnd, B_HITBOX); return 0;
                 case 'C': ui_action(hwnd, B_COLL); return 0;
                 case VK_F11: ui_action(hwnd, B_FULL); return 0;
@@ -5185,7 +7181,12 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             return 0;
         }
         case WM_CHAR: {
+            if (g_ms_view) { ms_char((char)wParam); InvalidateRect(hwnd, NULL, FALSE); return 0; }
             if (g_anim_view) { anim_view_char((char)wParam); InvalidateRect(hwnd, NULL, FALSE); return 0; }
+            if (g_script_view) {
+                if (g_anim_skip_char) { g_anim_skip_char = 0; if (wParam == 's' || wParam == 'S') return 0; } /* the S that opened it */
+                sv_char((char)wParam); InvalidateRect(hwnd, NULL, FALSE); return 0;
+            }
             if (g_map_mode) {
                 char c = (char)wParam;
                 if (c >= 32 && c < 127 && g_map_filter_len < (int)sizeof(g_map_filter) - 1) {
@@ -5201,7 +7202,15 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
         case WM_LBUTTONDBLCLK: {
             int cx = GET_X_LPARAM(lParam), cy = GET_Y_LPARAM(lParam);
             int dbl = (msg == WM_LBUTTONDBLCLK);
+            if (g_ms_view) { ms_mouse_down(hwnd, cx, cy, dbl); InvalidateRect(hwnd, NULL, FALSE); return 0; }
             if (g_anim_view) { anim_view_mouse_down(hwnd, cx, cy, dbl); InvalidateRect(hwnd, NULL, FALSE); return 0; }
+            if (g_script_view) { sv_mouse_down(hwnd, cx, cy, dbl); InvalidateRect(hwnd, NULL, FALSE); return 0; }
+            if (g_sv_pick) {
+                if (g_loaded && mouse_in_game(cx, cy)) { int rx, ry; client_to_room_point(cx, cy, &rx, &ry); sv_pick_click((float)rx, (float)ry, 0); }
+                InvalidateRect(hwnd, NULL, FALSE);
+                return 0;
+            }
+            if (script_playing()) { script_skip_row(); InvalidateRect(hwnd, NULL, FALSE); return 0; }
             if (g_map_mode) { /* room list: click a row to select it, double-click to go */
                 int row = (cy - 60) / 20;
                 if (row >= 0 && row < MAP_VISIBLE_ROWS && g_map_scroll + row < g_map_filtered_count) {
@@ -5239,10 +7248,11 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
         case WM_MOUSEMOVE: {
             g_mouse_client_x = GET_X_LPARAM(lParam);
             g_mouse_client_y = GET_Y_LPARAM(lParam);
-            if (g_anim_view) {
-                anim_view_layout(hwnd);
+            if (screen_view()) {
+                ui_layout(hwnd);
                 g_hover_btn = ui_hit(g_mouse_client_x, g_mouse_client_y);
-                anim_view_mouse_move(g_mouse_client_x, g_mouse_client_y);
+                if (!g_ms_view && g_anim_view) anim_view_mouse_move(g_mouse_client_x, g_mouse_client_y);
+                else if (!g_ms_view) sv_mouse_move(g_mouse_client_x, g_mouse_client_y);
                 InvalidateRect(hwnd, NULL, FALSE);
                 return 0;
             }
@@ -5277,16 +7287,21 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             return 0;
         }
         case WM_MOUSEWHEEL: {
-            if (!g_anim_view) break;
+            if (!screen_view()) break;
             POINT wp = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
             ScreenToClient(hwnd, &wp);
-            anim_view_wheel(wp.x, wp.y, GET_WHEEL_DELTA_WPARAM(wParam));
+            if (g_ms_view) ms_wheel(GET_WHEEL_DELTA_WPARAM(wParam));
+            else if (g_anim_view) anim_view_wheel(wp.x, wp.y, GET_WHEEL_DELTA_WPARAM(wParam));
+            else sv_wheel(wp.x, wp.y, GET_WHEEL_DELTA_WPARAM(wParam));
             InvalidateRect(hwnd, NULL, FALSE);
             return 0;
         }
         case WM_RBUTTONDOWN: {
-            if (g_anim_view) return 0;
             int cx = GET_X_LPARAM(lParam), cy = GET_Y_LPARAM(lParam);
+            if (g_ms_view || g_anim_view) return 0;
+            if (g_script_view) { sv_right_click(hwnd, cx, cy); InvalidateRect(hwnd, NULL, FALSE); return 0; }
+            if (g_sv_pick) { sv_pick_click(0, 0, 1); InvalidateRect(hwnd, NULL, FALSE); return 0; }
+            if (script_playing()) return 0;
             if (g_loaded && !g_map_mode && g_edit_mode && g_has_3d_character && mouse_in_game(cx, cy) && g_wiz == WIZ_NONE) {
                 int rx, ry;
                 client_to_room_point(cx, cy, &rx, &ry);
@@ -5344,7 +7359,7 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             static int last_room = -2;
             static double last_full_ms = 0;
             double now_ms = perf_now_ms();
-            int full = g_map_mode || g_anim_view || !g_loaded || bb_w != cw || now_ms - last_full_ms > 1000.0 ||
+            int full = g_map_mode || screen_view() || !g_loaded || bb_w != cw || now_ms - last_full_ms > 1000.0 ||
                        ps.rcPaint.left < game_rc.left || ps.rcPaint.top < game_rc.top ||
                        ps.rcPaint.right > game_rc.right || ps.rcPaint.bottom > game_rc.bottom ||
                        strcmp(last_status, g_status) != 0 || last_room != g_current_map_room;
@@ -5356,7 +7371,7 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             }
 
             double perf_s0 = perf_now_ms();
-            if (g_loaded && !g_anim_view) {
+            if (g_loaded && !screen_view()) {
                 if (g_view_mode_3d) {
                     render_room_mesh_3d(); /* F3: raw 3D blockout instead of the picture */
                 } else {
@@ -5369,7 +7384,10 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
                     if (room_depth) {
                         if (g_depth_buffer) memcpy(g_depth_buffer, room_depth, npix * sizeof(float));
                         if (g_depth_buffer_char) memcpy(g_depth_buffer_char, room_depth, npix * sizeof(float));
-                        draw_character_shadow();
+                        for (int k = 0; k < MAX_ACTORS; k++) {
+                            if (!g_actors[k].used) continue;
+                            actor_begin(&g_actors[k]); draw_character_shadow(); actor_end();
+                        }
                     } else if (g_depth_buffer) {
                         for (size_t i = 0; i < npix; i++) g_depth_buffer[i] = 1e29f;
                     }
@@ -5416,13 +7434,15 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             }
 
             /* tool panels (black bars in fullscreen, sidebar in windowed) */
-            if (full && !g_map_mode && !g_anim_view) {
+            if (full && !g_map_mode && !screen_view()) {
                 double perf_s3 = perf_now_ms();
                 ui_layout(hwnd);
                 ui_draw_panels(hwnd, hdc);
                 g_perf_sec[3] = perf_now_ms() - perf_s3;
             }
-            if (g_anim_view) anim_view_paint(hwnd, hdc);
+            if (g_ms_view) ms_paint(hwnd, hdc);
+            else if (g_anim_view) anim_view_paint(hwnd, hdc);
+            else if (g_script_view) sv_paint(hwnd, hdc);
 
             if (g_map_mode) {
                 ui_fill(hdc, &rc, RGB(8, 10, 16));
@@ -5501,7 +7521,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     {
         char dir[1024], dir2[1024];
         root_path(dir, sizeof(dir), "assets/chars/david");
-        if (!david_load(dir)) {
+        int david_ok = david_load(dir);
+        actor_reset(DAVID_ACTOR, &g_david, 0);
+        if (!david_ok) {
             MessageBoxA(NULL, "David's model wasn't found in assets/chars/david.\n\n"
                         "./assets must contain the content of the \"Silver Blockouts\" folder "
                         "(chars, levels, sprites...) -- see README.md.", "Silver Remaster", MB_ICONERROR);
@@ -5512,6 +7534,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         anim_lib_init(dir, dir2);
     }
     scan_room_list();
+    {
+        char sdir[1024];
+        root_path(sdir, sizeof(sdir), "assets/sound");
+        audio_init(sdir); /* music, sounds, ambiences (scripts) */
+    }
     david_settings_load(); /* David's global speeds */
     g_nav_zone_at = shapes_world_zone; /* editor red/green zones -> navigation */
     /* Same both-CDs fallback as change_room: a room given on the command
