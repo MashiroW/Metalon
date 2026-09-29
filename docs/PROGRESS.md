@@ -1467,3 +1467,28 @@ Validation, before removing the old data:
   data/portraits.cfg). Clip chooser with a live preview, portrait grid.
 - Checked offline: an ambience fading over 1 s is gone after 1.02 s while
   the music plays on; anim / speak cells round-trip through the file.
+
+## 2026-09-29 -- Room overlays, "Change room"
+
+- The rooms' environmental animations (the .smk videos, as PNG frames in
+  the blockouts): 356 overlays in 283 rooms. Their places aren't in any
+  data we decoded (the .SCT instructions are still unknown, and the
+  engine's overlay X/Y globals have no write site in the decompiled code),
+  so `tools/find_overlay_positions.py` finds them the way already
+  validated on the discs: an overlay is a patch of its room's picture,
+  its frames are matched against the picture and its variants (colour
+  difference over opaque pixels, frames voting), with an edge-correlation
+  vote as second opinion when the frames disagree (glowing portals in
+  atro10: colour votes 5/12 at wrong spots, edge votes 12/12 at the four
+  rings). Reproduces the positions measured before on the .smk files
+  exactly (DOCKSIDE dockhead 128,296, dockmob1 376,352, dockmob2
+  544,240, water 0,288; BOILAREA boilbelt 224,144). Frame rates read from
+  the .smk headers (7 to 30 fps; they vary a lot).
+- The game draws them into the room frame over the picture (under the
+  characters, inside the foreground capture). Script action "Overlays":
+  per overlay loop / once / once then hidden / frozen on frame N / hidden
+  / unchanged, optionally waiting for the "once" ones.
+- Script action "Change room": the connector transition to any room,
+  coming in by one of its connectors, then one of its scripts.
+- The rooms' own .ogg files (their characters' lines) are listed first in
+  the sound chooser ("levels/<level>/<room>/x.ogg").

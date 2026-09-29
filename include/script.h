@@ -21,8 +21,13 @@ enum {
     ACT_MOVE,       /* a character walks / runs to `pos`, or through connector `door` */
     ACT_ANIM,       /* a character plays clip `file` `repeat` times, or (anim_mode 1) until the rest of the row is over */
     ACT_SPEAK,      /* a character says `file` (a sound): its portrait is shown until the line is over */
+    ACT_OVERLAY,    /* the room's overlays (environmental animations): each one looped, played once, frozen, hidden... */
+    ACT_ROOM,       /* go to room `file` (as through a connector): David appears at its connector `door`, then `script` plays */
     ACT_COUNT
 };
+/* ACT_OVERLAY: what each overlay listed does */
+enum { OVM_KEEP, OVM_LOOP, OVM_ONCE, OVM_ONCE_HIDE, OVM_FREEZE, OVM_HIDE, OVM_COUNT };
+#define SCRIPT_MAX_OVERLAYS 16
 enum { STOP_ACTION, STOP_ALL_SOUNDS, STOP_MUSIC };
 
 typedef struct {
@@ -42,8 +47,15 @@ typedef struct {
     float pos[3], facing;              /* world point; facing in radians (PLACE) */
     int actor;                         /* MOVE / ANIM / SPEAK: 0 = David, else the id of the PLACE action that brought the character in */
     int run;                           /* MOVE: 0 walk, 1 run */
-    int door;                          /* MOVE: connector shape id to go through, 0 = go to pos */
+    int door;                          /* MOVE: connector shape id to go through, 0 = go to pos; ROOM: connector of the target room David
+                                          comes in by, 0 = where he'd spawn */
+    int nov;                           /* OVERLAY: the overlays it sets (by name, in the room's _overlays.cfg) */
+    char ov_name[SCRIPT_MAX_OVERLAYS][32];
+    int ov_mode[SCRIPT_MAX_OVERLAYS];  /* OVM_* */
+    int ov_frame[SCRIPT_MAX_OVERLAYS]; /* OVM_FREEZE: the frame shown */
+    char script[64];                   /* ROOM: the target room's script played on arrival ("" = its auto script, like a connector without one) */
 } ScriptAction;
+const char *overlay_mode_name(int mode);
 
 typedef struct {
     char name[64];

@@ -99,9 +99,14 @@ void action_init(Script *s, ScriptAction *a, int type) {
     if (type == ACT_ANIM) a->repeat = 1;
 }
 
+const char *overlay_mode_name(int mode) {
+    static const char *names[OVM_COUNT] = { "unchanged", "loop", "once", "once, then hidden", "frozen", "hidden" };
+    return (mode >= 0 && mode < OVM_COUNT) ? names[mode] : "?";
+}
+
 const char *action_type_name(int type) {
     static const char *names[ACT_COUNT] = { "Empty", "Wait", "Background", "Music", "Sound", "Ambience", "Stop sound", "Place character", "Move character",
-                                            "Animate character", "Speak" };
+                                            "Animate character", "Speak", "Overlays", "Change room" };
     return (type >= 0 && type < ACT_COUNT) ? names[type] : "?";
 }
 
@@ -132,11 +137,11 @@ void action_summary(const Script *s, const ScriptAction *a, char *out, int n) {
             }
             break;
         case ACT_SOUND:
-            snprintf(out, n, "%s", a->file[0] ? a->file : "(no file)");
+            snprintf(out, n, "%s", a->file[0] ? base_name(a->file) : "(no file)");
             if (a->repeat > 0) { size_t l = strlen(out); snprintf(out + l, n - l, "  x%d", a->repeat + 1); }
             if (a->wait_end) { size_t l = strlen(out); snprintf(out + l, n - l, "  (wait)"); }
             break;
-        case ACT_AMBIENCE: snprintf(out, n, "%s%s", a->file[0] ? a->file : "(no file)", a->loop ? "  (loop)" : ""); break;
+        case ACT_AMBIENCE: snprintf(out, n, "%s%s", a->file[0] ? base_name(a->file) : "(no file)", a->loop ? "  (loop)" : ""); break;
         case ACT_STOP:
             if (a->stop_kind == STOP_MUSIC) snprintf(out, n, "the music");
             else if (a->stop_kind == STOP_ALL_SOUNDS) snprintf(out, n, "all sounds & ambiences");
@@ -163,7 +168,23 @@ void action_summary(const Script *s, const ScriptAction *a, char *out, int n) {
             break;
         case ACT_SPEAK:
             script_actor_name(s, a->actor, t, sizeof(t));
-            snprintf(out, n, "%s: %s", t, a->file[0] ? a->file : "(no line yet)");
+            snprintf(out, n, "%s: %s", t, a->file[0] ? base_name(a->file) : "(no line yet)");
+            break;
+        case ACT_OVERLAY: {
+            int shown = 0;
+            for (int i = 0; i < a->nov; i++) {
+                if (a->ov_mode[i] == OVM_KEEP) continue;
+                size_t l = strlen(out);
+                if (a->ov_mode[i] == OVM_FREEZE) snprintf(out + l, n - l, "%s%s frame %d", shown ? ", " : "", a->ov_name[i], a->ov_frame[i]);
+                else snprintf(out + l, n - l, "%s%s %s", shown ? ", " : "", a->ov_name[i], overlay_mode_name(a->ov_mode[i]));
+                shown++;
+            }
+            if (!shown) snprintf(out, n, "(nothing changes)");
+            break;
+        }
+        case ACT_ROOM:
+            if (!a->file[0]) { snprintf(out, n, "(no room yet)"); break; }
+            snprintf(out, n, "%s%s%s", a->file, a->script[0] ? ", then " : "", a->script);
             break;
     }
 }
@@ -182,6 +203,8 @@ void action_summary(const Script *s, const ScriptAction *a, char *out, int n) {
    cell <row> <col> <id> move <actor> <run> <door> <has_pos> <x> <y> <z>
    cell <row> <col> <id> anim <actor> <mode> <times> <source/clip>
    cell <row> <col> <id> speak <actor> <file>
+   cell <row> <col> <id> overlays <wait for the 'once' ones> <n> [<name> <OVM_* mode> <frozen frame>]...
+   cell <row> <col> <id> room <level/room> <connector id> <script name (rest of the line) | ->
    end */
 static void parse_cell(Script *s, const char *line) {
     int r, c, id, used = 0;
@@ -214,6 +237,25 @@ static void parse_cell(Script *s, const char *line) {
     else if (!strcmp(kind, "place")) { a.type = ACT_PLACE; sscanf(p, "%47s %d %f %f %f %f", a.model, &a.has_pos, &a.pos[0], &a.pos[1], &a.pos[2], &a.facing); if (!strcmp(a.model, "-")) a.model[0] = 0; }
     else if (!strcmp(kind, "anim")) { a.type = ACT_ANIM; sscanf(p, "%d %d %d %159s", &a.actor, &a.anim_mode, &a.repeat, a.file); }
     else if (!strcmp(kind, "speak")) { a.type = ACT_SPEAK; sscanf(p, "%d %159s", &a.actor, a.file); }
+    else if (!strcmp(kind, "overlays")) {
+        a.type = ACT_OVERLAY;
+        int k = 0, nov = 0;
+        if (sscanf(p, "%d %d %n", &a.wait_end, &nov, &k) >= 2) {
+            p += k;
+            for (int i = 0; i < nov && a.nov < SCRIPT_MAX_OVERLAYS; i++) {
+                if (sscanf(p, "%31s %d %d %n", a.ov_name[a.nov], &a.ov_mode[a.nov], &a.ov_frame[a.nov], &k) < 3) break;
+                p += k; a.nov++;
+            }
+        }
+    }
+    else if (!strcmp(kind, "room")) {
+        a.type = ACT_ROOM;
+        int k = 0;
+        if (sscanf(p, "%159s %d %n", a.file, &a.door, &k) >= 2) {
+            snprintf(a.script, sizeof(a.script), "%s", p + k);
+            if (!strcmp(a.script, "-")) a.script[0] = 0;
+        }
+    }
     else if (!strcmp(kind, "move")) { a.type = ACT_MOVE; sscanf(p, "%d %d %d %d %f %f %f", &a.actor, &a.run, &a.door, &a.has_pos, &a.pos[0], &a.pos[1], &a.pos[2]); }
     else return;
     if (!strcmp(a.file, "-")) a.file[0] = 0;
@@ -268,6 +310,12 @@ static void write_cell(FILE *f, int r, int c, const ScriptAction *a) {
         case ACT_PLACE: fprintf(f, "place %s %d %.4f %.4f %.4f %.4f\n", a->model[0] ? a->model : "-", a->has_pos, a->pos[0], a->pos[1], a->pos[2], a->facing); break;
         case ACT_ANIM: fprintf(f, "anim %d %d %d %s\n", a->actor, a->anim_mode, a->repeat, a->file[0] ? a->file : "-"); break;
         case ACT_SPEAK: fprintf(f, "speak %d %s\n", a->actor, a->file[0] ? a->file : "-"); break;
+        case ACT_OVERLAY:
+            fprintf(f, "overlays %d %d", a->wait_end, a->nov);
+            for (int i = 0; i < a->nov; i++) fprintf(f, " %s %d %d", a->ov_name[i], a->ov_mode[i], a->ov_frame[i]);
+            fprintf(f, "\n");
+            break;
+        case ACT_ROOM: fprintf(f, "room %s %d %s\n", a->file[0] ? a->file : "-", a->door, a->script[0] ? a->script : "-"); break;
         case ACT_MOVE: fprintf(f, "move %d %d %d %d %.4f %.4f %.4f\n", a->actor, a->run, a->door, a->has_pos, a->pos[0], a->pos[1], a->pos[2]); break;
     }
 }

@@ -2192,9 +2192,159 @@ static void clamp_camera(void) {
     if (g_cam_y > max_y) g_cam_y = max_y;
 }
 
+/* =====================================================================
+   ROOM OVERLAYS: the environmental animations of a room (the original
+   game's .smk videos, exported as <name>.<n>.png in the room's folder).
+   Each is a patch of the room's own picture, drawn over it at its place
+   -- found by tools/find_overlay_positions.py and kept, with its frame
+   rate, in data/rooms/<level>/<room>_overlays.cfg. Nothing plays by
+   itself: the scripts' "Overlays" action loops them, plays them once,
+   freezes them on a frame or hides them.
+   ===================================================================== */
+enum { OVS_HIDDEN, OVS_LOOP, OVS_ONCE, OVS_ONCE_HIDE, OVS_FROZEN };
+#define MAX_ROOM_OVERLAYS 32
+typedef struct {
+    char name[32];
+    int frames, x, y, w, h;
+    char bg[48];              /* the picture it was matched on (the room's own, or a variant like rep1) */
+    char conf[8];             /* sure / guess / none / set (moved by hand) */
+    float fps;
+    int state;                /* OVS_* */
+    int frame, finished;      /* finished: a "once" came to its end */
+    float t;
+    uint32_t **img;           /* frames, loaded the first time they're drawn (0xAARRGGBB) */
+    int *iw, *ih;
+} RoomOverlay;
+static RoomOverlay g_ov[MAX_ROOM_OVERLAYS];
+static int g_ov_n = 0;
+static char g_ov_room[128] = "";
+static int g_ov_show = -1;    /* shown at its place whatever its state (its position being picked) */
+
+static void overlays_free(void) {
+    for (int i = 0; i < g_ov_n; i++) {
+        RoomOverlay *o = &g_ov[i];
+        if (o->img) for (int f = 0; f < o->frames; f++) free(o->img[f]);
+        free(o->img); free(o->iw); free(o->ih);
+    }
+    g_ov_n = 0;
+}
+static void overlays_path(char *out, size_t n, const char *label) { root_path(out, n, "data/rooms/%s_overlays.cfg", label); }
+static void overlays_load(const char *label) {
+    overlays_free();
+    snprintf(g_ov_room, sizeof(g_ov_room), "%s", label);
+    char path[1024], line[512];
+    overlays_path(path, sizeof(path), label);
+    FILE *f = fopen(path, "r");
+    if (!f) return;
+    while (fgets(line, sizeof(line), f) && g_ov_n < MAX_ROOM_OVERLAYS) {
+        RoomOverlay o; memset(&o, 0, sizeof(o));
+        o.fps = 15.0f;
+        if (sscanf(line, "overlay %31s %d %d %d %d %d %47s %7s %f", o.name, &o.frames, &o.x, &o.y, &o.w, &o.h, o.bg, o.conf, &o.fps) < 6 || o.frames <= 0) continue;
+        if (o.fps <= 0.5f || o.fps > 120.0f) o.fps = 15.0f;
+        o.img = (uint32_t **)calloc(o.frames, sizeof(uint32_t *));
+        o.iw = (int *)calloc(o.frames, sizeof(int)); o.ih = (int *)calloc(o.frames, sizeof(int));
+        g_ov[g_ov_n++] = o;
+    }
+    fclose(f);
+}
+static void overlays_save(void) {
+    char path[1024];
+    overlays_path(path, sizeof(path), g_ov_room);
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+    fprintf(f, "# Silver Remaster: this room's overlays (environmental animations) -- tools/find_overlay_positions.py\n");
+    fprintf(f, "# overlay <name> <frames> <x> <y> <width> <height> <picture it matched> <sure|guess|none|set> <fps>\n");
+    fprintf(f, "# frames: assets/levels/<level>/<room>/<name>.<0..frames-1>.png, drawn with their top-left corner at x y of the room picture\n");
+    for (int i = 0; i < g_ov_n; i++) {
+        RoomOverlay *o = &g_ov[i];
+        fprintf(f, "overlay %s %d %d %d %d %d %s %s %.2f\n", o->name, o->frames, o->x, o->y, o->w, o->h, o->bg[0] ? o->bg : "-", o->conf[0] ? o->conf : "set", o->fps);
+    }
+    fclose(f);
+}
+static int overlay_find(const char *name) {
+    for (int i = 0; i < g_ov_n; i++) if (!strcmp(g_ov[i].name, name)) return i;
+    return -1;
+}
+static const uint32_t *overlay_frame(RoomOverlay *o, int f, int *w, int *h) {
+    if (f < 0) f = 0;
+    if (f >= o->frames) f = o->frames - 1;
+    if (!o->img[f]) {
+        char level[64], room[64], path[1024];
+        split_label(g_ov_room, level, sizeof(level), room, sizeof(room));
+        root_path(path, sizeof(path), "assets/levels/%s/%s/%s.%d.png", level, room, o->name, f);
+        o->img[f] = image_load(path, &o->iw[f], &o->ih[f]);
+        if (!o->img[f]) { o->iw[f] = o->ih[f] = 0; }
+    }
+    *w = o->iw[f]; *h = o->ih[f];
+    return o->img[f];
+}
+/* mode: the script action's OVM_* */
+static void overlay_apply(RoomOverlay *o, int mode, int frame) {
+    switch (mode) {
+        case OVM_LOOP: o->state = OVS_LOOP; break;
+        case OVM_ONCE: o->state = OVS_ONCE; break;
+        case OVM_ONCE_HIDE: o->state = OVS_ONCE_HIDE; break;
+        case OVM_FREEZE: o->state = OVS_FROZEN; break;
+        case OVM_HIDE: o->state = OVS_HIDDEN; break;
+        default: return;
+    }
+    o->t = 0.0f; o->finished = 0;
+    o->frame = mode == OVM_FREEZE ? (frame < 0 ? 0 : frame >= o->frames ? o->frames - 1 : frame) : 0;
+}
+static void overlays_reset(void) { for (int i = 0; i < g_ov_n; i++) { g_ov[i].state = OVS_HIDDEN; g_ov[i].frame = 0; g_ov[i].finished = 0; } }
+/* returns 1 if a frame shown changed */
+static int overlays_tick(float dt) {
+    int changed = 0;
+    for (int i = 0; i < g_ov_n; i++) {
+        RoomOverlay *o = &g_ov[i];
+        if (o->state != OVS_LOOP && o->state != OVS_ONCE && o->state != OVS_ONCE_HIDE) continue;
+        if (o->finished) continue;
+        o->t += dt;
+        int f = (int)(o->t * o->fps);
+        if (o->state == OVS_LOOP) f %= o->frames;
+        else if (f >= o->frames) {
+            o->finished = 1;
+            if (o->state == OVS_ONCE_HIDE) { o->state = OVS_HIDDEN; changed = 1; continue; }
+            f = o->frames - 1; /* a "once" stays on its last frame */
+        }
+        if (f != o->frame) { o->frame = f; changed = 1; }
+    }
+    return changed;
+}
+/* into the room frame, right over the picture (under the characters) */
+static void overlays_draw(void) {
+    int W = (int)g_hdr.width, H = (int)g_hdr.height;
+    for (int i = 0; i < g_ov_n; i++) {
+        RoomOverlay *o = &g_ov[i];
+        if (o->state == OVS_HIDDEN && i != g_ov_show) continue;
+        int w, h;
+        const uint32_t *px = overlay_frame(o, o->frame, &w, &h);
+        if (!px) continue;
+        for (int y = 0; y < h; y++) {
+            int ry = o->y + y;
+            if (ry < 0 || ry >= H) continue;
+            const uint32_t *src = px + (size_t)y * w;
+            uint32_t *dst = g_render_pixels + (size_t)ry * g_dib_stride;
+            for (int x = 0; x < w; x++) {
+                int rx = o->x + x;
+                if (rx < 0 || rx >= W || (src[x] >> 24) < 128) continue;
+                dst[rx] = src[x] & 0x00FFFFFFu;
+            }
+        }
+    }
+}
+
 static int g_room_gen = 0;      /* bumped on every room load */
 static int g_room_entered = 0;  /* a room was just loaded: game_tick starts its arrival / auto script */
-static struct { int phase; float t; int door; } g_tr; /* room transition (see ROOM TRANSITION): 0 none, 1 fading out, 2 loading, 3 fading in */
+static struct {
+    int phase; float t;  /* room transition (see ROOM TRANSITION): 0 none, 1 fading out, 2 loading, 3 fading in */
+    int door;            /* through this connector... */
+    char room[128];      /* ...or (script "Change room") to this room, */
+    int room_door;       /* coming in by its connector (id, 0 = where he'd spawn), */
+    char script[64];     /* playing this script there */
+} g_tr;
+static void transition_start_room(const char *label, int door, const char *script);
+static void room_travel(HWND hwnd, const char *label, int door, const char *script);
 static char g_arrival_script[64] = ""; /* script of the connector David just came through */
 static void room_scripts_load(const char *label); /* SCRIPTS */
 static int g_sv_pick = 0;       /* a script action's point being picked in the room (SV_PICK_*) */
@@ -2207,6 +2357,7 @@ static void unload_room(void) {
     free(g_render_pixels); g_render_pixels = NULL;
     free(g_depth_buffer); g_depth_buffer = NULL;
     free(g_depth_buffer_char); g_depth_buffer_char = NULL;
+    overlays_free();
     g_loaded = 0;
 }
 
@@ -2243,6 +2394,7 @@ static int load_room(const char *label) {
     audio_stop_kind(AUDIO_SOUND); audio_stop_kind(AUDIO_AMBIENCE); /* the music goes on */
     try_start_3d_character_for_room(label);
     room_scripts_load(label);
+    overlays_load(label);
     g_room_gen++;
     g_room_entered = 1; /* game_tick: the room's arrival / auto script */
     resize_window_to_room();
@@ -3355,6 +3507,7 @@ static void wizard_target_chosen(HWND hwnd, int map_index) {
 }
 
 /* Game timer: David reached a connector's doorstep. */
+static int arrive_through(int j, int run);
 static void door_travel(HWND hwnd, int di) {
     if (di < 0 || di >= g_shape_count || !g_shapes[di].door) return;
     Shape d = g_shapes[di];
@@ -3368,6 +3521,12 @@ static void door_travel(HWND hwnd, int di) {
     SetWindowTextA(hwnd, title);
     snprintf(g_arrival_script, sizeof(g_arrival_script), "%s", d.script);
     int j = shape_index_by_id(d.target_door);
+    if (!arrive_through(j, run)) snprintf(g_status, sizeof(g_status), "arrived in %s (the way back isn't set up yet)", g_map_rooms[ti].label);
+}
+
+/* David comes in by connector j of the room just loaded: on its doorstep,
+   then walking (running) to its arrival point. 0 if it can't be done. */
+static int arrive_through(int j, int run) {
     if (g_has_3d_character && j >= 0 && g_shapes[j].door && g_shapes[j].has_step) {
         /* appear on the other side's doorstep, then walk in */
         memcpy(g_char_pos, g_shapes[j].step, sizeof(float) * 3);
@@ -3382,9 +3541,21 @@ static void door_travel(HWND hwnd, int di) {
             g_click_marker_active = 0;
         }
         center_view_on_david();
-    } else {
-        snprintf(g_status, sizeof(g_status), "arrived in %s (the way back isn't set up yet)", g_map_rooms[ti].label);
+        return 1;
     }
+    return 0;
+}
+
+/* Script "Change room": like going through a connector into `label`. */
+static void room_travel(HWND hwnd, const char *label, int door, const char *script) {
+    int ti = map_index_of_label(label);
+    if (ti < 0) { snprintf(g_status, sizeof(g_status), "script: room '%s' not found", label); return; }
+    char title[300];
+    snprintf(title, sizeof(title), "Silver Remaster -- %s  [%d/%d]", g_map_rooms[ti].label, ti + 1, g_map_room_count);
+    change_room(g_map_rooms[ti].label);
+    SetWindowTextA(hwnd, title);
+    snprintf(g_arrival_script, sizeof(g_arrival_script), "%s", script);
+    if (door) arrive_through(shape_index_by_id(door), 0);
 }
 
 static int door_at_pixel(float x, float y) {
@@ -3522,7 +3693,7 @@ enum {
     B_R_RED, B_R_GREEN, B_R_FG, B_R_DOOR, B_R_REDO, B_R_RETARGET, B_R_SCRIPT, B_W_CANCEL, B_SETTINGS, B_SET_RESET, B_SCRIPTS,
     B_ANIMS, B_AV_MODEL, B_AV_MOVESET, B_AV_PREV, B_AV_PLAY, B_AV_NEXT, B_AV_STEPB, B_AV_STEPF, B_AV_SLOWER, B_AV_FASTER, B_AV_FOLLOW, B_AV_RESET, B_AV_CLOSE,
     B_SET_BASE = 100, /* + 2*i (-), + 2*i+1 (+) */
-    B_SV_FIRST_ID = 280, B_SV_LAST_ID = 899 /* the scripts screen's (sv_action) */
+    B_SV_FIRST_ID = 280, B_SV_LAST_ID = 1399 /* the scripts screen's (sv_action), but 900-999: the moveset screen's */
 };
 typedef struct { int id; RECT r; const char *label; const char *key; const char *desc; int on; int enabled; int kind; } UiButton;
 #define UI_MAX_BTN 200
@@ -3718,7 +3889,7 @@ static void settings_applied(int nav) {
 
 /* One place for every action (buttons and keyboard shortcuts alike). */
 static void ui_action(HWND hwnd, int id) {
-    if (id >= B_SV_FIRST_ID && id <= B_SV_LAST_ID) { sv_action(hwnd, id); InvalidateRect(hwnd, NULL, FALSE); return; }
+    if (id >= B_SV_FIRST_ID && id <= B_SV_LAST_ID && !(id >= 900 && id < 1000)) { sv_action(hwnd, id); InvalidateRect(hwnd, NULL, FALSE); return; }
     switch (id) {
         case B_PREV: go_to_room_index(hwnd, g_current_map_room < 0 ? 0 : g_current_map_room - 1); break;
         case B_NEXT: go_to_room_index(hwnd, g_current_map_room + 1); break;
@@ -4065,6 +4236,14 @@ static void draw_editor_overlays(HDC hdc) {
     if (!show) return;
     float pm[3];
     if (sv_pick_marker(pm)) draw_world_point(hdc, pm, "1 the character", RGB(255, 220, 60));
+    if (g_ov_show >= 0 && g_ov_show < g_ov_n) { /* an overlay being placed */
+        RoomOverlay *o = &g_ov[g_ov_show];
+        int x0, y0, x1, y1;
+        room_to_client((float)o->x, (float)o->y, &x0, &y0); room_to_client((float)(o->x + o->w), (float)(o->y + o->h), &x1, &y1);
+        HPEN pen = CreatePen(PS_DASH, 1, RGB(255, 220, 60)); HPEN op = (HPEN)SelectObject(hdc, pen);
+        Rectangle(hdc, x0, y0, x1, y1);
+        SelectObject(hdc, op); DeleteObject(pen);
+    }
     HBRUSH ob = (HBRUSH)SelectObject(hdc, GetStockObject(NULL_BRUSH));
     HFONT f = ui_font(13, 0); HFONT of = (HFONT)SelectObject(hdc, f);
     SetBkMode(hdc, TRANSPARENT);
@@ -5281,6 +5460,7 @@ static struct {
     int row, row_started;
     CellRun cell[SCRIPT_MAX_COLS];
     int voice_action[RUN_MAX_VOICES], voice_id[RUN_MAX_VOICES], nvoices;
+    int leave;          /* a "Change room" started: the script ends once its row has started */
 } g_run;
 
 static int script_playing(void) { return g_run.active; }
@@ -5401,6 +5581,22 @@ static void run_start(const ScriptAction *a, CellRun *c) {
         case ACT_PLACE: actor_place(a); break;
         case ACT_MOVE: run_start_move(a, c); break;
         case ACT_ANIM: run_start_anim(a, c); break;
+        case ACT_OVERLAY: {
+            int wait = 0;
+            for (int i = 0; i < a->nov; i++) {
+                int k = overlay_find(a->ov_name[i]);
+                if (k < 0) continue;
+                overlay_apply(&g_ov[k], a->ov_mode[i], a->ov_frame[i]);
+                if (a->ov_mode[i] == OVM_ONCE || a->ov_mode[i] == OVM_ONCE_HIDE) wait = 1;
+            }
+            c->done = !(a->wait_end && wait);
+            break;
+        }
+        case ACT_ROOM:
+            if (!a->file[0]) break;
+            transition_start_room(a->file, a->door, a->script);
+            g_run.leave = 1;
+            break;
         case ACT_SPEAK: {
             CharModel *m = run_actor_model(&g_run.s, a->actor);
             c->portrait = m ? portrait_of(m->name) : 0;
@@ -5421,6 +5617,16 @@ static int run_cell_done(const ScriptAction *a, CellRun *c, float dt) {
             if (c->voice) c->done = !audio_playing(c->voice);
             else { c->timer -= dt; c->done = c->timer <= 0.0f; }
             break;
+        case ACT_OVERLAY: { /* its "once" overlays have played (or are gone with the room) */
+            int all = 1;
+            for (int i = 0; i < a->nov; i++) {
+                if (a->ov_mode[i] != OVM_ONCE && a->ov_mode[i] != OVM_ONCE_HIDE) continue;
+                int k = overlay_find(a->ov_name[i]);
+                if (k >= 0 && !g_ov[k].finished) all = 0;
+            }
+            c->done = all;
+            break;
+        }
         case ACT_ANIM:
             if (c->row_long) return 0; /* decided by the rest of the row (script_tick) */
             c->done = !c->actor->used || c->actor->play_clip != c->clip;
@@ -5515,6 +5721,7 @@ static void script_tick(HWND hwnd, float dt) {
                 if (a->type == ACT_NONE) g_run.cell[c].done = 1;
                 else run_start(a, &g_run.cell[c]);
             }
+            if (g_run.leave) { script_stop("ended: going to another room"); break; }
         }
         int all = 1;
         for (int c = 0; c < s->cols; c++) {
@@ -5533,13 +5740,17 @@ static void script_tick(HWND hwnd, float dt) {
     }
 }
 
-enum { SV_PICK_NONE, SV_PICK_PLACE_POS, SV_PICK_PLACE_FACE, SV_PICK_MOVE };
+enum { SV_PICK_NONE, SV_PICK_PLACE_POS, SV_PICK_PLACE_FACE, SV_PICK_MOVE, SV_PICK_OVERLAY };
 
 /* The yellow step box of the side panel while a script plays or a point
    is being picked (see wizard_step_text). */
 static const char *script_step_text(char *buf, size_t n, const char **sub) {
     static char sb[400];
     *sub = sb;
+    if (g_sv_pick == SV_PICK_OVERLAY) {
+        snprintf(sb, sizeof(sb), "Click where the overlay's CENTRE goes (it's shown at its place now). Its position is the room's: every script uses it. Esc: cancel.");
+        return "Overlays -- place an animation";
+    }
     if (g_sv_pick == SV_PICK_PLACE_POS) {
         snprintf(sb, sizeof(sb), "Click the floor where the character appears (the green floor). Esc: cancel.");
         return "Script -- place a character: its position";
@@ -5575,10 +5786,14 @@ enum {
     B_SV_FILE, B_SV_LISTEN, B_SV_REP_M, B_SV_REP_P, B_SV_WAITEND, B_SV_LOOP, B_SV_ST_ALL, B_SV_ST_MUSIC,
     B_SV_PL_MODEL, B_SV_PL_POS, B_SV_FACE_L, B_SV_FACE_R, B_SV_MV_DEST, B_SV_MV_WALK, B_SV_MV_RUN, B_SV_MOVESET,
     B_CH_OK, B_CH_CANCEL, B_CH_LISTEN, B_CH_SCOPE0, B_CH_SCOPE1, B_CH_SCOPE2,
+    B_SV_OV_LEFT, B_SV_OV_RIGHT, B_SV_OV_UP, B_SV_OV_DOWN, B_SV_OV_PICK, B_SV_OV_WAIT, B_SV_OV_RELOAD, B_SV_RM_ROOM,
     B_SV_ADD = 400,     /* + action type */
     B_SV_TRACK = 500,   /* + track * 8 + op (0 listen, 1 loop, 2 up, 3 down, 4 remove) */
     B_SV_STOPREF = 600, /* + index in the script's sounds / ambiences */
     B_SV_ACTOR = 700,   /* + index: 0 David, then the script's placed characters */
+    B_SV_OVROW = 1000,  /* + entry * 8 + op (0 select, 1 mode, 2 frame -, 3 frame +) */
+    B_SV_RM_DOOR = 1200, /* + index: 0 = where he'd spawn, then the target room's connectors */
+    B_SV_RM_SCRIPT = 1300, /* + index: 0 = none, then the target room's scripts */
     B_SV_LAST = 899
 };
 #define SV_ROW_H 46
@@ -5593,8 +5808,10 @@ static ScriptAction g_sv_clip;              /* copy / paste */
 static int g_sv_has_clip = 0;
 static int g_sv_text = 0;                   /* typing a script name: 1 new, 2 rename */
 static char g_sv_text_buf[64];
-static RECT g_sv_list_rc, g_sv_grid_rc, g_sv_insp_rc, g_sv_thumb_rc, g_sv_port_rc;
+static RECT g_sv_list_rc, g_sv_grid_rc, g_sv_insp_rc, g_sv_thumb_rc, g_sv_port_rc, g_sv_ovprev_rc;
 static int g_sv_port_num = 0; /* the portrait shown in the inspector (SPEAK) */
+static int g_sv_ov_sel = 0;     /* the overlay selected in an Overlays action */
+static struct { char label[128]; int nd, door_id[24]; char door_to[24][128]; int ns; char script[24][64]; } g_rinfo;
 
 /* labels of the screen, built with its buttons (sv_layout) */
 typedef struct { RECT r; char text[220]; COLORREF col; int font; UINT flags; } SvLabel;
@@ -5626,7 +5843,7 @@ static void svl_draw(HDC hdc) {
 static COLORREF action_color(int type) {
     static const COLORREF c[ACT_COUNT] = { RGB(90, 90, 100), RGB(160, 160, 170), RGB(190, 130, 255), RGB(90, 160, 255), RGB(255, 160, 60),
                                            RGB(60, 205, 190), RGB(255, 90, 90), RGB(240, 210, 80), RGB(110, 220, 110),
-                                           RGB(255, 130, 200), RGB(235, 215, 170) };
+                                           RGB(255, 130, 200), RGB(235, 215, 170), RGB(170, 230, 90), RGB(190, 190, 255) };
     return (type >= 0 && type < ACT_COUNT) ? c[type] : RGB(200, 200, 200);
 }
 
@@ -5652,7 +5869,7 @@ static int sv_actions_of(Script *s, int t1, int t2, ScriptAction **out, int *row
 }
 
 /* ---- choosers: sound files, pictures ---- */
-enum { CH_NONE, CH_SOUND, CH_TRACK, CH_PICTURE, CH_CLIP, CH_PORTRAIT };
+enum { CH_NONE, CH_SOUND, CH_TRACK, CH_PICTURE, CH_CLIP, CH_PORTRAIT, CH_ROOM };
 static CharModel *g_ch_model = NULL;   /* CH_CLIP: the character the clips are for; CH_PORTRAIT: the one getting a portrait */
 static float g_ch_t = 0.0f;            /* CH_CLIP: preview time */
 #define PORT_CELL_W 100
@@ -5701,11 +5918,12 @@ static void ch_scan_room_pictures(const char *label, int *cap, int main_only) {
 }
 static void ch_build(void) {
     static char room[128] = "";
-    if (g_ch == CH_CLIP || g_ch == CH_PORTRAIT) { /* rebuilt every time: they depend on the character */
+    if (g_ch == CH_CLIP || g_ch == CH_PORTRAIT || g_ch == CH_ROOM) { /* rebuilt every time: they depend on the character */
         g_ch_all_n = 0;
         int cap = 0;
         free(g_ch_all); g_ch_all = NULL;
         g_ch_all_kind = g_ch == CH_CLIP ? 2 : 3;
+        if (g_ch == CH_ROOM) { for (int i = 0; i < g_map_room_count; i++) ch_add(g_map_rooms[i].label, &cap); return; }
         if (g_ch == CH_PORTRAIT) {
             char nm[32];
             for (int i = 1; i <= PORTRAIT_MAX; i++) { snprintf(nm, sizeof(nm), "bigports.%d", i); ch_add(nm, &cap); }
@@ -5727,16 +5945,31 @@ static void ch_build(void) {
     }
     if (g_ch_all_kind >= 2) g_ch_all_kind = -1;
     int kind = g_ch == CH_PICTURE ? 1 : 0, scope = kind ? g_ch_scope : 0;
-    if (g_ch_all_kind == kind && g_ch_all_scope == scope && (kind == 0 || scope == 1 || !strcmp(room, current_room_label()))) return; /* scanned already */
+    if (g_ch_all_kind == kind && g_ch_all_scope == scope && ((kind == 1 && scope == 1) || !strcmp(room, current_room_label()))) return; /* scanned already */
     snprintf(room, sizeof(room), "%s", current_room_label());
     g_ch_all_n = 0;
     int cap = 0;
     free(g_ch_all); g_ch_all = NULL;
     g_ch_all_kind = kind; g_ch_all_scope = scope;
     if (!kind) {
-        char pat[1024]; root_path(pat, sizeof(pat), "assets/sound/*.ogg");
+        /* the room's own sounds first (its characters' lines), then assets/sound */
+        char level[64], rm[64], pat[1024], nm[200];
+        split_label(current_room_label(), level, sizeof(level), rm, sizeof(rm));
+        root_path(pat, sizeof(pat), "assets/levels/%s/%s/*.ogg", level, rm);
         WIN32_FIND_DATAA fd;
         HANDLE h = FindFirstFileA(pat, &fd);
+        if (h != INVALID_HANDLE_VALUE) {
+            do {
+                snprintf(nm, sizeof(nm), "levels/%s/%s/%s", level, rm, fd.cFileName);
+                for (char *q = nm; *q; q++) if (*q >= 'A' && *q <= 'Z') *q += 32;
+                ch_add(nm, &cap);
+            } while (FindNextFileA(h, &fd));
+            FindClose(h);
+        }
+        qsort(g_ch_all, g_ch_all_n, sizeof(ChEntry), ch_name_cmp);
+        int first_shared = g_ch_all_n;
+        root_path(pat, sizeof(pat), "assets/sound/*.ogg");
+        h = FindFirstFileA(pat, &fd);
         if (h != INVALID_HANDLE_VALUE) {
             do {
                 char lower[128]; snprintf(lower, sizeof(lower), "%s", fd.cFileName);
@@ -5745,7 +5978,7 @@ static void ch_build(void) {
             } while (FindNextFileA(h, &fd));
             FindClose(h);
         }
-        qsort(g_ch_all, g_ch_all_n, sizeof(ChEntry), ch_name_cmp);
+        qsort(g_ch_all + first_shared, g_ch_all_n - first_shared, sizeof(ChEntry), ch_name_cmp);
     } else if (scope == 0) ch_scan_room_pictures(current_room_label(), &cap, 0);
     else if (scope == 1) { for (int i = 0; i < g_map_room_count; i++) ch_scan_room_pictures(g_map_rooms[i].label, &cap, 1); }
     else {
@@ -5817,6 +6050,7 @@ static void ch_choose(void) {
     }
     if (g_ch == CH_PICTURE && a->type == ACT_BACKGROUND) snprintf(a->file, sizeof(a->file), "%s", name);
     else if (g_ch == CH_CLIP && a->type == ACT_ANIM) snprintf(a->file, sizeof(a->file), "%s", name);
+    else if (g_ch == CH_ROOM && a->type == ACT_ROOM) { snprintf(a->file, sizeof(a->file), "%s", name); a->door = 0; a->script[0] = 0; }
     else if (g_ch == CH_SOUND && (a->type == ACT_SOUND || a->type == ACT_AMBIENCE || a->type == ACT_SPEAK)) snprintf(a->file, sizeof(a->file), "%s", name);
     else if (g_ch == CH_TRACK && a->type == ACT_MUSIC && a->ntracks < AUDIO_MAX_TRACKS) {
         snprintf(a->track[a->ntracks], sizeof(a->track[0]), "%s", name);
@@ -5866,6 +6100,7 @@ static void png_size(const char *file, int *w, int *h) {
 /* ---- the screen ---- */
 static void sv_open_view(void) {
     g_script_view = 1;
+    g_rinfo.label[0] = 0;
     g_map_mode = 0; g_anim_view = 0;
     ClipCursor(NULL); g_clip_active = 0;
     if (g_sv_script >= g_script_count) g_sv_script = g_script_count - 1;
@@ -5952,6 +6187,16 @@ static void sv_set_type(int type) {
         int n = sv_actions_of(s, ACT_SOUND, ACT_AMBIENCE, list, rows, 64);
         for (int k = 0; k < n; k++) if (rows[k] < g_sv_row) { a->stop_kind = STOP_ACTION; a->stop_ref = list[k]->id; }
     }
+    if (type == ACT_OVERLAY) { /* every overlay of the room, already at its place: the ones of its own picture loop */
+        char level[64], own[64];
+        split_label(current_room_label(), level, sizeof(level), own, sizeof(own));
+        for (int k = 0; k < g_ov_n && a->nov < SCRIPT_MAX_OVERLAYS; k++) {
+            snprintf(a->ov_name[a->nov], sizeof(a->ov_name[0]), "%s", g_ov[k].name);
+            a->ov_mode[a->nov] = (g_ov[k].frames > 1 && !strcmp(g_ov[k].bg, own)) ? OVM_LOOP : OVM_KEEP;
+            a->nov++;
+        }
+        g_sv_ov_sel = 0;
+    }
     sv_changed();
     if (type == ACT_SPEAK) sv_ask_portrait(a);
 }
@@ -6000,6 +6245,17 @@ static void sv_pick_end(void) { g_sv_pick = SV_PICK_NONE; g_script_view = 1; }
 static void sv_pick_click(float rx, float ry, int right) {
     ScriptAction *a = sv_cell(1);
     if (!a) { sv_pick_end(); return; }
+    if (g_sv_pick == SV_PICK_OVERLAY) {
+        if (!right && g_ov_show >= 0 && g_ov_show < g_ov_n) {
+            RoomOverlay *o = &g_ov[g_ov_show];
+            o->x = (int)rx - o->w / 2; o->y = (int)ry - o->h / 2;
+            snprintf(o->conf, sizeof(o->conf), "set");
+            overlays_save();
+        }
+        g_ov_show = -1;
+        sv_pick_end();
+        return;
+    }
     if (g_sv_pick == SV_PICK_PLACE_FACE) {
         float w[3];
         if (!right && pick_floor_point(rx, ry, w)) a->facing = atan2f(w[0] - a->pos[0], w[2] - a->pos[2]);
@@ -6040,6 +6296,7 @@ static void sv_play(int from_row) {
     actors_clear_npcs();
     background_set("");
     audio_stop_kind(AUDIO_SOUND); audio_stop_kind(AUDIO_AMBIENCE); audio_music_stop();
+    overlays_reset();
     ch_close();
     g_script_view = 0; g_sv_text = 0;
     script_start(s, from_row);
@@ -6130,6 +6387,32 @@ static void sv_action(HWND hwnd, int id) {
         case B_SV_LISTEN: if (audio_preview_playing()) audio_preview(NULL); else audio_preview(a->file); return;
         case B_SV_REP_M: if (a->repeat > (a->type == ACT_ANIM ? 1 : 0)) a->repeat--; break;
         case B_SV_AN_TIMES: a->anim_mode = 0; if (a->repeat < 1) a->repeat = 1; break;
+        case B_SV_RM_ROOM: ch_open(CH_ROOM, a->file); return;
+        case B_SV_OV_WAIT: a->wait_end = !a->wait_end; break;
+        case B_SV_OV_RELOAD:
+            for (int k = 0; k < g_ov_n && a->nov < SCRIPT_MAX_OVERLAYS; k++) {
+                int listed = 0;
+                for (int i = 0; i < a->nov; i++) if (!strcmp(a->ov_name[i], g_ov[k].name)) listed = 1;
+                if (listed) continue;
+                snprintf(a->ov_name[a->nov], sizeof(a->ov_name[0]), "%s", g_ov[k].name);
+                a->ov_mode[a->nov] = OVM_KEEP; a->ov_frame[a->nov] = 0;
+                a->nov++;
+            }
+            break;
+        case B_SV_OV_LEFT: case B_SV_OV_RIGHT: case B_SV_OV_UP: case B_SV_OV_DOWN: case B_SV_OV_PICK: {
+            int k = g_sv_ov_sel < a->nov ? overlay_find(a->ov_name[g_sv_ov_sel]) : -1;
+            if (k < 0) return;
+            if (id == B_SV_OV_PICK) { g_ov_show = k; sv_pick_start(SV_PICK_OVERLAY); return; }
+            int st = (GetKeyState(VK_SHIFT) & 0x8000) ? 8 : 1;
+            RoomOverlay *o = &g_ov[k];
+            if (id == B_SV_OV_LEFT) o->x -= st;
+            if (id == B_SV_OV_RIGHT) o->x += st;
+            if (id == B_SV_OV_UP) o->y -= st;
+            if (id == B_SV_OV_DOWN) o->y += st;
+            snprintf(o->conf, sizeof(o->conf), "set");
+            overlays_save();
+            return;
+        }
         case B_SV_AN_ROW: a->anim_mode = 1; break;
         case B_SV_AN_CLIP: g_ch_model = run_actor_model(s, a->actor); if (g_ch_model) ch_open(CH_CLIP, a->file); return;
         case B_SV_PORTRAIT: g_ch_model = run_actor_model(s, a->actor); if (g_ch_model) ch_open(CH_PORTRAIT, NULL); return;
@@ -6170,6 +6453,34 @@ static void sv_action(HWND hwnd, int id) {
                     memmove(&a->track_loop[t], &a->track_loop[t + 1], sizeof(int) * (a->ntracks - t - 1));
                     a->ntracks--;
                 }
+            } else if (id >= B_SV_OVROW && id < B_SV_OVROW + SCRIPT_MAX_OVERLAYS * 8 && a->type == ACT_OVERLAY) {
+                int i = (id - B_SV_OVROW) / 8, op = (id - B_SV_OVROW) % 8;
+                if (i >= a->nov) return;
+                g_sv_ov_sel = i;
+                int k = overlay_find(a->ov_name[i]), frames = k >= 0 ? g_ov[k].frames : 1;
+                int st = (GetKeyState(VK_SHIFT) & 0x8000) ? 10 : 1;
+                if (op == 1) {
+                    HMENU m = CreatePopupMenu();
+                    static const int order[OVM_COUNT] = { OVM_LOOP, OVM_ONCE, OVM_ONCE_HIDE, OVM_FREEZE, OVM_HIDE, OVM_KEEP };
+                    static const char *label[OVM_COUNT] = { "Loop\tplays over and over", "Once\tplays once, stays on its last frame",
+                        "Once, then hidden\tplays once, then disappears", "Frozen on a frame\tshows one frame (choose it below)",
+                        "Hidden\tnot shown", "Unchanged\tstays as it is (not touched by this action)" };
+                    for (int q = 0; q < OVM_COUNT; q++) AppendMenuA(m, MF_STRING | (a->ov_mode[i] == order[q] ? MF_CHECKED : 0), 1 + order[q], label[q]);
+                    POINT pt; GetCursorPos(&pt);
+                    int cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_NONOTIFY, pt.x, pt.y, 0, hwnd, NULL);
+                    DestroyMenu(m);
+                    if (cmd <= 0) return;
+                    a->ov_mode[i] = cmd - 1;
+                }
+                if (op == 2) a->ov_frame[i] = a->ov_frame[i] - st < 0 ? 0 : a->ov_frame[i] - st;
+                if (op == 3) a->ov_frame[i] = a->ov_frame[i] + st > frames - 1 ? frames - 1 : a->ov_frame[i] + st;
+                if (op == 0) return;
+            } else if (id >= B_SV_RM_DOOR && id < B_SV_RM_DOOR + 25 && a->type == ACT_ROOM) {
+                int k = id - B_SV_RM_DOOR;
+                a->door = (k == 0 || k - 1 >= g_rinfo.nd) ? 0 : g_rinfo.door_id[k - 1];
+            } else if (id >= B_SV_RM_SCRIPT && id < B_SV_RM_SCRIPT + 25 && a->type == ACT_ROOM) {
+                int k = id - B_SV_RM_SCRIPT;
+                if (k == 0 || k - 1 >= g_rinfo.ns) a->script[0] = 0; else snprintf(a->script, sizeof(a->script), "%s", g_rinfo.script[k - 1]);
             } else if (id >= B_SV_STOPREF && id < B_SV_STOPREF + 64 && a->type == ACT_STOP) {
                 ScriptAction *list[64]; int rows[64];
                 int n = sv_actions_of(s, ACT_SOUND, ACT_AMBIENCE, list, rows, 64);
@@ -6214,6 +6525,59 @@ static void sv_layout(HWND hwnd) {
         ui_add(B_CH_SCOPE2, bx, by, 150, 28, "This whole level", "", "Every picture of this room's level (many files).", g_ch_scope == 2, 1, 3);
     }
 }
+/* Change room: the target room's connectors and scripts (read once per room) */
+static void room_info(const char *label) {
+    if (!strcmp(g_rinfo.label, label)) return;
+    memset(&g_rinfo, 0, sizeof(g_rinfo));
+    snprintf(g_rinfo.label, sizeof(g_rinfo.label), "%s", label);
+    static Shape tmp[SHAPE_MAX];
+    int n = shapes_read_file(label, tmp, SHAPE_MAX);
+    for (int i = 0; i < n && g_rinfo.nd < 24; i++) if (tmp[i].door && tmp[i].has_step) {
+        g_rinfo.door_id[g_rinfo.nd] = tmp[i].id;
+        snprintf(g_rinfo.door_to[g_rinfo.nd], sizeof(g_rinfo.door_to[0]), "%s", tmp[i].target[0] ? tmp[i].target : "no target");
+        g_rinfo.nd++;
+    }
+    char path[1024];
+    scripts_file_path(path, sizeof(path), label);
+    Script *sc = NULL;
+    int ns = scripts_load(path, &sc);
+    for (int i = 0; i < ns; i++) { if (g_rinfo.ns < 24) snprintf(g_rinfo.script[g_rinfo.ns++], 64, "%s", sc[i].name); script_free(&sc[i]); }
+    free(sc);
+}
+
+/* Overlays: the room's picture with the overlays of the action on it, animated (inspector) */
+static void sv_overlay_preview(HDC hdc, const RECT *r, const ScriptAction *a) {
+    if (!g_loaded || !g_dib_pixels) return;
+    int W = (int)g_hdr.width, H = (int)g_hdr.height;
+    static uint32_t *buf = NULL; static size_t cap = 0;
+    if (cap < (size_t)W * H) { free(buf); buf = (uint32_t *)malloc((size_t)W * H * 4); cap = buf ? (size_t)W * H : 0; if (!buf) return; }
+    const uint32_t *pic = g_dib_own ? g_dib_own : g_dib_pixels;
+    for (int y = 0; y < H; y++) memcpy(buf + (size_t)y * W, pic + (size_t)y * g_dib_stride, W * 4);
+    int selx = -1, sely = 0, selw = 0, selh = 0;
+    for (int i = 0; i < a->nov; i++) {
+        int k = overlay_find(a->ov_name[i]);
+        if (k < 0 || a->ov_mode[i] == OVM_HIDE) continue;
+        RoomOverlay *o = &g_ov[k];
+        int f = a->ov_mode[i] == OVM_FREEZE ? a->ov_frame[i] : (int)(g_ch_t * o->fps) % o->frames;
+        int w, h;
+        const uint32_t *px = overlay_frame(o, f, &w, &h);
+        if (px) blend_sprite(buf, W, H, px, w, h, o->x, o->y, 1.0f);
+        if (i == g_sv_ov_sel) { selx = o->x; sely = o->y; selw = o->w; selh = o->h; }
+    }
+    int RW = r->right - r->left, RH = r->bottom - r->top;
+    float k = fminf((float)RW / W, (float)RH / H);
+    int dw = (int)(W * k), dh = (int)(H * k), ox = r->left + (RW - dw) / 2, oy = r->top + (RH - dh) / 2;
+    BITMAPINFO bi; memset(&bi, 0, sizeof(bi));
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER); bi.bmiHeader.biWidth = W; bi.bmiHeader.biHeight = -H;
+    bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32; bi.bmiHeader.biCompression = BI_RGB;
+    SetStretchBltMode(hdc, HALFTONE);
+    StretchDIBits(hdc, ox, oy, dw, dh, 0, 0, W, H, buf, &bi, DIB_RGB_COLORS, SRCCOPY);
+    if (selx >= 0) {
+        RECT sr = { ox + (int)(selx * k) - 1, oy + (int)(sely * k) - 1, ox + (int)((selx + selw) * k) + 2, oy + (int)((sely + selh) * k) + 2 };
+        ui_frame(hdc, &sr, RGB(255, 210, 60));
+    }
+}
+
 /* the "CHARACTER" choice of MOVE / ANIM / SPEAK: David + the script's placed characters */
 static int sv_actor_buttons(Script *s, ScriptAction *a, int ix, int iy, int iw, int rh) {
     char t[160];
@@ -6232,6 +6596,7 @@ static int sv_actor_buttons(Script *s, ScriptAction *a, int ix, int iy, int iw, 
 static void sv_layout_main(HWND hwnd) {
     RECT rc; GetClientRect(hwnd, &rc);
     SetRect(&g_sv_port_rc, 0, 0, 0, 0);
+    SetRect(&g_sv_ovprev_rc, 0, 0, 0, 0);
     int W = rc.right, H = rc.bottom;
     g_btn_count = 0; g_svl_n = 0;
     int list_w = W / 6; if (list_w < 180) list_w = 180; if (list_w > 240) list_w = 240;
@@ -6303,7 +6668,9 @@ static void sv_layout_main(HWND hwnd) {
             "Bring a character into the room, at a point you click, facing a direction.",
             "Make a character (David or one placed by this script) walk / run to a point you click, or through a connector.",
             "Make a character play an animation: a number of times, or over and over until the rest of the row is over (e.g. talking while its line plays).",
-            "A character says a line (a sound): its portrait is shown until the line is over. The row waits for it." };
+            "A character says a line (a sound): its portrait is shown until the line is over. The row waits for it.",
+            "The room's environmental animations, already at their place: loop some, play some once, freeze some on a frame, hide some.",
+            "Go to another room, as through a connector: David comes in by one of its connectors, then one of its scripts plays. This script ends there." };
         for (int t = ACT_WAIT; t < ACT_COUNT; t++) {
             ui_add(B_SV_ADD + t, ix + ((t - 1) % 2) * (half + 6), iy, half, rh, action_type_name(t), "", add_desc[t], 0, 1, 0);
             if ((t - 1) % 2 == 1) iy += rh + 6;
@@ -6434,6 +6801,102 @@ static void sv_layout_main(HWND hwnd) {
             iy += rh + 12;
             svl(ix, iy, iw, 60, 0, SVL_DIM, DT_LEFT | DT_WORDBREAK, "It stands there until a 'Move character' action moves it. It leaves with the room.");
             break;
+        case ACT_OVERLAY: {
+            if (g_ov_n == 0) {
+                svl(ix, iy, iw, 60, 0, SVL_TEXT, DT_LEFT | DT_WORDBREAK, "This room has no overlay (no environmental animation in its folder).");
+                break;
+            }
+            int th = iw * (int)g_hdr.height / ((int)g_hdr.width > 0 ? (int)g_hdr.width : 1);
+            if (th > 240) th = 240;
+            SetRect(&g_sv_ovprev_rc, ix, iy, ix + iw, iy + th);
+            iy += th + 8;
+            if (g_sv_ov_sel >= a->nov) g_sv_ov_sel = 0;
+            for (int i = 0; i < a->nov && iy < g_sv_insp_rc.bottom - 250; i++) {
+                int k = overlay_find(a->ov_name[i]);
+                char nm[96];
+                snprintf(nm, sizeof(nm), "%s%s", a->ov_name[i], k < 0 ? "  (not in this room)" : (!strcmp(g_ov[k].conf, "guess") || !strcmp(g_ov[k].conf, "none")) ? "  (place?)" : "");
+                ui_addf(B_SV_OVROW + i * 8, ix, iy, iw - 136, rh - 4, nm, "", "Select it: it's framed in yellow above; its place and frame are set below.", i == g_sv_ov_sel, 1, 3);
+                char md[48];
+                if (a->ov_mode[i] == OVM_FREEZE) snprintf(md, sizeof(md), "frozen: %d", a->ov_frame[i]);
+                else snprintf(md, sizeof(md), "%s", a->ov_mode[i] == OVM_ONCE_HIDE ? "once+hide" : overlay_mode_name(a->ov_mode[i]));
+                ui_addf(B_SV_OVROW + i * 8 + 1, ix + iw - 130, iy, 130, rh - 4, md, "",
+                        "What it does: loop / once (stays on its last frame) / once then hidden / frozen on a frame / hidden / unchanged (as it is).", a->ov_mode[i] != OVM_KEEP, 1, 1);
+                iy += rh;
+            }
+            iy += 6;
+            if (g_sv_ov_sel < a->nov) {
+                int k = overlay_find(a->ov_name[g_sv_ov_sel]);
+                if (k >= 0) {
+                    RoomOverlay *o = &g_ov[k];
+                    char own[64];
+                    split_label(current_room_label(), t, sizeof(t), own, sizeof(own));
+                    svl(ix, iy, iw, 18, 3, action_color(ACT_OVERLAY), SV_ONE, "%s", o->name);
+                    iy += 20;
+                    svl(ix, iy, iw, 18, 0, SVL_TEXT, SV_ONE, "%d frames, %.0f fps, %dx%d at %d, %d", o->frames, o->fps, o->w, o->h, o->x, o->y);
+                    iy += 18;
+                    if (strcmp(o->bg, own) && o->bg[0] && strcmp(o->bg, "-")) { svl(ix, iy, iw, 18, 0, RGB(255, 190, 120), SV_ONE, "made for the picture '%s' of this room", o->bg); iy += 18; }
+                    if (!strcmp(o->conf, "guess") || !strcmp(o->conf, "none")) { svl(ix, iy, iw, 18, 0, RGB(255, 150, 120), SV_ONE, "its place is a guess: check it, move it if needed"); iy += 18; }
+                    iy += 4;
+                    int q = 32;
+                    ui_add(B_SV_OV_LEFT, ix, iy, q, rh, "<", "", "1 pixel left (Shift: 8).", 0, 1, 0);
+                    ui_add(B_SV_OV_RIGHT, ix + q + 3, iy, q, rh, ">", "", "1 pixel right (Shift: 8).", 0, 1, 0);
+                    ui_add(B_SV_OV_UP, ix + 2 * (q + 3), iy, q, rh, "^", "", "1 pixel up (Shift: 8).", 0, 1, 0);
+                    ui_add(B_SV_OV_DOWN, ix + 3 * (q + 3), iy, q, rh, "v", "", "1 pixel down (Shift: 8).", 0, 1, 0);
+                    ui_add(B_SV_OV_PICK, ix + 4 * (q + 3) + 6, iy, iw - 4 * (q + 3) - 6, rh, "Place in the room...", "",
+                           "Click in the room where its centre goes. Its place belongs to the room (every script uses it).", 0, 1, 0);
+                    iy += rh + 6;
+                    if (a->ov_mode[g_sv_ov_sel] == OVM_FREEZE) {
+                        ui_add(B_SV_OVROW + g_sv_ov_sel * 8 + 2, ix, iy, 40, rh, "-", "", "The frame before (Shift: 10).", 0, a->ov_frame[g_sv_ov_sel] > 0, 0);
+                        svl(ix + 46, iy, iw - 92, rh, 0, SVL_VALUE, SV_ONE | DT_CENTER, "frozen on frame %d / %d", a->ov_frame[g_sv_ov_sel], o->frames - 1);
+                        ui_add(B_SV_OVROW + g_sv_ov_sel * 8 + 3, ix + iw - 40, iy, 40, rh, "+", "", "The frame after (Shift: 10).", 0, a->ov_frame[g_sv_ov_sel] < o->frames - 1, 0);
+                        iy += rh + 6;
+                    }
+                }
+            }
+            ui_add(B_SV_OV_WAIT, ix, iy, iw, rh, a->wait_end ? "The row waits for the 'once' ones" : "The row doesn't wait for them", "",
+                   "Yes: the row isn't over until the overlays played once have reached their end. No: they play on while the next rows start.", a->wait_end, 1, 1);
+            iy += rh + 5;
+            int missing = 0;
+            for (int k = 0; k < g_ov_n; k++) {
+                int listed = 0;
+                for (int i = 0; i < a->nov; i++) if (!strcmp(a->ov_name[i], g_ov[k].name)) listed = 1;
+                if (!listed) missing++;
+            }
+            if (missing) { ui_addf(B_SV_OV_RELOAD, ix, iy, iw, rh, "Add the room's other overlays", "", "List the overlays of this room that this action doesn't have yet (unchanged).", 0, a->nov < SCRIPT_MAX_OVERLAYS, 0); iy += rh + 5; }
+            break;
+        }
+        case ACT_ROOM: {
+            svl(ix, iy, iw, 16, 1, SVL_SECTION, SV_ONE, "ROOM");
+            iy += 20;
+            svl(ix, iy, iw, 20, 0, a->file[0] ? SVL_VALUE : RGB(255, 150, 120), SV_ONE, "%s", a->file[0] ? a->file : "not chosen yet");
+            iy += 26;
+            ui_add(B_SV_RM_ROOM, ix, iy, iw, rh, "Choose room...", "", "The room David goes to (type to filter).", 0, 1, 0);
+            iy += rh + 12;
+            if (a->file[0]) {
+                room_info(a->file);
+                svl(ix, iy, iw, 16, 1, SVL_SECTION, SV_ONE, "DAVID COMES IN BY");
+                iy += 22;
+                ui_add(B_SV_RM_DOOR, ix, iy, iw, rh - 4, "Where he'd spawn (no connector)", "", "He appears where he does when the room is loaded from the room list.", a->door == 0, 1, 3);
+                iy += rh;
+                for (int k = 0; k < g_rinfo.nd && k < 10; k++) {
+                    snprintf(t, sizeof(t), "Connector #%d  (from %s)", g_rinfo.door_id[k], g_rinfo.door_to[k]);
+                    ui_addf(B_SV_RM_DOOR + 1 + k, ix, iy, iw, rh - 4, t, "", "He appears on this connector's doorstep and walks to its arrival point.", a->door == g_rinfo.door_id[k], 1, 3);
+                    iy += rh;
+                }
+                iy += 10;
+                svl(ix, iy, iw, 16, 1, SVL_SECTION, SV_ONE, "THEN PLAY");
+                iy += 22;
+                ui_add(B_SV_RM_SCRIPT, ix, iy, iw, rh - 4, "Its auto script (if any)", "", "As when David enters a room without a connector script.", a->script[0] == 0, 1, 3);
+                iy += rh;
+                for (int k = 0; k < g_rinfo.ns && k < 10; k++) {
+                    ui_addf(B_SV_RM_SCRIPT + 1 + k, ix, iy, iw, rh - 4, g_rinfo.script[k], "", "This script of that room plays when he arrives.", !strcmp(a->script, g_rinfo.script[k]), 1, 3);
+                    iy += rh;
+                }
+                iy += 10;
+            }
+            svl(ix, iy, iw, 60, 0, SVL_DIM, DT_LEFT | DT_WORDBREAK, "Like going through a connector (fade, loading, fade in). This script ends here: the rows after it don't play.");
+            break;
+        }
         case ACT_ANIM: case ACT_SPEAK: {
             iy = sv_actor_buttons(s, a, ix, iy, iw, rh);
             CharModel *m = run_actor_model(s, a->actor);
@@ -6584,6 +7047,7 @@ static void sv_paint(HWND hwnd, HDC hdc) {
     ui_frame(hdc, &g_sv_insp_rc, RGB(50, 50, 60));
     ScriptAction *a = sv_cell(0);
     if (g_sv_thumb_rc.right > g_sv_thumb_rc.left && a) blit_picture(hdc, &g_sv_thumb_rc, a->file);
+    if (g_sv_ovprev_rc.right > g_sv_ovprev_rc.left && a) sv_overlay_preview(hdc, &g_sv_ovprev_rc, a);
     if (g_sv_port_rc.right > g_sv_port_rc.left) {
         static uint32_t buf[88 * 120];
         int pw, ph;
@@ -6612,6 +7076,7 @@ static void sv_paint(HWND hwnd, HDC hdc) {
         ui_frame(hdc, &g_ch_rc, RGB(255, 210, 60));
         SelectObject(hdc, ui_font(20, 1));
         if (g_ch == CH_CLIP) snprintf(t, sizeof(t), "Choose an animation for %s", g_ch_model ? g_ch_model->name : "?");
+        else if (g_ch == CH_ROOM) snprintf(t, sizeof(t), "Choose the room to go to");
         else if (g_ch == CH_PORTRAIT) snprintf(t, sizeof(t), "Choose the portrait of %s (kept for this character everywhere)", g_ch_model ? g_ch_model->name : "?");
         else snprintf(t, sizeof(t), "%s", pic ? "Choose a picture" : g_ch == CH_TRACK ? "Add a music track" : "Choose a sound");
         ui_text(hdc, g_ch_rc.left + 12, g_ch_rc.top + 8, 900, 26, t, RGB(255, 225, 120), SV_ONE);
@@ -6656,7 +7121,8 @@ static void sv_paint(HWND hwnd, HDC hdc) {
             if (k == g_ch_sel) { RECT hl = { g_ch_list_rc.left, y, g_ch_list_rc.right, y + CH_ROW_H }; ui_fill(hdc, &hl, RGB(60, 50, 10)); }
             SelectObject(hdc, ui_font(14, 0));
             ui_text(hdc, g_ch_list_rc.left + 8, y, lw - 110, CH_ROW_H, e->name, k == g_ch_sel ? RGB(255, 230, 60) : RGB(215, 215, 220), SV_ONE);
-            if (g_ch == CH_CLIP) {
+            if (g_ch == CH_ROOM) {
+            } else if (g_ch == CH_CLIP) {
                 snprintf(t, sizeof(t), "%.2f s", e->secs);
                 ui_text(hdc, g_ch_list_rc.right - 100, y, 92, CH_ROW_H, t, RGB(130, 130, 140), DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
             } else if (pic) {
@@ -7133,10 +7599,16 @@ static int sv_pick_marker(float out[3]) {
 #define SPIN_FRAMES 30
 
 static void transition_start(int door) {
-    g_tr.phase = 1; g_tr.t = 0.0f; g_tr.door = door;
+    g_tr.phase = 1; g_tr.t = 0.0f; g_tr.door = door; g_tr.room[0] = 0;
     audio_fade_kind(AUDIO_SOUND, TR_FADE_OUT);
     audio_fade_kind(AUDIO_AMBIENCE, TR_FADE_OUT);
     g_click_marker_active = 0;
+}
+static void transition_start_room(const char *label, int door, const char *script) {
+    transition_start(-1);
+    snprintf(g_tr.room, sizeof(g_tr.room), "%s", label);
+    g_tr.room_door = door;
+    snprintf(g_tr.script, sizeof(g_tr.script), "%s", script);
 }
 /* game_tick: returns 1 when the room changed (whole window to repaint) */
 static int transition_tick(HWND hwnd, float dt) {
@@ -7144,7 +7616,8 @@ static int transition_tick(HWND hwnd, float dt) {
     g_tr.t += dt;
     if (g_tr.phase == 1 && g_tr.t >= TR_FADE_OUT) {
         g_tr.phase = 2; g_tr.t = 0.0f;
-        door_travel(hwnd, g_tr.door);
+        if (g_tr.room[0]) room_travel(hwnd, g_tr.room, g_tr.room_door, g_tr.script);
+        else door_travel(hwnd, g_tr.door);
         return 1;
     }
     if (g_tr.phase == 2 && g_tr.t >= TR_LOADING) { g_tr.phase = 3; g_tr.t = 0.0f; }
@@ -7449,6 +7922,7 @@ static void game_tick(HWND hwnd) {
                 actor_begin(&g_actors[k]); need_repaint |= advance_character((float)dt); actor_end();
             }
         } else need_repaint = advance_player(dt);
+        if (!frozen && overlays_tick((float)dt)) need_repaint = 1;
         if (g_anim_view) { if (!g_anim_paused) g_anim_t += (float)dt * g_anim_speed; need_repaint = 1; }
         if (g_ms_view) g_ms_t += (float)dt;
         if (g_script_view) g_ch_t += (float)dt;
@@ -7796,6 +8270,7 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
                     /* the real pre-rendered photo + a depth-only pass of the
                        real mesh so David is hidden behind the scenery */
                     composite_frame();
+                    overlays_draw(); /* the room's animations are part of the picture */
                     fg_capture(); /* foreground shapes: the photo as it is here, before any character */
                     size_t npix = (size_t)g_dib_stride * g_hdr.height;
                     const float *room_depth = g_has_3d_character ? room_depth_cached() : NULL;

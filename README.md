@@ -79,10 +79,19 @@ No file of the original game is needed.
   - **Animate character**: a character plays any animation made for its
     skeleton (chosen with a live preview), a number of times or over and
     over while the rest of the row lasts -- e.g. talking during a line;
-  - **Speak**: a character says a line (a sound) with its portrait shown
-    until the line is over. Each character's portrait (sprites
-    `bigports.1-71`) is chosen the first time it speaks and kept for it
-    everywhere (`data/portraits.cfg`).
+  - **Speak**: a character says a line (a sound -- the room's own lines
+    are listed first) with its portrait shown until the line is over. Each
+    character's portrait (sprites `bigports.1-71`) is chosen the first time
+    it speaks and kept for it everywhere (`data/portraits.cfg`);
+  - **Overlays**: the room's environmental animations (the original
+    game's videos: fires, water, doors, crowds...), already at their place
+    on the picture, each one looped, played once (stays on its last frame,
+    or disappears), frozen on a chosen frame, hidden or left as it is --
+    with an animated preview. Their places can be nudged or picked in the
+    room (they belong to the room: `data/rooms/<level>/<room>_overlays.cfg`,
+    from `tools/find_overlay_positions.py`);
+  - **Change room**: like going through a connector -- the room, the
+    connector David comes in by, and the script that plays there.
 - While a script plays, the player can only left-click to skip the current
   row -- not a row that moves a character. Esc stops it (testing).
 - A script plays when David arrives through a connector that names it (the
@@ -164,6 +173,7 @@ data/            this project's data (versioned)
   rooms/<level>/<room>_shapes.cfg     scene editor shapes
   rooms/<level>/<room>_nav.cfg        per-room navigation settings (only changed values)
   rooms/<level>/<room>_scripts.cfg    the room's scripts
+  rooms/<level>/<room>_overlays.cfg   the room's overlays: place, size, frame rate
   movesets/<model>.cfg                a character's moveset (only when changed)
   portraits.cfg                       the portrait each character speaks with
 tools/           scripts that need the original CDs (see tools/README.md)
@@ -185,8 +195,9 @@ build/           silver_remaster.exe
 
 ## Known limitations
 
-- Animated scenery (e.g. conveyor belts, flames) and the intro videos
-  aren't played yet. Music and sounds only play from scripts.
+- The intro videos aren't played yet. Music, sounds and the rooms'
+  animations only play from scripts (an "auto" script plays when David
+  enters the room).
 - Scene connectors are authored by hand in the editor. The game's own
   room-to-room links aren't decoded.
 

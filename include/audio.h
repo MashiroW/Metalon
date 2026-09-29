@@ -6,7 +6,9 @@
      - SOUNDS: any number at once, each played 1 + `repeat` times;
      - AMBIENCES: any number at once, looped or not.
    Every sound / ambience gets a voice id to stop it or ask if it's still
-   playing. File names are relative to the folder given to audio_init. */
+   playing. File names are relative to the folder given to audio_init
+   (assets/sound), or, with a '/', to its parent (e.g. a room's own
+   sounds: "levels/verdante/dockside/albfine.ogg"). */
 #ifndef SILVER_AUDIO_H
 #define SILVER_AUDIO_H
 

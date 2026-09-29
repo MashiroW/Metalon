@@ -45,7 +45,8 @@ static int g_ntracks = 0, g_track = -1;
 
 static stb_vorbis *open_file(const char *file, int *channels, unsigned *rate) {
     char path[MAX_PATH * 2];
-    snprintf(path, sizeof(path), "%s\\%s", g_dir, file);
+    if (strchr(file, '/')) snprintf(path, sizeof(path), "%s\\..\\%s", g_dir, file); /* under assets/ (a room's own sounds) */
+    else snprintf(path, sizeof(path), "%s\\%s", g_dir, file);
     int err = 0;
     stb_vorbis *v = stb_vorbis_open_filename(path, &err, NULL);
     if (!v) return NULL;
