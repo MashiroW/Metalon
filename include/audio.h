@@ -21,7 +21,8 @@ typedef struct { int id, kind; char file[64]; } AudioVoiceInfo;
 int audio_init(const char *sound_dir); /* 1 = sound output running */
 void audio_shutdown(void);
 
-/* the music: n = 0 stops it */
+/* the music: n = 0 stops it. If the track playing is the new playlist's
+   first one, it goes on (no restart); else the new playlist starts. */
 void audio_music_play(const AudioTrack *tracks, int n);
 void audio_music_stop(void);
 /* file of the track playing ("" if none), its index in the playlist */

@@ -79,9 +79,12 @@ void quat_nlerp(const float a[4], const float b_in[4], float t, float out[4]) {
 
 /* ---------------- skeleton ---------------- */
 
+static Mat4 g_last_global[DAVID_MAX_NODES]; /* the bones of the last pose computed */
+static int g_last_nodes = 0;
 void skeleton_skin_matrices_for(const CharModel *m, const NodeOverride *overrides, Mat4 *out_skin_mats) {
     static Mat4 local[DAVID_MAX_NODES];
-    static Mat4 global[DAVID_MAX_NODES];
+    Mat4 *global = g_last_global;
+    g_last_nodes = m->node_count;
     for (int i = 0; i < m->node_count; i++) {
         const NodeOverride *ov = &overrides[i];
         const float *t = ov->has_t ? ov->t : m->node_t[i];
@@ -100,6 +103,12 @@ void skeleton_skin_matrices_for(const CharModel *m, const NodeOverride *override
         int j = m->joints[ji];
         out_skin_mats[ji] = mat4_mul(global[(j >= 0 && j < m->node_count) ? j : 0], ib);
     }
+}
+
+int skeleton_node_global(int node, Mat4 *out) {
+    if (node < 0 || node >= g_last_nodes) return 0;
+    *out = g_last_global[node];
+    return 1;
 }
 
 void skeleton_compute_skin_matrices(const NodeOverride *overrides, Mat4 *out_skin_mats) {

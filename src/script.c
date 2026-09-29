@@ -130,7 +130,7 @@ void action_summary(const Script *s, const ScriptAction *a, char *out, int n) {
         case ACT_WAIT: snprintf(out, n, "%.1f s", a->seconds); break;
         case ACT_BACKGROUND: snprintf(out, n, "%s", a->file[0] ? base_name(a->file) : "the room's own picture"); break;
         case ACT_MUSIC:
-            if (a->ntracks == 0) { snprintf(out, n, "stop the music"); break; }
+            if (a->ntracks == 0) { snprintf(out, n, "None (no music)"); break; }
             for (int i = 0; i < a->ntracks; i++) {
                 size_t l = strlen(out);
                 snprintf(out + l, n - l, "%s%s%s", i ? " > " : "", a->track[i], a->track_loop[i] ? " (loop)" : "");

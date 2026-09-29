@@ -197,7 +197,11 @@ static RoomCamera g_char_cam; /* roll-free variant of g_room_cam, David's mesh p
    the hips exactly 90/180 degrees without moving him and end in the run
    cycle's first pose. */
 enum { MC_RUN90A, MC_RUN90C, MC_RUN180A, MC_RUN180C, MC_TOWALKA, MC_TOWALKC, MC_TOWALK, MC_TORUN, MC_TO180A, MC_TO180C,
-       MC_STAND, MC_WALK, MC_RUN, MC_COUNT };
+       MC_STAND, MC_WALK, MC_RUN,
+       /* combat (attack mode, Ctrl held): a click = one of the 3 attacks at random, a held swing = the other 5 */
+       MC_ATK1, MC_ATK2, MC_ATK3, MC_SW_UP, MC_SW_LEFT, MC_SW_RIGHT, MC_SW_BACKL, MC_SW_BACKR, MC_COUNT };
+#define MC_FIRST_COMBAT MC_ATK1
+#define RIGHT_HAND_NODE 42 /* the grip bone of the right hand (child of the wrist, in the palm) in the human skeleton */
 #define MAX_CHAR_WAYPOINTS 48
 #define MAX_ACTORS 16
 typedef struct {
@@ -220,7 +224,14 @@ typedef struct {
     int play_clip;             /* script "Animate character": clip playing over its stand / walk pose, -1 = none */
     float play_t;
     int play_left;             /* times still to play (this one included), -1 = until the script stops it */
+    int play_attack;           /* the clip playing is an attack (attack mode) */
+    float play_turn;           /* facing change once it ends (the swings that turn the body) */
+    CharModel *item;           /* held in the right hand (its moveset's right_hand), NULL = nothing */
+    Mat4 hand;                 /* the right hand's grip bone in the pose last computed (actor_project) */
+    int hand_ok;
 } Actor;
+static int g_atk_queued = -1;  /* attack mode: the next attack, asked for while one plays */
+static void david_attack(int slot);
 static Actor g_actors[MAX_ACTORS];
 static Actor *g_act = &g_actors[0];
 #define DAVID_ACTOR (&g_actors[0])
@@ -949,6 +960,7 @@ static int move_clip_for(float from, float to, int run, int standing) {
 static int move_clip_is_front_start(int clip) {
     return clip >= 0 && (clip == g_act->clips[MC_TOWALK] || clip == g_act->clips[MC_TORUN]);
 }
+static float wrap_angle(float a);
 static float wrap_angle(float a) {
     while (a > 3.14159265f) a -= 6.2831853f;
     while (a < -3.14159265f) a += 6.2831853f;
@@ -1047,6 +1059,7 @@ static void david_turn_after_clip(void) {
 }
 
 static void set_character_target(float wx, float wy, float wz, int run) {
+    if (g_act->play_attack) { g_act->play_clip = -1; g_act->play_attack = 0; g_act->play_turn = 0.0f; } /* a move order ends an attack */
     float dx = wx - g_char_pos[0], dz = wz - g_char_pos[2];
     if (dx * dx + dz * dz < 1e-6f) return; /* already there */
     g_char_target[0] = wx;
@@ -1338,8 +1351,15 @@ static int advance_character(float dt) {
         g_act->play_t += dt * g_david_anim_speed;
         if (d <= 0.0f) g_act->play_clip = -1;
         else if (g_act->play_t >= d) {
-            if (g_act->play_left > 0 && --g_act->play_left == 0) g_act->play_clip = -1;
-            else g_act->play_t = fmodf(g_act->play_t, d);
+            if (g_act->play_left > 0 && --g_act->play_left == 0) {
+                g_act->play_clip = -1;
+                g_char_facing = wrap_angle(g_char_facing + g_act->play_turn); /* the swings that turned the body */
+                g_act->play_turn = 0.0f;
+                if (g_act->play_attack) {
+                    g_act->play_attack = 0;
+                    if (g_act == DAVID_ACTOR && g_atk_queued >= 0) { int q = g_atk_queued; g_atk_queued = -1; david_attack(q); }
+                }
+            } else g_act->play_t = fmodf(g_act->play_t, d);
         }
     }
     if (!g_char_moving) {
@@ -1497,6 +1517,7 @@ static void actor_project(Actor *a, float *px_buf, float *py_buf, float *z_buf, 
     actor_pose(a, overrides);
     static Mat4 skin_mats[DAVID_MAX_JOINTS];
     skeleton_skin_matrices_for(m, overrides, skin_mats);
+    a->hand_ok = a->item && skeleton_node_global(RIGHT_HAND_NODE, &a->hand);
 
     /* facing = direction it's heading (atan2(dx, dz)); the models face -Z
        (measured on David: in the walk cycles the grounded foot slides
@@ -1517,6 +1538,21 @@ static void actor_project(Actor *a, float *px_buf, float *py_buf, float *z_buf, 
     }
 }
 
+/* The item in a character's right hand, projected like its body (after
+   actor_project, which found the hand). 0 if it holds nothing. */
+static int actor_project_item(Actor *a, float *px_buf, float *py_buf, float *z_buf, int *visible) {
+    const CharModel *it = a->item;
+    if (!it || !a->hand_ok) return 0;
+    float cf = cosf(a->facing + 3.14159265f), sf = sinf(a->facing + 3.14159265f);
+    for (int vi = 0; vi < it->vertex_count; vi++) {
+        float h[3];
+        mat4_vec3(&a->hand, it->positions[vi], h);
+        float world[3] = { h[0] * cf + h[2] * sf + a->pos[0], h[1] + a->pos[1], -h[0] * sf + h[2] * cf + a->pos[2] };
+        visible[vi] = char_project(a->pos, world, &px_buf[vi], &py_buf[vi], &z_buf[vi]);
+    }
+    return 1;
+}
+
 /* F3 debug view only: the characters rasterized into the 8-bit room frame. */
 static void render_3d_character(void) {
     if (!g_has_3d_character) return;
@@ -1529,6 +1565,8 @@ static void render_3d_character(void) {
         actor_project(a, px_buf, py_buf, z_buf, visible);
         /* the Z-buffer test in fill_triangle_textured handles self-occlusion,
            the other characters AND the room geometry: draw order doesn't matter */
+        for (int pass = 0; pass < 2; pass++) {
+        if (pass == 1) { if (!actor_project_item(a, px_buf, py_buf, z_buf, visible)) break; m = a->item; } /* then what it holds */
         for (int t = 0; t < m->index_count / 3; t++) {
             int i0 = m->indices[t * 3], i1 = m->indices[t * 3 + 1], i2 = m->indices[t * 3 + 2];
             if (!visible[i0] || !visible[i1] || !visible[i2]) continue;
@@ -1538,6 +1576,7 @@ static void render_3d_character(void) {
                                     m->uvs_px[i1][0], m->uvs_px[i1][1],
                                     m->uvs_px[i2][0], m->uvs_px[i2][1],
                                     g_depth_buffer_char);
+        }
         }
     }
 }
@@ -2833,25 +2872,32 @@ static void run_camera_calibration(void) {
 /* =====================================================================
    MOVESETS: the animations a character walks with
    ---------------------------------------------------------------------
-   13 slots (MC_*): stand / walk / run cycles and the start / turn clips
-   played when it sets off or changes direction (see move_clip_for).
+   13 walking slots (MC_*): stand / walk / run cycles and the start / turn
+   clips played when it sets off or changes direction (see move_clip_for),
+   and 8 combat slots (attack mode, see ATTACK MODE) with their own preset,
+   the 1-HANDED SWORD one. A moveset also says what the character holds in
+   its right hand (an item of assets/chars/items; David: daveswrd).
    Each character model (folder of assets/chars) has one moveset:
    the HUMAN preset -- David's own clips -- or none, plus per-slot
    overrides (another clip, or "no animation") that never change the
    preset itself. Saved in data/movesets/<model>.cfg (only when it
    differs from "human preset, no override"):
      preset human|none
+     combat sword1h|none
+     right_hand <item>|-
      <slot key> <source>/<clip name>   (or  -  = no animation)
    A clip only plays on a skeleton with the same bone count.
    ===================================================================== */
 static const char *MOVE_SLOT_KEY[MC_COUNT] = {
     "run_turn_left", "run_turn_right", "run_back_left", "run_back_right",
     "walk_turn_left", "walk_turn_right", "start_walk", "start_run", "walk_back_left", "walk_back_right",
-    "stand", "walk", "run" };
+    "stand", "walk", "run",
+    "attack_1", "attack_2", "attack_3", "swing_up", "swing_left", "swing_right", "swing_back_left", "swing_back_right" };
 static const char *MOVE_SLOT_LABEL[MC_COUNT] = {
     "Run: turn left", "Run: turn right", "Run: back via left", "Run: back via right",
     "Walk: turn left", "Walk: turn right", "Start walking", "Start running", "Walk: back via left", "Walk: back via right",
-    "Stand", "Walk", "Run" };
+    "Stand", "Walk", "Run",
+    "Attack 1", "Attack 2", "Attack 3", "Swing up", "Swing left", "Swing right", "Swing down, via left", "Swing down, via right" };
 static const char *MOVE_SLOT_DESC[MC_COUNT] = {
     "Running, the new direction is 45-135 degrees to its left: played while it turns, then the run cycle.",
     "Running, the new direction is 45-135 degrees to its right.",
@@ -2863,14 +2909,27 @@ static const char *MOVE_SLOT_DESC[MC_COUNT] = {
     "Standing still, it sets off running straight ahead.",
     "Walking, the new direction is behind it: turns around via its left.",
     "Walking, the new direction is behind it: turns around via its right.",
-    "Standing still (loops).", "The walk cycle (loops).", "The run cycle (loops)." };
+    "Standing still (loops).", "The walk cycle (loops).", "The run cycle (loops).",
+    "Attack mode, a simple click: one of the three attacks, at random.", "Attack mode, a simple click: one of the three attacks, at random.",
+    "Attack mode, a simple click: one of the three attacks, at random.",
+    "Attack mode, button held and the mouse swung UP: a thrust ahead.",
+    "Attack mode, button held and the mouse swung LEFT: a blow turning 90 degrees to its left.",
+    "Attack mode, button held and the mouse swung RIGHT: a blow turning 90 degrees to its right.",
+    "Attack mode, button held and the mouse swung DOWN (and a bit left): a blow turning around via its left.",
+    "Attack mode, button held and the mouse swung DOWN (and a bit right): a blow turning around via its right." };
+/* the presets: HUMAN (David's walking clips) for the walking slots, 1-HANDED SWORD for the combat ones */
 static const char *HUMAN_PRESET[MC_COUNT] = { "run90a", "run90c", "run180a", "run180c", "towalka", "towalkc", "towalk", "torun", "to180a", "to180c",
-                                             "stand", "walk", "run" };
+                                             "stand", "walk", "run",
+                                             "rchop", "rchopp", "rchoppp", "lstab", "rchp90a", "rchp90c", "rchp180a", "rchp180c" };
 typedef struct {
     char model[48];
-    int human;                   /* preset: 1 human, 0 none */
+    int human;                   /* walking preset: 1 human, 0 none */
+    int sword;                   /* combat preset: 1 1-handed sword, 0 none */
+    char right_hand[48];         /* item held, "" = nothing */
     char slot[MC_COUNT][100];    /* "" = the preset's, "-" = no animation, else "source/name" */
 } Moveset;
+static const char *default_right_hand(const char *model) { return !strcmp(model, "david") ? "daveswrd" : ""; }
+static int slot_preset_on(const Moveset *ms, int slot) { return slot < MC_FIRST_COMBAT ? ms->human : ms->sword; }
 #define MAX_MOVESETS 64
 static Moveset g_movesets[MAX_MOVESETS];
 static int g_moveset_count = 0;
@@ -2884,7 +2943,8 @@ static Moveset *moveset_get(const char *model) {
     Moveset *ms = &g_movesets[g_moveset_count++];
     memset(ms, 0, sizeof(*ms));
     snprintf(ms->model, sizeof(ms->model), "%s", model);
-    ms->human = 1;
+    ms->human = 1; ms->sword = 1;
+    snprintf(ms->right_hand, sizeof(ms->right_hand), "%s", default_right_hand(model));
     char path[1024], line[256], key[64], val[128];
     moveset_path(path, sizeof(path), model);
     FILE *f = fopen(path, "r");
@@ -2892,6 +2952,8 @@ static Moveset *moveset_get(const char *model) {
         while (fgets(line, sizeof(line), f)) {
             if (sscanf(line, "%63s %127s", key, val) != 2 || key[0] == '#') continue;
             if (!strcmp(key, "preset")) { ms->human = !strcmp(val, "human"); continue; }
+            if (!strcmp(key, "combat")) { ms->sword = !strcmp(val, "sword1h"); continue; }
+            if (!strcmp(key, "right_hand")) { snprintf(ms->right_hand, sizeof(ms->right_hand), "%s", strcmp(val, "-") ? val : ""); continue; }
             for (int k = 0; k < MC_COUNT; k++) if (!strcmp(key, MOVE_SLOT_KEY[k])) snprintf(ms->slot[k], sizeof(ms->slot[k]), "%s", val);
         }
         fclose(f);
@@ -2902,15 +2964,17 @@ static Moveset *moveset_get(const char *model) {
 static void moveset_save(const Moveset *ms) {
     char path[1024];
     moveset_path(path, sizeof(path), ms->model);
-    int custom = !ms->human;
+    int custom = !ms->human || !ms->sword || strcmp(ms->right_hand, default_right_hand(ms->model)) != 0;
     for (int k = 0; k < MC_COUNT; k++) if (ms->slot[k][0]) custom = 1;
     g_moveset_gen++;
     if (!custom) { remove(path); return; }
     ensure_parent_dir(path);
     FILE *f = fopen(path, "w");
     if (!f) return;
-    fprintf(f, "# Silver Remaster: %s's moveset (walking animations). Only the slots differing from the preset.\n", ms->model);
+    fprintf(f, "# Silver Remaster: %s's moveset (walking and combat animations, right hand). Only the slots differing from the presets.\n", ms->model);
     fprintf(f, "preset %s\n", ms->human ? "human" : "none");
+    fprintf(f, "combat %s\n", ms->sword ? "sword1h" : "none");
+    fprintf(f, "right_hand %s\n", ms->right_hand[0] ? ms->right_hand : "-");
     for (int k = 0; k < MC_COUNT; k++) if (ms->slot[k][0]) fprintf(f, "%s %s\n", MOVE_SLOT_KEY[k], ms->slot[k]);
     fclose(f);
 }
@@ -2929,8 +2993,34 @@ static int moveset_clip(const Moveset *ms, int slot, int *how) {
     const char *v = ms->slot[slot];
     if (!strcmp(v, "-")) { if (how) *how = 2; return -1; }
     if (v[0]) { if (how) *how = 1; return anim_lib_find_ref(v); }
-    if (how) *how = ms->human ? 0 : 2;
-    return ms->human ? anim_lib_find(HUMAN_PRESET[slot]) : -1;
+    int on = slot_preset_on(ms, slot);
+    if (how) *how = on ? 0 : 2;
+    return on ? anim_lib_find(HUMAN_PRESET[slot]) : -1;
+}
+
+/* An item of assets/chars/items (weapons, shields...): a small model whose
+   mesh is bound, with an identity bind, to its bone 2 -- its vertices are
+   in the frame of the hand that holds it, the grip at the origin, a
+   blade toward -Z. Loaded once. */
+static CharModel *item_model(const char *name) {
+    static CharModel *loaded[64];
+    static char names[64][48];
+    static int n = 0;
+    if (!name || !name[0]) return NULL;
+    for (int i = 0; i < n; i++) if (!strcmp(names[i], name)) return loaded[i];
+    if (n >= 64) return NULL;
+    char dir[1024];
+    root_path(dir, sizeof(dir), "assets/chars/items");
+    CharModel *m = (CharModel *)calloc(1, sizeof(CharModel));
+    if (m && !char_model_load(m, dir, name)) { char_model_free(m); free(m); m = NULL; }
+    snprintf(names[n], sizeof(names[0]), "%s", name);
+    loaded[n++] = m;
+    return m;
+}
+/* what a character model holds in its right hand (only a human skeleton has the grip bone) */
+static CharModel *model_right_hand(const CharModel *m) {
+    if (!m || m->node_count <= RIGHT_HAND_NODE) return NULL;
+    return item_model(moveset_get(m->name[0] ? m->name : "david")->right_hand);
 }
 
 static void actor_resolve_clips(Actor *a) {
@@ -2941,6 +3031,7 @@ static void actor_resolve_clips(Actor *a) {
         int c = moveset_clip(ms, k, NULL);
         a->clips[k] = (c >= 0 && anim_lib_fits(c, a->model->node_count)) ? c : -1;
     }
+    a->item = model_right_hand(a->model);
 }
 
 /* ---- the characters of the room ---- */
@@ -3715,6 +3806,7 @@ static int g_ms_view = 0;       /* moveset screen (full window, over the others)
 static int g_pick_for_script = 0; /* the character picker chooses a script action's model */
 static void script_view_toggle(void);
 static int screen_view(void) { return g_anim_view || g_script_view || g_ms_view; }
+static int attack_mode(void); /* ATTACK MODE */
 static void anim_view_layout(HWND hwnd);
 static void anim_view_toggle(void);
 static void anim_view_action(int id);
@@ -4154,7 +4246,9 @@ after_selection:;
             case TOOL_POLY: help = "POLYGON: click each corner, then click the first corner (or press Enter) to close it. Backspace removes the last corner, Esc cancels."; break;
         }
     } else {
-        help = "Click to walk, double-click to run. Mouse at an edge of the picture scrolls the view. Press CAPS LOCK to use the buttons.";
+        help = attack_mode()
+            ? "ATTACK MODE (Ctrl held): click = an attack (one of three, toward the point clicked). Hold the button and swing the mouse: up = thrust, left / right = blow turning left / right, down = blow turning around."
+            : "Click to walk, double-click to run. Hold Ctrl for attack mode. Mouse at an edge of the picture scrolls the view. Press CAPS LOCK to use the buttons.";
     }
     if (help) {
         SelectObject(hdc, fs);
@@ -4470,8 +4564,70 @@ static void edit_context_menu(HWND hwnd, float rx, float ry, int client_x, int c
     }
 }
 
+/* =====================================================================
+   ATTACK MODE: Ctrl held (the selected members of the team -- David for
+   now). A simple click: one of the 3 attacks of the moveset at random,
+   toward the point clicked. The button held and the mouse swung (on the
+   screen): up = swing up (lstab), left = swing left (rchp90a, turns him
+   90 degrees left), right = swing right (rchp90c), down = swing down via
+   his left or right (rchp180a / rchp180c) depending on the angle.
+   An attack asked for while one plays comes right after it.
+   ===================================================================== */
+#define ATK_GESTURE_PX 36
+static int g_atk_press = 0, g_atk_x = 0, g_atk_y = 0;
+static int attack_mode(void) {
+    return (GetKeyState(VK_CONTROL) & 0x8000) && g_loaded && g_has_3d_character && !g_edit_mode && !script_playing() &&
+           !screen_view() && !g_sv_pick && !g_tr.phase && !g_map_mode;
+}
+static void david_attack(int slot) {
+    Actor *a = DAVID_ACTOR;
+    actor_resolve_clips(a);
+    if (a->play_clip >= 0 && a->play_attack) { g_atk_queued = slot; return; }
+    if (slot == MC_ATK1) { /* a click: one of the three attacks at random */
+        int c[3], n = 0;
+        for (int k = MC_ATK1; k <= MC_ATK3; k++) if (a->clips[k] >= 0) c[n++] = k;
+        if (n) slot = c[rand() % n];
+    }
+    int clip = a->clips[slot];
+    if (clip < 0) { snprintf(g_status, sizeof(g_status), "attack: no animation for '%s' in %s's moveset", MOVE_SLOT_LABEL[slot], a->model->name); return; }
+    if (a->turn_clip >= 0) { a->facing = a->turn_to; a->turn_clip = -1; } /* he stops where he stands */
+    a->moving = 0; a->walk_mode = 0; a->waypoint_count = 0; a->pending_door = -1;
+    g_click_marker_active = 0;
+    a->play_clip = clip; a->play_t = 0.0f; a->play_left = 1; a->play_attack = 1;
+    a->play_turn = slot == MC_SW_LEFT ? 1.5707963f : slot == MC_SW_RIGHT ? -1.5707963f :
+                   slot == MC_SW_BACKL ? 3.14159265f : slot == MC_SW_BACKR ? -3.14159265f : 0.0f;
+}
+/* the button went down in the picture, in attack mode */
+static void attack_press(HWND hwnd, int cx, int cy) { g_atk_press = 1; g_atk_x = cx; g_atk_y = cy; SetCapture(hwnd); }
+/* the mouse moved with the button held: a swing once it's gone far enough */
+static int attack_drag(int cx, int cy) {
+    if (!g_atk_press) return 0;
+    int dx = cx - g_atk_x, dy = cy - g_atk_y;
+    if (dx * dx + dy * dy < ATK_GESTURE_PX * ATK_GESTURE_PX) return 1;
+    g_atk_press = 0; ReleaseCapture();
+    int slot;
+    if (abs(dy) >= abs(dx)) slot = dy < 0 ? MC_SW_UP : (dx < 0 ? MC_SW_BACKL : MC_SW_BACKR);
+    else slot = dx < 0 ? MC_SW_LEFT : MC_SW_RIGHT;
+    david_attack(slot);
+    return 1;
+}
+/* the button came up without a swing: a simple click, toward the point clicked */
+static int attack_release(int cx, int cy) {
+    if (!g_atk_press) return 0;
+    g_atk_press = 0; ReleaseCapture();
+    Actor *a = DAVID_ACTOR;
+    int rx, ry; float w[3];
+    client_to_room_point(cx, cy, &rx, &ry);
+    if (!(a->play_clip >= 0 && a->play_attack) && click_to_world((float)rx, (float)ry, w)) {
+        float dx = w[0] - a->pos[0], dz = w[2] - a->pos[2];
+        if (dx * dx + dz * dz > 0.04f) { a->facing = atan2f(dx, dz); if (a->turn_clip >= 0) a->turn_clip = -1; }
+    }
+    david_attack(MC_ATK1);
+    return 1;
+}
+
 /* ---------------- cursor: CAPS LOCK, clipping, edge panning ---------------- */
-static HCURSOR g_cur_game = NULL, g_cur_door = NULL, g_cur_pan[9];
+static HCURSOR g_cur_game = NULL, g_cur_door = NULL, g_cur_pan[9], g_cur_attack = NULL;
 static int g_pan_dir = 0;        /* 0 none, 1 up 2 down 3 left 4 right 5 ul 6 ur 7 dl 8 dr */
 static int g_clip_active = 0;
 static RECT g_clip_rect;
@@ -4547,6 +4703,7 @@ static void load_game_cursors(void) {
     g_cur_game = cursor_from_sprite(0, 2.0f, "tl", 0, 0);
     for (int i = 1; i < 9; i++) g_cur_pan[i] = cursor_from_sprite(i, 2.0f, rules[i], 0, 0);
     g_cur_door = cursor_from_sprite(11, 1.5f, NULL, 21, 21);
+    g_cur_attack = cursor_from_sprite(29, 2.0f, "tl", 0, 0); /* the sword: attack mode */
     if (!g_cur_game) g_cur_game = LoadCursorA(NULL, IDC_ARROW);
 }
 
@@ -4607,6 +4764,7 @@ static HCURSOR cursor_for(int cx, int cy) {
         if (handle_hit((float)rx, (float)ry) >= 0) return LoadCursorA(NULL, IDC_SIZEALL);
         return g_cursor_arrow;
     }
+    if (attack_mode() && g_cur_attack) return g_cur_attack;
     if (g_pan_dir && g_cur_pan[g_pan_dir]) return g_cur_pan[g_pan_dir];
     if (g_hovered_door >= 0 && !g_show_walkable && g_cur_door) return g_cur_door;
     return g_cur_game;
@@ -4879,7 +5037,7 @@ static void anim_raster_tri(const CharModel *m, uint32_t *px, float *zb, int W, 
 
 /* `m` posed by `clip` at time t (rest pose if clip < 0), orbit camera
    (yaw/pitch/zoom); follow = frame the whole body, grid = floor grid. */
-static void render_char_view(const CharModel *m, int clip, float t, uint32_t *px, int W, int H,
+static void render_char_view(const CharModel *m, const CharModel *item, int clip, float t, uint32_t *px, int W, int H,
                              float yaw, float pitch, float zoom, int follow, int grid) {
     static float *zb = NULL; static size_t zbn = 0;
     size_t npx = (size_t)W * H;
@@ -4968,6 +5126,27 @@ static void render_char_view(const CharModel *m, int clip, float t, uint32_t *px
         float v3[3] = { m->uvs_px[i0][1], m->uvs_px[i1][1], m->uvs_px[i2][1] };
         anim_raster_tri(m, px, zb, W, H, sx3, sy3, sz3, u3, v3, shade);
     }
+    Mat4 hand; /* what it holds in its right hand, in its hand */
+    if (item && item->vertex_count > 0 && m->node_count > RIGHT_HAND_NODE && skeleton_node_global(RIGHT_HAND_NODE, &hand)) {
+        static float iw3[DAVID_MAX_VERTS][3];
+        for (int vi = 0; vi < item->vertex_count; vi++) {
+            mat4_vec3(&hand, item->positions[vi], iw3[vi]);
+            ANIM_PROJ(iw3[vi][0], iw3[vi][1], iw3[vi][2], vx[vi], vy[vi], vz[vi]);
+        }
+        for (int tr = 0; tr < item->index_count / 3; tr++) {
+            int i0 = item->indices[tr * 3], i1 = item->indices[tr * 3 + 1], i2 = item->indices[tr * 3 + 2];
+            if (vz[i0] < 0.1f || vz[i1] < 0.1f || vz[i2] < 0.1f) continue;
+            float e1[3] = { iw3[i1][0] - iw3[i0][0], iw3[i1][1] - iw3[i0][1], iw3[i1][2] - iw3[i0][2] };
+            float e2[3] = { iw3[i2][0] - iw3[i0][0], iw3[i2][1] - iw3[i0][1], iw3[i2][2] - iw3[i0][2] };
+            float n[3] = { e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0] };
+            float nl = sqrtf(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+            float d = nl > 1e-9f ? fabsf((n[0] * L[0] + n[1] * L[1] + n[2] * L[2]) / nl) : 0.5f;
+            float sx3[3] = { vx[i0], vx[i1], vx[i2] }, sy3[3] = { vy[i0], vy[i1], vy[i2] }, sz3[3] = { vz[i0], vz[i1], vz[i2] };
+            float u3[3] = { item->uvs_px[i0][0], item->uvs_px[i1][0], item->uvs_px[i2][0] };
+            float v3[3] = { item->uvs_px[i0][1], item->uvs_px[i1][1], item->uvs_px[i2][1] };
+            anim_raster_tri(item, px, zb, W, H, sx3, sy3, sz3, u3, v3, 0.55f + 0.65f * d);
+        }
+    }
     #undef ANIM_PROJ
 }
 
@@ -4985,7 +5164,7 @@ static void anim_render_stage(HDC hdc, const RECT *r) {
     if (W < 16 || H < 16) return;
     static uint32_t *px = NULL; static size_t cap = 0;
     if (cap < (size_t)W * H) { free(px); px = (uint32_t *)malloc((size_t)W * H * 4); cap = (size_t)W * H; }
-    render_char_view(g_view_model, anim_current_clip(), g_anim_t, px, W, H, g_anim_yaw, g_anim_pitch, g_anim_zoom, g_anim_follow, 1);
+    render_char_view(g_view_model, model_right_hand(g_view_model), anim_current_clip(), g_anim_t, px, W, H, g_anim_yaw, g_anim_pitch, g_anim_zoom, g_anim_follow, 1);
     blit_pixels(hdc, r->left, r->top, W, H, px);
 }
 
@@ -5074,12 +5253,12 @@ static void picker_paint(HWND hwnd, HDC hdc) {
         if (k == g_pick_sel) { /* selected: alive, turning slowly */
             float dur = anim_lib_duration(e->preview_clip);
             float tt = dur > 0 ? fmodf(g_anim_t, dur) : 0.0f;
-            render_char_view(&e->model, e->preview_clip, tt, live, PICK_PW, PICK_PH, ANIM_DEFAULT_YAW + g_anim_t * 0.6f, 0.15f, 1.0f, 1, 0);
+            render_char_view(&e->model, NULL, e->preview_clip, tt, live, PICK_PW, PICK_PH, ANIM_DEFAULT_YAW + g_anim_t * 0.6f, 0.15f, 1.0f, 1, 0);
             img = live;
         } else {
             if (!e->preview) {
                 e->preview = (uint32_t *)malloc(PICK_PW * PICK_PH * 4);
-                render_char_view(&e->model, e->preview_clip, 0.0f, e->preview, PICK_PW, PICK_PH, ANIM_DEFAULT_YAW, 0.15f, 1.0f, 1, 0);
+                render_char_view(&e->model, NULL, e->preview_clip, 0.0f, e->preview, PICK_PW, PICK_PH, ANIM_DEFAULT_YAW, 0.15f, 1.0f, 1, 0);
             }
             img = e->preview;
         }
@@ -5467,7 +5646,7 @@ static int script_playing(void) { return g_run.active; }
 
 /* the script animations stop (the characters go back to their own pose) */
 static void run_stop_anims(void) {
-    for (int k = 0; k < MAX_ACTORS; k++) g_actors[k].play_clip = -1;
+    for (int k = 0; k < MAX_ACTORS; k++) { g_actors[k].play_clip = -1; g_actors[k].play_attack = 0; g_actors[k].play_turn = 0.0f; }
 }
 static void script_stop(const char *why) {
     if (!g_run.active) return;
@@ -6155,6 +6334,8 @@ static void sv_new_script(void) {
     char name[64];
     for (int k = g_script_count + 1;; k++) { snprintf(name, sizeof(name), "Script %d", k); if (room_script_find(name) < 0) break; }
     script_init(&g_scripts[g_script_count], name);
+    script_ensure_rows(&g_scripts[g_script_count], 1); /* the first block: the room's music, None until chosen */
+    action_init(&g_scripts[g_script_count], script_at(&g_scripts[g_script_count], 0, 0), ACT_MUSIC);
     g_sv_script = g_script_count++;
     g_sv_row = g_sv_col = g_sv_scroll = 0;
     sv_changed();
@@ -6661,7 +6842,7 @@ static void sv_layout_main(HWND hwnd) {
         static const char *add_desc[ACT_COUNT] = { "",
             "Wait a given time. The game goes on meanwhile.",
             "Show another picture as the room's background (the geometry and masks stay the room's).",
-            "Change the music: a playlist of tracks, each looped or not. Replaces the music playing.",
+            "Change the music: a playlist of tracks, each looped or not. Replaces the music playing (the same track goes on).",
             "Play a sound (repeated or not). The music isn't touched.",
             "Play an atmosphere sound, looped or not. The music isn't touched.",
             "Stop a sound or ambience started by this script (or all of them, or the music).",
@@ -6724,11 +6905,11 @@ static void sv_layout_main(HWND hwnd) {
                 ui_add(B_SV_TRACK + i * 8 + 4, x, iy, bw, rh, "x", "", "Remove it from the playlist.", 0, 1, 0);
                 iy += rh + 5;
             }
-            if (a->ntracks == 0) { svl(ix, iy, iw, 20, 0, RGB(255, 150, 120), SV_ONE, "No track: this action STOPS the music."); iy += 26; }
+            if (a->ntracks == 0) { svl(ix, iy, iw, 20, 0, RGB(255, 150, 120), SV_ONE, "None: no music here (stops the music playing)."); iy += 26; }
             ui_add(B_SV_MU_ADD, ix, iy, iw, rh, "Add a track...", "", "Choose a music file (assets/sound) to add at the end of the playlist.", 0, a->ntracks < AUDIO_MAX_TRACKS, 0);
             iy += rh + 12;
             svl(ix, iy, iw, 90, 0, SVL_DIM, DT_LEFT | DT_WORDBREAK,
-                "Starting it stops the music playing and its playlist, and plays this one instead. The row doesn't wait for it: the music goes on while the next rows play.");
+                "It replaces the music playing and its playlist -- but if the music playing is already this playlist's first track (the same music as the room before), it goes on without restarting. The row doesn't wait for it.");
             break;
         case ACT_SOUND: case ACT_AMBIENCE:
             svl(ix, iy, iw, 16, 1, SVL_SECTION, SV_ONE, "FILE");
@@ -7143,7 +7324,7 @@ static void sv_paint(HWND hwnd, HDC hdc) {
                 static uint32_t *pv = NULL; static size_t cap = 0;
                 if (cap < (size_t)W * H) { free(pv); pv = (uint32_t *)malloc((size_t)W * H * 4); cap = (size_t)W * H; }
                 float dur = anim_lib_duration(clip);
-                render_char_view(g_ch_model, clip, dur > 0 ? fmodf(g_ch_t, dur) : 0.0f, pv, W, H, ANIM_DEFAULT_YAW, 0.15f, 1.0f, 1, 1);
+                render_char_view(g_ch_model, model_right_hand(g_ch_model), clip, dur > 0 ? fmodf(g_ch_t, dur) : 0.0f, pv, W, H, ANIM_DEFAULT_YAW, 0.15f, 1.0f, 1, 1);
                 blit_pixels(hdc, g_ch_prev_rc.left, g_ch_prev_rc.top, W, H, pv);
                 SelectObject(hdc, ui_font(16, 1));
                 ui_text(hdc, g_ch_prev_rc.left + 12, g_ch_prev_rc.top + 8, W - 24, 22, ch_current(), RGB(255, 255, 255), SV_ONE);
@@ -7304,7 +7485,34 @@ static void sv_wheel(int x, int y, int delta) {
    (stand -> start -> walk / run cycles -> turns), the selected slot's
    clip playing on the character, and the clips it can use instead.
    ===================================================================== */
-enum { B_MS_FIRST = 900, B_MS_HUMAN = B_MS_FIRST, B_MS_EMPTY, B_MS_CLOSE, B_MS_NONE, B_MS_PRESET, B_MS_USE, B_MS_LAST = 950 };
+enum { B_MS_FIRST = 900, B_MS_HUMAN = B_MS_FIRST, B_MS_EMPTY, B_MS_CLOSE, B_MS_NONE, B_MS_PRESET, B_MS_USE,
+       B_MS_TAB_WALK, B_MS_TAB_COMBAT, B_MS_SWORD, B_MS_HAND, B_MS_HAND_NONE, B_MS_LAST = 950 };
+static int g_ms_tab = 0;   /* 0 walking, 1 combat */
+static int g_ms_items = 0; /* the list shows the items (right hand) instead of the clips */
+/* the items of assets/chars/items (a .gltf with its texture: the few without are item animations) */
+static char (*g_item_names)[48] = NULL;
+static int g_item_count = -1;
+static void items_scan(void) {
+    if (g_item_count >= 0) return;
+    g_item_count = 0;
+    char pat[1024];
+    root_path(pat, sizeof(pat), "assets/chars/items/*.png");
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(pat, &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    int cap = 0;
+    do {
+        char nm[48], g[1024];
+        snprintf(nm, sizeof(nm), "%.*s", (int)(strlen(fd.cFileName) - 4), fd.cFileName);
+        for (char *q = nm; *q; q++) if (*q >= 'A' && *q <= 'Z') *q += 32;
+        root_path(g, sizeof(g), "assets/chars/items/%s.gltf", nm);
+        if (GetFileAttributesA(g) == INVALID_FILE_ATTRIBUTES) continue;
+        if (g_item_count == cap) { cap = cap ? cap * 2 : 256; g_item_names = (char (*)[48])realloc(g_item_names, sizeof(*g_item_names) * cap); }
+        snprintf(g_item_names[g_item_count++], 48, "%s", nm);
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+    qsort(g_item_names, g_item_count, sizeof(*g_item_names), (int (*)(const void *, const void *))strcmp);
+}
 static CharModel *g_ms_model = NULL;
 static int g_ms_slot = MC_WALK, g_ms_sel = 0, g_ms_scroll = 0, g_ms_preview = 0; /* g_ms_preview: the list's clip plays instead of the slot's */
 static float g_ms_t = 0.0f;
@@ -7317,6 +7525,13 @@ static RECT g_ms_graph_rc, g_ms_stage_rc, g_ms_list_rc, g_ms_node_rc[MC_COUNT];
 static void ms_filter(void) {
     const CharModel *m = g_ms_model;
     g_ms_n = 0;
+    if (g_ms_items) {
+        items_scan();
+        for (int i = 0; i < g_item_count && g_ms_n < 4096; i++) if (!g_ms_filter[0] || ci_strstr(g_item_names[i], g_ms_filter)) g_ms_list[g_ms_n++] = i;
+        if (g_ms_sel >= g_ms_n) g_ms_sel = g_ms_n > 0 ? g_ms_n - 1 : 0;
+        g_ms_scroll = 0;
+        return;
+    }
     for (int pass = 0; pass < 2; pass++)
         for (int i = 0; i < anim_lib_count() && g_ms_n < 4096; i++) {
             const char *src = anim_lib_source(i);
@@ -7332,7 +7547,7 @@ static void ms_select(int k) {
     if (g_ms_n <= 0) return;
     if (k < 0) k = 0;
     if (k >= g_ms_n) k = g_ms_n - 1;
-    g_ms_sel = k; g_ms_preview = 1; g_ms_t = 0.0f;
+    g_ms_sel = k; g_ms_preview = !g_ms_items; g_ms_t = 0.0f;
     int rows = ms_rows_visible();
     if (g_ms_sel < g_ms_scroll) g_ms_scroll = g_ms_sel;
     if (g_ms_sel >= g_ms_scroll + rows) g_ms_scroll = g_ms_sel - rows + 1;
@@ -7340,6 +7555,7 @@ static void ms_select(int k) {
 /* the list on the slot's clip */
 static void ms_select_slot(int slot) {
     g_ms_slot = slot; g_ms_preview = 0; g_ms_t = 0.0f;
+    if (g_ms_items) return;
     int clip = moveset_clip(moveset_get(g_ms_model->name), slot, NULL);
     for (int k = 0; k < g_ms_n; k++) if (g_ms_list[k] == clip) {
         g_ms_sel = k;
@@ -7353,8 +7569,9 @@ static void ms_open(CharModel *m) {
     g_ms_model = m;
     g_ms_view = 1;
     g_ms_filter[0] = 0; g_ms_filter_len = 0;
+    g_ms_items = 0;
     ms_filter();
-    ms_select_slot(MC_WALK);
+    ms_select_slot(g_ms_tab ? MC_ATK1 : MC_WALK);
     ClipCursor(NULL); g_clip_active = 0;
 }
 static void ms_assign(int clip) {
@@ -7363,7 +7580,7 @@ static void ms_assign(int clip) {
     else {
         char ref[100]; snprintf(ref, sizeof(ref), "%s/%s", anim_lib_source(clip), anim_lib_name(clip));
         /* the preset's own clip for this slot: no override needed */
-        if (ms->human && clip == anim_lib_find(HUMAN_PRESET[g_ms_slot])) ms->slot[g_ms_slot][0] = 0;
+        if (slot_preset_on(ms, g_ms_slot) && clip == anim_lib_find(HUMAN_PRESET[g_ms_slot])) ms->slot[g_ms_slot][0] = 0;
         else snprintf(ms->slot[g_ms_slot], sizeof(ms->slot[0]), "%s", ref);
     }
     moveset_save(ms);
@@ -7374,11 +7591,26 @@ static void ms_action(int id) {
     Moveset *ms = moveset_get(g_ms_model->name);
     switch (id) {
         case B_MS_CLOSE: g_ms_view = 0; break;
-        case B_MS_HUMAN: ms->human = 1; for (int k = 0; k < MC_COUNT; k++) ms->slot[k][0] = 0; moveset_save(ms); snprintf(g_status, sizeof(g_status), "%s: Human preset loaded", ms->model); break;
-        case B_MS_EMPTY: ms->human = 0; for (int k = 0; k < MC_COUNT; k++) ms->slot[k][0] = 0; moveset_save(ms); break;
+        case B_MS_HUMAN: ms->human = 1; for (int k = 0; k < MC_FIRST_COMBAT; k++) ms->slot[k][0] = 0; moveset_save(ms); snprintf(g_status, sizeof(g_status), "%s: Human preset loaded", ms->model); break;
+        case B_MS_SWORD: ms->sword = 1; for (int k = MC_FIRST_COMBAT; k < MC_COUNT; k++) ms->slot[k][0] = 0; moveset_save(ms); snprintf(g_status, sizeof(g_status), "%s: 1-handed sword preset loaded", ms->model); break;
+        case B_MS_EMPTY: /* the tab's group only */
+            if (g_ms_tab) ms->sword = 0; else ms->human = 0;
+            for (int k = g_ms_tab ? MC_FIRST_COMBAT : 0; k < (g_ms_tab ? MC_COUNT : MC_FIRST_COMBAT); k++) ms->slot[k][0] = 0;
+            moveset_save(ms);
+            break;
         case B_MS_NONE: ms_assign(-1); break;
         case B_MS_PRESET: ms->slot[g_ms_slot][0] = 0; moveset_save(ms); g_ms_preview = 0; break;
-        case B_MS_USE: if (g_ms_n > 0) ms_assign(g_ms_list[g_ms_sel]); break;
+        case B_MS_USE:
+            if (g_ms_n <= 0) break;
+            if (g_ms_items) { snprintf(ms->right_hand, sizeof(ms->right_hand), "%s", g_item_names[g_ms_list[g_ms_sel]]); moveset_save(ms); g_ms_items = 0; ms_filter(); ms_select_slot(g_ms_slot); }
+            else ms_assign(g_ms_list[g_ms_sel]);
+            break;
+        case B_MS_TAB_WALK: case B_MS_TAB_COMBAT:
+            g_ms_tab = id == B_MS_TAB_COMBAT; g_ms_items = 0; ms_filter();
+            ms_select_slot(g_ms_tab ? MC_ATK1 : MC_WALK);
+            break;
+        case B_MS_HAND: g_ms_items = !g_ms_items; g_ms_filter[0] = 0; g_ms_filter_len = 0; ms_filter(); g_ms_preview = 0; break;
+        case B_MS_HAND_NONE: ms->right_hand[0] = 0; moveset_save(ms); g_ms_items = 0; ms_filter(); break;
     }
 }
 
@@ -7386,26 +7618,48 @@ static void ms_layout(HWND hwnd) {
     RECT rc; GetClientRect(hwnd, &rc);
     g_btn_count = 0;
     int gw = rc.right * 55 / 100;
-    SetRect(&g_ms_graph_rc, 10, 84, gw, rc.bottom - 10);
+    SetRect(&g_ms_graph_rc, 10, 98, gw, rc.bottom - 10);
     int rx = gw + 14, rw = rc.right - 10 - rx;
-    int stage_h = (rc.bottom - 84) * 45 / 100;
-    SetRect(&g_ms_stage_rc, rx, 84, rc.right - 10, 84 + stage_h);
+    int stage_h = (rc.bottom - 98) * 45 / 100;
+    SetRect(&g_ms_stage_rc, rx, 98, rc.right - 10, 98 + stage_h);
     int by = g_ms_stage_rc.bottom + 62;
     int bw = (rw - 12) / 3;
     const Moveset *ms = moveset_get(g_ms_model->name);
     int how = 0; moveset_clip(ms, g_ms_slot, &how);
-    ui_add(B_MS_USE, rx, by, bw, 26, "Use this clip", "Enter", "The clip selected in the list below plays for this slot (double-click a clip does the same).", 0, g_ms_n > 0 && g_ms_preview, 0);
-    ui_add(B_MS_NONE, rx + bw + 6, by, bw, 26, "No animation", "", "This slot plays nothing: a start / turn just turns the character, a cycle shows it in its rest pose.", how == 2 && ms->slot[g_ms_slot][0], 1, 0);
-    ui_add(B_MS_PRESET, rx + 2 * (bw + 6), by, bw, 26, "Back to preset", "", "Forget this slot's change: it plays the preset's clip again.", 0, ms->slot[g_ms_slot][0] != 0, 0);
+    if (g_ms_items) {
+        ui_add(B_MS_USE, rx, by, bw, 26, "Hold this item", "Enter", "The item selected in the list goes in its right hand (double-click does the same).", 0, g_ms_n > 0, 0);
+        ui_add(B_MS_HAND_NONE, rx + bw + 6, by, bw, 26, "Empty hand", "", "It holds nothing in its right hand.", !ms->right_hand[0], 1, 0);
+        ui_add(B_MS_HAND, rx + 2 * (bw + 6), by, bw, 26, "Back to the clips", "", "The list shows the animations again.", 0, 1, 0);
+    } else {
+        ui_add(B_MS_USE, rx, by, bw, 26, "Use this clip", "Enter", "The clip selected in the list below plays for this slot (double-click a clip does the same).", 0, g_ms_n > 0 && g_ms_preview, 0);
+        ui_add(B_MS_NONE, rx + bw + 6, by, bw, 26, "No animation", "", "This slot plays nothing: a start / turn just turns the character, a cycle shows it in its rest pose.", how == 2 && ms->slot[g_ms_slot][0], 1, 0);
+        ui_add(B_MS_PRESET, rx + 2 * (bw + 6), by, bw, 26, "Back to preset", "", "Forget this slot's change: it plays the preset's clip again.", 0, ms->slot[g_ms_slot][0] != 0, 0);
+    }
     SetRect(&g_ms_list_rc, rx, by + 62, rc.right - 10, rc.bottom - 10);
-    ui_add(B_MS_HUMAN, rc.right - 440, 10, 170, 28, "Load Human preset", "", "Every slot gets David's own clip (the changes of this character are forgotten). The preset itself never changes.", 0, 1, 0);
-    ui_add(B_MS_EMPTY, rc.right - 264, 10, 150, 28, "Empty moveset", "", "No preset: every slot plays nothing until you give it a clip.", 0, 1, 0);
+    ui_add(B_MS_TAB_WALK, 12, 62, 110, 26, "Walking", "", "Stand, walk, run, their starts and turns.", g_ms_tab == 0, 1, 3);
+    ui_add(B_MS_TAB_COMBAT, 128, 62, 200, 26, "Combat: 1-handed sword", "", "The attacks of attack mode (Ctrl held): a click, and the swings up / left / right / down.", g_ms_tab == 1, 1, 3);
+    if (g_ms_tab == 0)
+        ui_add(B_MS_HUMAN, rc.right - 440, 10, 170, 28, "Load Human preset", "", "Every walking slot gets David's own clip (the changes of this character are forgotten). The preset itself never changes.", 0, 1, 0);
+    else
+        ui_add(B_MS_SWORD, rc.right - 440, 10, 170, 28, "Load 1-handed sword", "", "Every combat slot gets the 1-handed sword preset (rchop, rchopp, rchoppp, lstab, rchp90a/c, rchp180a/c). The preset itself never changes.", 0, 1, 0);
+    ui_add(B_MS_EMPTY, rc.right - 264, 10, 150, 28, "Empty this tab", "", "No preset for this tab: its slots play nothing until you give them a clip.", 0, 1, 0);
     ui_add(B_MS_CLOSE, rc.right - 106, 10, 96, 28, "Close", "Esc", "Back.", 0, 1, 0);
+    { char hl[96];
+      snprintf(hl, sizeof(hl), "Right hand: %s", ms->right_hand[0] ? ms->right_hand : "nothing");
+      ui_addf(B_MS_HAND, 340, 62, 240, 26, hl, "", "What it holds in its right hand (an item of assets/chars/items) -- shown in the game and here. Click: choose in the list.",
+              g_ms_items, g_ms_model->node_count > RIGHT_HAND_NODE, 1); }
     /* graph nodes */
     int gx = g_ms_graph_rc.left, gy = g_ms_graph_rc.top, gwid = g_ms_graph_rc.right - g_ms_graph_rc.left, gh = g_ms_graph_rc.bottom - g_ms_graph_rc.top;
     int nw = gwid / 5, nh = 48;
     if (nw < 130) nw = 130;
     #define MS_NODE(k, fx, fy) SetRect(&g_ms_node_rc[k], gx + (int)(gwid * (fx)) - nw / 2, gy + (int)(gh * (fy)) - nh / 2, gx + (int)(gwid * (fx)) + nw / 2, gy + (int)(gh * (fy)) + nh / 2)
+    memset(g_ms_node_rc, 0, sizeof(g_ms_node_rc));
+    if (g_ms_tab == 1) { /* combat: attack mode -> a click / a held swing */
+        MS_NODE(MC_ATK1, 0.50f, 0.10f); MS_NODE(MC_ATK2, 0.50f, 0.22f); MS_NODE(MC_ATK3, 0.50f, 0.34f);
+        MS_NODE(MC_SW_UP, 0.83f, 0.52f); MS_NODE(MC_SW_LEFT, 0.83f, 0.64f); MS_NODE(MC_SW_RIGHT, 0.83f, 0.76f);
+        MS_NODE(MC_SW_BACKL, 0.83f, 0.88f); MS_NODE(MC_SW_BACKR, 0.50f, 0.88f);
+        return;
+    }
     MS_NODE(MC_STAND, 0.11f, 0.50f);
     MS_NODE(MC_TOWALK, 0.35f, 0.22f);
     MS_NODE(MC_TORUN, 0.35f, 0.78f);
@@ -7451,14 +7705,31 @@ static void ms_paint(HWND hwnd, HDC hdc) {
     snprintf(t, sizeof(t), "Moveset -- %s", g_ms_model->name);
     ui_text(hdc, 12, 10, 600, 28, t, RGB(255, 225, 120), SV_ONE);
     SelectObject(hdc, ui_font(14, 0));
-    snprintf(t, sizeof(t), "The animations %s walks with. Preset: %s. Click a box to see its clip, then pick another one in the list (right).", g_ms_model->name, ms->human ? "Human (David's clips)" : "none");
-    ui_text(hdc, 12, 42, rc.right - 470, 20, t, RGB(200, 200, 205), SV_ONE);
+    if (g_ms_tab == 0) snprintf(t, sizeof(t), "The animations %s walks with. Preset: %s. Click a box to see its clip, then pick another one in the list (right).", g_ms_model->name, ms->human ? "Human (David's clips)" : "none");
+    else snprintf(t, sizeof(t), "%s's attacks (attack mode: Ctrl held). Preset: %s. Click a box to see its clip, then pick another one in the list (right).", g_ms_model->name, ms->sword ? "1-handed sword" : "none");
+    ui_text(hdc, 12, 40, rc.right - 470, 20, t, RGB(200, 200, 205), SV_ONE);
     /* graph */
     ui_fill(hdc, &g_ms_graph_rc, RGB(20, 20, 26));
     RECT *n = g_ms_node_rc;
     COLORREF ac = RGB(110, 110, 125);
     #define CX(k) ((n[k].left + n[k].right) / 2)
     #define CY(k) ((n[k].top + n[k].bottom) / 2)
+    if (g_ms_tab == 1) {
+        RECT mode = { g_ms_graph_rc.left + 20, CY(MC_SW_UP) - 70, g_ms_graph_rc.left + 20 + (n[MC_ATK1].right - n[MC_ATK1].left), CY(MC_SW_UP) - 22 };
+        ui_fill(hdc, &mode, RGB(52, 30, 30)); ui_frame(hdc, &mode, RGB(200, 100, 90));
+        SelectObject(hdc, ui_font(16, 1));
+        ui_text(hdc, mode.left + 8, mode.top, mode.right - mode.left - 12, 24, "ATTACK MODE", RGB(255, 200, 190), SV_ONE);
+        SelectObject(hdc, ui_font(12, 0));
+        ui_text(hdc, mode.left + 8, mode.top + 24, mode.right - mode.left - 12, 20, "Ctrl held", RGB(220, 190, 180), SV_ONE);
+        int mx = mode.right, my = (mode.top + mode.bottom) / 2;
+        for (int k = MC_ATK1; k <= MC_ATK3; k++) ms_arrow(hdc, mx, my - 8, n[k].left, CY(k), ac, 0);
+        static const int sw[5] = { MC_SW_UP, MC_SW_LEFT, MC_SW_RIGHT, MC_SW_BACKL, MC_SW_BACKR };
+        for (int i = 0; i < 5; i++) ms_arrow(hdc, mx, my + 8, n[sw[i]].left, CY(sw[i]), ac, 0);
+        SelectObject(hdc, ui_font(12, 1));
+        ui_text(hdc, n[MC_ATK1].left, n[MC_ATK1].top - 20, 400, 16, "A CLICK: ONE OF THE THREE, AT RANDOM", RGB(90, 110, 140), DT_LEFT | DT_SINGLELINE);
+        ui_text(hdc, n[MC_SW_BACKR].left, n[MC_SW_UP].top - 20, 500, 16, "BUTTON HELD + A SWING OF THE MOUSE: UP / LEFT / RIGHT / DOWN", RGB(90, 110, 140), DT_LEFT | DT_SINGLELINE);
+        ui_text(hdc, g_ms_graph_rc.left + 8, g_ms_graph_rc.bottom - 20, 700, 16, "THE LEFT / RIGHT / DOWN SWINGS TURN THE BODY: IT FACES THE NEW WAY AFTER THE BLOW", RGB(90, 110, 140), DT_LEFT | DT_SINGLELINE);
+    } else {
     ms_arrow(hdc, n[MC_STAND].right, CY(MC_STAND) - 8, n[MC_TOWALK].left, CY(MC_TOWALK), ac, 0);
     ms_arrow(hdc, n[MC_STAND].right, CY(MC_STAND) + 8, n[MC_TORUN].left, CY(MC_TORUN), ac, 0);
     ms_arrow(hdc, n[MC_TOWALK].right, CY(MC_TOWALK), n[MC_WALK].left, CY(MC_WALK), ac, 0);
@@ -7477,9 +7748,11 @@ static void ms_paint(HWND hwnd, HDC hdc) {
     ui_text(hdc, CX(MC_WALK) - 70, (CY(MC_WALK) + CY(MC_RUN)) / 2 - 8, 140, 16, "walk <-> run (no clip)", RGB(120, 120, 135), DT_CENTER | DT_SINGLELINE);
     SelectObject(hdc, ui_font(12, 1));
     ui_text(hdc, g_ms_graph_rc.left + 8, g_ms_graph_rc.bottom - 20, 600, 16, "CHANGES OF DIRECTION (45 DEG OR MORE) PLAY THE TURN CLIPS, THEN BACK TO THE CYCLE", RGB(90, 110, 140), DT_LEFT | DT_SINGLELINE);
+    }
     #undef CX
     #undef CY
     for (int k = 0; k < MC_COUNT; k++) {
+        if (n[k].right <= n[k].left) continue; /* not on this tab */
         int how = 0, clip = moveset_clip(ms, k, &how);
         int fits = clip >= 0 && anim_lib_fits(clip, g_ms_model->node_count);
         int big = k == MC_STAND || k == MC_WALK || k == MC_RUN;
@@ -7505,7 +7778,8 @@ static void ms_paint(HWND hwnd, HDC hdc) {
         static uint32_t *px = NULL; static size_t cap = 0;
         if (cap < (size_t)W * H) { free(px); px = (uint32_t *)malloc((size_t)W * H * 4); cap = (size_t)W * H; }
         float dur = anim_lib_duration(clip);
-        render_char_view(g_ms_model, clip, dur > 0 ? fmodf(g_ms_t, dur) : 0.0f, px, W, H, ANIM_DEFAULT_YAW + g_ms_t * 0.25f, 0.15f, 1.0f, 1, 1);
+        const CharModel *held = g_ms_items && g_ms_n > 0 ? item_model(g_item_names[g_ms_list[g_ms_sel]]) : model_right_hand(g_ms_model); /* trying an item: in its hand */
+        render_char_view(g_ms_model, held, clip, dur > 0 ? fmodf(g_ms_t, dur) : 0.0f, px, W, H, ANIM_DEFAULT_YAW + g_ms_t * 0.25f, 0.15f, 1.0f, 1, 1);
         blit_pixels(hdc, g_ms_stage_rc.left, g_ms_stage_rc.top, W, H, px);
     }
     ui_frame(hdc, &g_ms_stage_rc, RGB(60, 60, 70));
@@ -7521,11 +7795,22 @@ static void ms_paint(HWND hwnd, HDC hdc) {
     ui_text(hdc, g_ms_stage_rc.left, ry + 22, W, 32, t, RGB(200, 200, 205), DT_LEFT | DT_WORDBREAK | DT_END_ELLIPSIS);
     /* list */
     SelectObject(hdc, ui_font(12, 1));
-    snprintf(t, sizeof(t), "CLIPS FOR THIS SKELETON (%d)   filter: %s_", g_ms_n, g_ms_filter);
+    if (g_ms_items) snprintf(t, sizeof(t), "ITEMS FOR ITS RIGHT HAND (%d)   filter: %s_", g_ms_n, g_ms_filter);
+    else snprintf(t, sizeof(t), "CLIPS FOR THIS SKELETON (%d)   filter: %s_", g_ms_n, g_ms_filter);
     ui_text(hdc, g_ms_list_rc.left, g_ms_list_rc.top - 20, g_ms_list_rc.right - g_ms_list_rc.left, 16, t, SVL_SECTION, SV_ONE);
     ui_fill(hdc, &g_ms_list_rc, RGB(22, 22, 28));
     int rows = ms_rows_visible();
-    for (int r = 0; r < rows; r++) {
+    for (int r = 0; g_ms_items && r < rows; r++) {
+        int k = g_ms_scroll + r;
+        if (k >= g_ms_n) break;
+        const char *nm = g_item_names[g_ms_list[k]];
+        int y = g_ms_list_rc.top + r * MS_ROW_H, held = !strcmp(nm, ms->right_hand);
+        if (k == g_ms_sel) { RECT hl = { g_ms_list_rc.left, y, g_ms_list_rc.right, y + MS_ROW_H }; ui_fill(hdc, &hl, RGB(60, 50, 10)); }
+        SelectObject(hdc, ui_font(14, held));
+        snprintf(t, sizeof(t), "%s%s", nm, held ? "   <- in its hand" : "");
+        ui_text(hdc, g_ms_list_rc.left + 8, y, g_ms_list_rc.right - g_ms_list_rc.left - 16, MS_ROW_H, t, k == g_ms_sel ? RGB(255, 230, 60) : RGB(210, 210, 210), SV_ONE);
+    }
+    for (int r = 0; !g_ms_items && r < rows; r++) {
         int k = g_ms_scroll + r;
         if (k >= g_ms_n) break;
         int id = g_ms_list[k], y = g_ms_list_rc.top + r * MS_ROW_H;
@@ -7553,7 +7838,11 @@ static int ms_key(int vk) {
         case VK_PRIOR: ms_select(g_ms_sel - ms_rows_visible()); return 1;
         case VK_NEXT: ms_select(g_ms_sel + ms_rows_visible()); return 1;
         case VK_RETURN: ms_action(B_MS_USE); return 1;
-        case VK_TAB: ms_select_slot((g_ms_slot + 1) % MC_COUNT); return 1;
+        case VK_TAB: { /* the next slot of the tab */
+            int first = g_ms_tab ? MC_FIRST_COMBAT : 0, count = g_ms_tab ? MC_COUNT - MC_FIRST_COMBAT : MC_FIRST_COMBAT;
+            ms_select_slot(first + (g_ms_slot - first + 1 + count) % count);
+            return 1;
+        }
         case VK_BACK: if (g_ms_filter_len > 0) { g_ms_filter[--g_ms_filter_len] = 0; ms_filter(); } return 1;
     }
     return 0;
@@ -7704,11 +7993,10 @@ static void perf_frame(double paint_ms) {
    (room depth sampled under each screen pixel) and by FOREGROUND shapes.
    px: 0x00RRGGBB top-down, W x H = the displayed part of the room;
    screen (x, y) <-> room (cam_x + x / sc, cam_y + y / sc). */
-static void render_actor_hires(Actor *a, uint32_t *px, int W, int H, float sc, float *zb, uint32_t *zst, uint32_t stamp) {
-    const CharModel *m = a->model;
-    static float vx[DAVID_MAX_VERTS], vy[DAVID_MAX_VERTS], vz[DAVID_MAX_VERTS];
-    static int vis[DAVID_MAX_VERTS];
-    actor_project(a, vx, vy, vz, vis);
+/* One mesh (a body, an item) already projected into room pixels: rasterized
+   at screen resolution, hidden by the room and the foreground shapes. */
+static void render_mesh_hires(const CharModel *m, float *vx, float *vy, const float *vz, const int *vis,
+                              uint32_t *px, int W, int H, float sc, float *zb, uint32_t *zst, uint32_t stamp) {
     float bx0 = 1e9f, by0 = 1e9f, bx1 = -1e9f, by1 = -1e9f;
     for (int i = 0; i < m->vertex_count; i++) {
         if (!vis[i]) continue;
@@ -7770,6 +8058,13 @@ static void render_actor_hires(Actor *a, uint32_t *px, int W, int H, float sc, f
             }
         }
     }
+}
+static void render_actor_hires(Actor *a, uint32_t *px, int W, int H, float sc, float *zb, uint32_t *zst, uint32_t stamp) {
+    static float vx[DAVID_MAX_VERTS], vy[DAVID_MAX_VERTS], vz[DAVID_MAX_VERTS];
+    static int vis[DAVID_MAX_VERTS];
+    actor_project(a, vx, vy, vz, vis);
+    render_mesh_hires(a->model, vx, vy, vz, vis, px, W, H, sc, zb, zst, stamp);
+    if (actor_project_item(a, vx, vy, vz, vis)) render_mesh_hires(a->item, vx, vy, vz, vis, px, W, H, sc, zb, zst, stamp);
 }
 /* Every character of the room. One depth buffer for all of them, never
    cleared: a pixel's depth only counts if it was written this frame
@@ -7982,6 +8277,10 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
         case WM_KEYDOWN: {
             int ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
             if (wParam == VK_CAPITAL) { update_cursor_clip(hwnd); InvalidateRect(hwnd, NULL, FALSE); return 0; }
+            if (wParam == VK_CONTROL && !(lParam & 0x40000000)) { /* attack mode on: its cursor, its help */
+                POINT cp; GetCursorPos(&cp); ScreenToClient(hwnd, &cp); SetCursor(cursor_for(cp.x, cp.y));
+                InvalidateRect(hwnd, NULL, FALSE);
+            }
             if (g_ms_view) { if (ms_key((int)wParam)) InvalidateRect(hwnd, NULL, FALSE); return 0; }
             if (g_anim_view) { if (anim_view_key((int)wParam)) InvalidateRect(hwnd, NULL, FALSE); return 0; }
             if (g_script_view) { if (sv_key(hwnd, (int)wParam)) InvalidateRect(hwnd, NULL, FALSE); return 0; }
@@ -8071,6 +8370,12 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             if (moved) { clamp_camera(); InvalidateRect(hwnd, NULL, FALSE); }
             return 0;
         }
+        case WM_KEYUP:
+            if (wParam == VK_CONTROL) { /* attack mode off */
+                POINT cp; GetCursorPos(&cp); ScreenToClient(hwnd, &cp); SetCursor(cursor_for(cp.x, cp.y));
+                InvalidateRect(hwnd, NULL, FALSE);
+            }
+            return 0;
         case WM_CHAR: {
             if (g_ms_view) { ms_char((char)wParam); InvalidateRect(hwnd, NULL, FALSE); return 0; }
             if (g_anim_view) { anim_view_char((char)wParam); InvalidateRect(hwnd, NULL, FALSE); return 0; }
@@ -8121,6 +8426,7 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             if (!g_loaded || !mouse_in_game(cx, cy)) return 0;
             int rx, ry;
             client_to_room_point(cx, cy, &rx, &ry);
+            if (attack_mode()) { attack_press(hwnd, cx, cy); return 0; }
             if (g_edit_mode && g_has_3d_character) {
                 edit_mouse_down((float)rx, (float)ry);
                 if (g_drag != DRAG_NONE) { SetCapture(hwnd); g_edit_dragging = 1; }
@@ -8148,6 +8454,7 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
                 InvalidateRect(hwnd, NULL, FALSE);
                 return 0;
             }
+            if (attack_drag(g_mouse_client_x, g_mouse_client_y)) return 0;
             int repaint = 0;
             ui_layout(hwnd);
             int hb = mouse_in_game(g_mouse_client_x, g_mouse_client_y) ? B_NONE : ui_hit(g_mouse_client_x, g_mouse_client_y);
@@ -8166,6 +8473,7 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             return 0;
         }
         case WM_LBUTTONUP: {
+            if (attack_release(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam))) return 0;
             if (g_anim_sb_page) { g_anim_sb_page = 0; KillTimer(hwnd, ANIM_SB_TIMER_ID); ReleaseCapture(); InvalidateRect(hwnd, NULL, FALSE); return 0; }
             if (g_anim_drag) { g_anim_drag = 0; ReleaseCapture(); InvalidateRect(hwnd, NULL, FALSE); return 0; }
             if (g_drag != DRAG_NONE) {
@@ -8405,6 +8713,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     if (calibrate_mode || verify_paths_mode) verify_spawns_mode = 1; /* same "no room args" launch path */
 
     init_root();
+    srand(GetTickCount()); /* attack mode: which of the three attacks */
     const char *start_label = "gno/boilarea";
     if (!verify_spawns_mode && lpCmdLine && lpCmdLine[0]) { /* optional: a room "level/room" to start in */
         static char arg[128];

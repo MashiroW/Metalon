@@ -66,7 +66,10 @@ No file of the original game is needed.
   - **Wait** a given time (the game goes on);
   - **Background**: the room shows another picture (only the picture);
   - **Music**: a playlist of tracks, each looped or not; it replaces the
-    music playing and goes on during the next rows;
+    music playing and goes on during the next rows. If the music playing
+    is already its first track (the same music as the room before), it
+    goes on without restarting. Every new script starts with a Music
+    block set to *None* (no music) in its first cell;
   - **Sound**: played 1 + *repeat* times; the row can wait for its end;
   - **Ambience**: an atmosphere sound, looped or not;
   - **Stop sound**: one of the script's sounds / ambiences, all of them,
@@ -100,11 +103,23 @@ No file of the original game is needed.
 - Choosers for sounds (with Listen) and pictures (with a preview); points
   are picked right in the room. Saved in `data/rooms/`.
 
-**Movesets** -- how a character walks
-- The 13 clips a character walks with (stand, walk, run, the starts and
-  the turns), shown as a graph with the selected clip playing on the
-  character. The **Human** preset gives David's clips; any slot can take
-  another clip or "no animation" without changing the preset.
+**Attack mode** (Ctrl held)
+- A click: one of the three attacks of the moveset (`rchop`, `rchopp`,
+  `rchoppp`), at random, toward the point clicked.
+- The button held and the mouse swung: up = thrust (`lstab`), left /
+  right = a blow turning 90 degrees (`rchp90a` / `rchp90c`), down = a blow
+  turning around via the left or the right (`rchp180a` / `rchp180c`).
+- David holds his sword (`daveswrd`) in his right hand: any item of
+  `assets/chars/items` can go there (moveset screen, "Right hand").
+
+**Movesets** -- how a character walks and fights
+- Walking tab: the 13 clips a character walks with (stand, walk, run, the
+  starts and the turns), shown as a graph with the selected clip playing
+  on the character. The **Human** preset gives David's clips.
+- Combat tab: the 8 attacks of attack mode, with the **1-handed sword**
+  preset. And what the character holds in its right hand.
+- Any slot can take another clip or "no animation" without changing its
+  preset.
 - Per character, in `data/movesets/`. From the animation viewer
   (Moveset...) or a script's character actions.
 
@@ -151,6 +166,7 @@ Every tool is also a button in the side panel, with its shortcut shown.
 | A | animation viewer (Tab inside it: choose the character) |
 | S | scripts of the room (F5 play, F6 play from the row, Ins / Del rows and cells, right-click a cell) |
 | Left-click during a script | skip the current row (not while a character is moving) |
+| Ctrl held | attack mode: click = attack, button held + swing up / left / right / down = the other blows |
 | E | scene editor: V select, 1 rectangle, 2 circle, 3 polygon, Ctrl+Z undo, Del delete, right-click = roles |
 | N (editor) | David & navigation settings |
 
@@ -174,7 +190,7 @@ data/            this project's data (versioned)
   rooms/<level>/<room>_nav.cfg        per-room navigation settings (only changed values)
   rooms/<level>/<room>_scripts.cfg    the room's scripts
   rooms/<level>/<room>_overlays.cfg   the room's overlays: place, size, frame rate
-  movesets/<model>.cfg                a character's moveset (only when changed)
+  movesets/<model>.cfg                a character's moveset and right-hand item (only when changed)
   portraits.cfg                       the portrait each character speaks with
 tools/           scripts that need the original CDs (see tools/README.md)
 docs/PROGRESS.md development history: measurements, decisions, what was tried

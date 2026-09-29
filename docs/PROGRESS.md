@@ -1492,3 +1492,27 @@ Validation, before removing the old data:
   coming in by one of its connectors, then one of its scripts.
 - The rooms' own .ogg files (their characters' lines) are listed first in
   the sound chooser ("levels/<level>/<room>/x.ogg").
+
+## 2026-09-29 -- Attack mode, weapons in hand, music carried over
+
+- assets/chars: `items/` holds the item models (~137: swords, shields,
+  keys, food...) plus 6 item animations (itemspin, itembnce, lift,
+  potspin, spinup, shootbow: node 2 of the item rig). `item/` and
+  `itemspin/` are two generic pick-up models. An item is a 3-node rig,
+  its mesh bound with an identity bind to node 2: vertices in the frame
+  of the hand holding it, grip at the origin, blade along -Z.
+- The human skeleton's node 42 (child of the right wrist 19, in the palm)
+  is the right-hand grip; 40 / 41 (children of the left wrist 23) the
+  left hand's. Checked offline by posing the skeleton with rchop / lstab /
+  rchp90c and drawing daveswrd at node 42: blade forward in lstab, down
+  in front in rchop, raised forward in the stand pose.
+- The swings turn the body like the move turns (hip yaw 180 -> -90 for
+  rchp90a, -> 90 for rchp90c, -> 0 for rchp180a/c; chops and lstab stay
+  at 180): the facing changes by +-90 / 180 degrees when the blow ends.
+- Attack mode (Ctrl held, cursor: the sword sprite mouse.29): click =
+  attack_1..3 at random toward the point clicked; button held + a 36 px
+  swing = up / left / right / down (down: via left or right by the
+  swing's slant). Combat slots in the movesets, "1-handed sword" preset,
+  right-hand item per model.
+- Music: a new playlist whose first track is the one playing leaves it
+  playing (no restart); new scripts start with a Music "None" block.

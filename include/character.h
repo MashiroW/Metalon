@@ -74,6 +74,9 @@ void skeleton_compute_skin_matrices(const NodeOverride *overrides /* [DAVID_NODE
                                      Mat4 *out_skin_mats /* [DAVID_JOINT_COUNT] */);
 /* same, for any character */
 void skeleton_skin_matrices_for(const CharModel *m, const NodeOverride *overrides, Mat4 *out_skin_mats);
+/* a bone's model-space matrix in the pose the last call above computed
+   (e.g. the hand holding a weapon); 0 if the model has no such bone */
+int skeleton_node_global(int node, Mat4 *out);
 
 /* --- Animation library: the .gltf clips of chars/anims, chars/david and
    (added on demand) any character's own folder, each clip loaded the

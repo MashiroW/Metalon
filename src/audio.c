@@ -203,6 +203,17 @@ void audio_music_play(const AudioTrack *tracks, int n) {
     if (!g_running) return;
     if (n > AUDIO_MAX_TRACKS) n = AUDIO_MAX_TRACKS;
     EnterCriticalSection(&g_cs);
+    /* the track playing is the new playlist's first one (the room before had
+       the same music): it goes on where it is, the new playlist after it */
+    for (int k = 0; k < MAX_VOICES && n > 0; k++) {
+        Voice *vc = &g_voice[k];
+        if (!vc->used || vc->kind != AUDIO_MUSIC || _stricmp(vc->file, tracks[0].file) != 0) continue;
+        memcpy(g_tracks, tracks, sizeof(AudioTrack) * n);
+        g_ntracks = n; g_track = 0;
+        vc->loop = tracks[0].loop;
+        LeaveCriticalSection(&g_cs);
+        return;
+    }
     for (int k = 0; k < MAX_VOICES; k++) if (g_voice[k].used && g_voice[k].kind == AUDIO_MUSIC) voice_free(&g_voice[k]);
     memcpy(g_tracks, tracks, sizeof(AudioTrack) * (n > 0 ? n : 0));
     g_ntracks = n > 0 ? n : 0;
