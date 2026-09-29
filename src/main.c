@@ -5833,10 +5833,11 @@ static CharModel *run_actor_model(const Script *s, int actor) {
     return (p && p->type == ACT_PLACE) ? model_by_name(p->model) : NULL;
 }
 
-/* SPEAK: the portraits of the characters speaking, bottom left of the picture */
+/* SPEAK: the portraits of the characters speaking, top right of the picture
+   (several at once: side by side, leftward) */
 static void script_draw_portraits(uint32_t *px, int W, int H, float sc) {
     if (!g_run.active || !g_run.row_started || g_tr.phase) return;
-    int x = (int)(16 * sc);
+    int right = W - (int)(12 * sc), y = (int)(12 * sc);
     for (int c = 0; c < g_run.s.cols; c++) {
         const ScriptAction *a = script_at(&g_run.s, g_run.row, c);
         CellRun *cr = &g_run.cell[c];
@@ -5844,12 +5845,12 @@ static void script_draw_portraits(uint32_t *px, int W, int H, float sc) {
         int pw, ph;
         const uint32_t *img = portrait_pixels(cr->portrait, &pw, &ph);
         if (!img) continue;
-        float k = sc * 2.0f;
-        int dw = (int)(pw * k), dh = (int)(ph * k), y = H - dh - (int)(16 * sc);
-        for (int yy = y - 3; yy < y + dh + 3; yy++) for (int xx = x - 3; xx < x + dw + 3; xx++) /* gold frame */
+        float k = sc * 1.25f;
+        int dw = (int)(pw * k), dh = (int)(ph * k), x = right - dw;
+        for (int yy = y - 2; yy < y + dh + 2; yy++) for (int xx = x - 2; xx < x + dw + 2; xx++) /* gold frame */
             if (xx >= 0 && yy >= 0 && xx < W && yy < H) px[(size_t)yy * W + xx] = (yy < y - 1 || yy >= y + dh + 1 || xx < x - 1 || xx >= x + dw + 1) ? 0xC8A040u : 0x101010u;
         blend_sprite(px, W, H, img, pw, ph, x, y, k);
-        x += dw + (int)(14 * sc);
+        right = x - (int)(10 * sc);
     }
 }
 
