@@ -1530,3 +1530,13 @@ Validation, before removing the old data:
   fuge's stdstill both blades then point forward (right (0.38, 0.13,
   -0.92), left (0.37, 0.27, -0.89)); as exported the left one would point
   sideways. fuge holds dualswrd by default.
+
+## 2026-09-29 -- Sound catalog, attack sounds
+
+- Sounds by kind in every chooser: music (the 39 soundtrack tracks of
+  assets/sound, listed by name), sound effects (the other 993), lines
+  (2199 .ogg in 122 room folders: the room's own ones, and the others').
+  Category titles in the lists (kept when filtering, skipped by the
+  keyboard); order by context.
+- Combat slots: up to 6 sounds each (movesets: `sounds <slot> <files>`),
+  one played at random when the attack starts.

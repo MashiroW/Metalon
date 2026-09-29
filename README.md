@@ -105,6 +105,11 @@ No file of the original game is needed.
   or, entering the room otherwise, the room's first script marked *auto*.
 - Choosers for sounds (with Listen) and pictures (with a preview); points
   are picked right in the room. Saved in `data/rooms/`.
+- The sounds are listed by kind: the room's own **lines** (its characters'
+  dialogue, in its folder), the **music** (the 39 soundtrack tracks), the
+  **sound effects** (the rest of `assets/sound`), the **other rooms'
+  lines** -- the likeliest kind first (music for a Music action, the
+  room's lines for Speak / Sound / Ambience, effects for attack sounds).
 
 **Attack mode** (Ctrl held)
 - A click: one of the three attacks of the moveset (`rchop`, `rchopp`,
@@ -120,7 +125,9 @@ No file of the original game is needed.
   starts and the turns), shown as a graph with the selected clip playing
   on the character. The **Human** preset gives David's clips.
 - Combat tab: the 8 attacks of attack mode, with the **1-handed sword**
-  preset. And what the character holds in its right hand.
+  preset, each with a pool of sounds (one plays at random with the
+  attack). And what the character holds in its right hand (a pair of
+  weapons like fuge's `dualswrd`: one in each hand).
 - Any slot can take another clip or "no animation" without changing its
   preset.
 - Per character, in `data/movesets/`. From the animation viewer
