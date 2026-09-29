@@ -111,25 +111,47 @@ No file of the original game is needed.
   lines** -- the likeliest kind first (music for a Music action, the
   room's lines for Speak / Sound / Ambience, effects for attack sounds).
 
+**Radial menu** (right click in the game)
+- 8 slots around the click (kept inside the picture), each with its
+  ornament on the ring; the view doesn't scroll while it's open.
+- Food, Orbs, Ranged, Magical, Backpack (Inventory, Potions, Keys),
+  Shields, Weapons, Specials. The centre goes back up.
+- Weapons: short sword, broad sword, battle axe, long sword, war hammer,
+  mace, bastard sword, dual knightly swords -- drawn or put away with
+  `sheatmp` (the one held: put away).
+- Shields: taken out / put back with `shldquip`, worn on the back of the
+  left hand. A broken shield falls in pieces and is gone for good.
+- Specials: Web of Death, Reaper, Cleaver, Scythe, Falcon, Hurricane,
+  Berserker, Armageddon -- their animation, with a blue trail behind the
+  blades.
+- The other items are there for later (no effect yet).
+
 **Attack mode** (Ctrl held)
-- A click: one of the three attacks of the moveset (`rchop`, `rchopp`,
-  `rchoppp`), at random, toward the point clicked.
-- The button held and the mouse swung: up = thrust (`lstab`), left /
-  right = a blow turning 90 degrees (`rchp90a` / `rchp90c`), down = a blow
-  turning around via the left or the right (`rchp180a` / `rchp180c`).
-- David holds his sword (`daveswrd`) in his right hand: any item of
-  `assets/chars/items` can go there (moveset screen, "Right hand").
+- A click: one of the three attacks of the moveset, at random, toward the
+  point clicked.
+- The button held and the mouse swung: up = thrust, left / right = side
+  blows, down = a blow turning around via the left or the right.
+- Every blow moves him with it (hitbox diameters: attacks 1, thrust 4,
+  left 1.25, right 1.5, down 1.5 back -- as far as the floor allows).
+- Right click: a dodge back (`dodgeb`, 4 hitbox diameters). Right button
+  held: the shield up (`shldup`, `shldhold` while held, `shlddown`).
+- The weapon's combat preset: **Single Swords** (rchop / rchopp /
+  rchoppp, lstab, headchop, revslice, rchp180a/c) or **Double Swords** for
+  the dual swords (rchoptwo, stabtwo, rslice2, hedchop2 -- `lslice2`
+  isn't in the blockouts --, rlc2180a/c).
 
 **Movesets** -- how a character walks and fights
 - Walking tab: the 13 clips a character walks with (stand, walk, run, the
   starts and the turns), shown as a graph with the selected clip playing
   on the character. The **Human** preset gives David's clips.
-- Combat tab: the 8 attacks of attack mode, with the **1-handed sword**
-  preset, each with a pool of sounds (one plays at random with the
-  attack). And what the character holds in its right hand (a pair of
-  weapons like fuge's `dualswrd`: one in each hand).
-- Any slot can take another clip or "no animation" without changing its
-  preset.
+- Combat tab: the 8 attacks of attack mode, each with its step and a pool
+  of sounds (one plays at random with the attack). The combat preset
+  follows the weapon held unless one is chosen. And what the character
+  holds in its right hand (a pair of weapons like fuge's `dualswrd`: one
+  in each hand).
+- Presets: Human, Single Swords, Double Swords, and your own -- "Save this
+  tab as a new preset" (`data/presets/`). Any slot can take another clip
+  or "no animation" without changing its preset.
 - Per character, in `data/movesets/`. From the animation viewer
   (Moveset...) or a script's character actions.
 
@@ -176,7 +198,9 @@ Every tool is also a button in the side panel, with its shortcut shown.
 | A | animation viewer (Tab inside it: choose the character) |
 | S | scripts of the room (F5 play, F6 play from the row, Ins / Del rows and cells, right-click a cell) |
 | Left-click during a script | skip the current row (not while a character is moving) |
-| Ctrl held | attack mode: click = attack, button held + swing up / left / right / down = the other blows |
+| Right click | the radial menu (weapons, shields, specials...) |
+| Ctrl held | attack mode: click = attack, button held + swing up / left / right / down = the other blows, right click = dodge, right button held = shield |
+| Ctrl+K | break the shield (test: nothing hits yet) |
 | E | scene editor: V select, 1 rectangle, 2 circle, 3 polygon, Ctrl+Z undo, Del delete, right-click = roles |
 | N (editor) | David & navigation settings |
 
@@ -201,6 +225,7 @@ data/            this project's data (versioned)
   rooms/<level>/<room>_scripts.cfg    the room's scripts
   rooms/<level>/<room>_overlays.cfg   the room's overlays: place, size, frame rate
   movesets/<model>.cfg                a character's moveset and right-hand item (only when changed)
+  presets/<name>.cfg                  moveset presets saved from the moveset screen
   portraits.cfg                       the portrait each character speaks with
 tools/           scripts that need the original CDs (see tools/README.md)
 docs/PROGRESS.md development history: measurements, decisions, what was tried

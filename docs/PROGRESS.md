@@ -1540,3 +1540,27 @@ Validation, before removing the old data:
   keyboard); order by context.
 - Combat slots: up to 6 sounds each (movesets: `sounds <slot> <files>`),
   one played at random when the attack starts.
+
+## 2026-09-30 -- Radial menu, combat moves, presets, items fixed
+
+- Items: all 137 load; ~25 (bows, clubs, torches, food...) have their own
+  bone offsets / non-identity binds the hand code ignored, so they sat in
+  the wrong place: each item's rest skinning is now baked into its
+  vertices when loaded. lightorb was taken for a pair of blades (the pair
+  test now also wants nothing long on the other side). longswrd and
+  spikmace are the long sword and the mace.
+- Shields hang on node 41 (back of the left hand): in shldhold its plate is
+  in front of the chest, facing forward.
+- Clip turns are measured (hip yaw at the end vs the start): headchop /
+  revslice don't turn, rchp180a/c and rlc2180a/c turn 180. The attacks
+  move the character (steps in hitbox diameters per slot, eased over the
+  clip, shortened against walls / ledges); none of the clips move the
+  root themselves.
+- Missing clips: lslice2 (hedchop2 stands in, Double Swords' right swing),
+  shlquip is shldquip; 2sheathe is empty (0 s).
+- Presets: Human / Single Swords / Double Swords built in, saved ones in
+  data/presets; per character walking preset, combat preset (default:
+  from the weapon held), overrides, steps, sounds.
+- Radial menu, dodge (dodgeb), shield (shldup / shldhold / shlddown),
+  equipment (sheatmp, shldquip), specials with blade trails, shield
+  breaking (Ctrl+K until something hits).
