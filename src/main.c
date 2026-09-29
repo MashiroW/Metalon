@@ -3475,14 +3475,40 @@ static void connector_clear(int i) {
 /* data/rooms/<level>/<room>_scripts.cfg */
 static void scripts_file_path(char *out, size_t n, const char *room_label) { root_path(out, n, "data/rooms/%s_scripts.cfg", room_label); }
 
+/* Every room has a script "Default", first of its list: played
+   automatically when David enters (auto), its first block the room's
+   background music -- None (no music) until chosen. Rooms without one get
+   it when their scripts are read (it's saved with the first edit). If the
+   room already has another auto script, that one keeps playing (Default
+   is then not auto). */
+#define DEFAULT_SCRIPT "Default"
+static int scripts_with_default(Script **sc, int n) {
+    for (int i = 0; i < n; i++) if (!strcmp((*sc)[i].name, DEFAULT_SCRIPT)) return n;
+    Script *ns = (Script *)realloc(*sc, sizeof(Script) * (n + 1));
+    if (!ns) return n;
+    memmove(&ns[1], &ns[0], sizeof(Script) * n);
+    script_init(&ns[0], DEFAULT_SCRIPT);
+    script_ensure_rows(&ns[0], 1);
+    action_init(&ns[0], script_at(&ns[0], 0, 0), ACT_MUSIC);
+    ns[0].auto_run = 1;
+    for (int i = 1; i <= n; i++) if (ns[i].auto_run) ns[0].auto_run = 0;
+    *sc = ns;
+    return n + 1;
+}
+/* a room's scripts, with its Default */
+static int room_scripts_read(const char *room_label, Script **out) {
+    char path[1024];
+    scripts_file_path(path, sizeof(path), room_label);
+    *out = NULL;
+    return scripts_with_default(out, scripts_load(path, out));
+}
+
 /* "Which script plays when David arrives in <room_label> through this
    connector?" -- a menu of that room's scripts. Returns 1 if one was
    picked (out = its name, "" = none), 0 if the menu was dismissed. */
 static int ask_arrival_script(const char *room_label, char *out, size_t n) {
-    char path[1024];
-    scripts_file_path(path, sizeof(path), room_label);
     Script *sc = NULL;
-    int ns = scripts_load(path, &sc);
+    int ns = room_scripts_read(room_label, &sc);
     HMENU m = CreatePopupMenu();
     char head[200];
     snprintf(head, sizeof(head), "When David arrives in %s through this connector, play:", room_label);
@@ -5552,9 +5578,7 @@ static void room_scripts_free(void) {
 static void room_scripts_load(const char *label) {
     room_scripts_free();
     snprintf(g_scripts_room, sizeof(g_scripts_room), "%s", label);
-    char path[1024];
-    scripts_file_path(path, sizeof(path), label);
-    g_script_count = scripts_load(path, &g_scripts);
+    g_script_count = room_scripts_read(label, &g_scripts);
 }
 static void room_scripts_save(void) {
     if (!g_scripts_room[0]) return;
@@ -6500,7 +6524,7 @@ static void sv_action(HWND hwnd, int id) {
     switch (id) {
         case B_SV_CLOSE: script_view_toggle(); return;
         case B_SV_NEW: sv_new_script(); return;
-        case B_SV_RENAME: if (s) { g_sv_text = 2; snprintf(g_sv_text_buf, sizeof(g_sv_text_buf), "%s", s->name); } return;
+        case B_SV_RENAME: if (s && strcmp(s->name, DEFAULT_SCRIPT)) { g_sv_text = 2; snprintf(g_sv_text_buf, sizeof(g_sv_text_buf), "%s", s->name); } return;
         case B_SV_DUP:
             if (s) {
                 Script *ns = (Script *)realloc(g_scripts, sizeof(Script) * (g_script_count + 1));
@@ -6516,7 +6540,7 @@ static void sv_action(HWND hwnd, int id) {
             }
             return;
         case B_SV_DELETE:
-            if (s) {
+            if (s && strcmp(s->name, DEFAULT_SCRIPT)) {
                 char q[200]; snprintf(q, sizeof(q), "Delete the script \"%s\"?", s->name);
                 if (MessageBoxA(hwnd, q, "Silver Remaster -- scripts", MB_YESNO | MB_ICONQUESTION) != IDYES) return;
                 script_free(s);
@@ -6719,10 +6743,8 @@ static void room_info(const char *label) {
         snprintf(g_rinfo.door_to[g_rinfo.nd], sizeof(g_rinfo.door_to[0]), "%s", tmp[i].target[0] ? tmp[i].target : "no target");
         g_rinfo.nd++;
     }
-    char path[1024];
-    scripts_file_path(path, sizeof(path), label);
     Script *sc = NULL;
-    int ns = scripts_load(path, &sc);
+    int ns = room_scripts_read(label, &sc);
     for (int i = 0; i < ns; i++) { if (g_rinfo.ns < 24) snprintf(g_rinfo.script[g_rinfo.ns++], 64, "%s", sc[i].name); script_free(&sc[i]); }
     free(sc);
 }
@@ -6796,10 +6818,11 @@ static void sv_layout_main(HWND hwnd) {
     svl(10, 46, list_w, 16, 1, SVL_SECTION, SV_ONE, "SCRIPTS OF THIS ROOM (%d)", g_script_count);
     int bx = 10, by = g_sv_list_rc.bottom + 8, bh = 26, bw = (list_w - 6) / 2;
     ui_add(B_SV_NEW, bx, by, bw, bh, "New", "", "A new empty script for this room (then type its name, Enter).", 0, 1, 0);
-    ui_add(B_SV_RENAME, bx + bw + 6, by, bw, bh, "Rename", "F2", "Rename the selected script (type, Enter). A connector playing it must be pointed at the new name again.", 0, s != NULL, 0);
+    int is_default = s && !strcmp(s->name, DEFAULT_SCRIPT);
+    ui_add(B_SV_RENAME, bx + bw + 6, by, bw, bh, "Rename", "F2", "Rename the selected script (type, Enter). A connector playing it must be pointed at the new name again. 'Default' keeps its name.", 0, s != NULL && !is_default, 0);
     by += bh + 5;
     ui_add(B_SV_DUP, bx, by, bw, bh, "Duplicate", "", "A copy of the selected script.", 0, s != NULL, 0);
-    ui_add(B_SV_DELETE, bx + bw + 6, by, bw, bh, "Delete", "", "Delete the selected script (asks first).", 0, s != NULL, 0);
+    ui_add(B_SV_DELETE, bx + bw + 6, by, bw, bh, "Delete", "", "Delete the selected script (asks first). Every room keeps its 'Default' script.", 0, s != NULL && !is_default, 0);
     by += bh + 5;
     ui_add(B_SV_AUTO, bx, by, list_w, bh, s && s->auto_run ? "Auto on entry: ON" : "Auto on entry: off", "",
            "ON: played whenever David enters this room without a connector script of its own (the first 'auto' script of the list). Not while the scene editor is on.",

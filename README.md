@@ -58,6 +58,9 @@ No file of the original game is needed.
 - Saved per room in `data/rooms/`.
 
 **Scripts** (S) -- the room's cutscenes
+- Every room has a **Default** script (it can't be deleted or renamed):
+  it plays automatically when David enters, and its first block is the
+  room's background music -- *None* until chosen.
 - Several scripts per room, each a grid of actions: 3 columns by default
   (more can be added), as many rows as needed. The rows play one after the
   other; the actions of a row all start together and the next row starts
