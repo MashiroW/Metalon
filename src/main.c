@@ -201,7 +201,14 @@ enum { MC_RUN90A, MC_RUN90C, MC_RUN180A, MC_RUN180C, MC_TOWALKA, MC_TOWALKC, MC_
        /* combat (attack mode, Ctrl held): a click = one of the 3 attacks at random, a held swing = the other 5 */
        MC_ATK1, MC_ATK2, MC_ATK3, MC_SW_UP, MC_SW_LEFT, MC_SW_RIGHT, MC_SW_BACKL, MC_SW_BACKR, MC_COUNT };
 #define MC_FIRST_COMBAT MC_ATK1
-#define RIGHT_HAND_NODE 42 /* the grip bone of the right hand (child of the wrist, in the palm) in the human skeleton */
+/* The human skeleton's hands: the wrists 19 (right) and 23 (left), the
+   grips in their palms 42 (right) and 40 (left) -- 41, on the back of the
+   left hand, is most likely a shield's. Not every model has the grips
+   where David does (fuge: 42 hangs from the root), so grip_node checks. */
+#define RIGHT_HAND_NODE 42
+#define RIGHT_WRIST_NODE 19
+#define LEFT_HAND_NODE 40
+#define LEFT_WRIST_NODE 23
 #define MAX_CHAR_WAYPOINTS 48
 #define MAX_ACTORS 16
 typedef struct {
@@ -227,11 +234,13 @@ typedef struct {
     int play_attack;           /* the clip playing is an attack (attack mode) */
     float play_turn;           /* facing change once it ends (the swings that turn the body) */
     CharModel *item;           /* held in the right hand (its moveset's right_hand), NULL = nothing */
-    Mat4 hand;                 /* the right hand's grip bone in the pose last computed (actor_project) */
-    int hand_ok;
+    CharModel *item_l;         /* held in the left hand (the second blade of a pair) */
+    Mat4 hand, hand_l;         /* the hands' grip bones in the pose last computed (actor_project) */
+    int hand_ok, hand_l_ok;
 } Actor;
 static int g_atk_queued = -1;  /* attack mode: the next attack, asked for while one plays */
 static void david_attack(int slot);
+static int grip_node(const CharModel *m, int left); /* MOVESETS */
 static Actor g_actors[MAX_ACTORS];
 static Actor *g_act = &g_actors[0];
 #define DAVID_ACTOR (&g_actors[0])
@@ -1517,7 +1526,8 @@ static void actor_project(Actor *a, float *px_buf, float *py_buf, float *z_buf, 
     actor_pose(a, overrides);
     static Mat4 skin_mats[DAVID_MAX_JOINTS];
     skeleton_skin_matrices_for(m, overrides, skin_mats);
-    a->hand_ok = a->item && skeleton_node_global(RIGHT_HAND_NODE, &a->hand);
+    a->hand_ok = a->item && skeleton_node_global(grip_node(m, 0), &a->hand);
+    a->hand_l_ok = a->item_l && skeleton_node_global(grip_node(m, 1), &a->hand_l);
 
     /* facing = direction it's heading (atan2(dx, dz)); the models face -Z
        (measured on David: in the walk cycles the grounded foot slides
@@ -1538,15 +1548,16 @@ static void actor_project(Actor *a, float *px_buf, float *py_buf, float *z_buf, 
     }
 }
 
-/* The item in a character's right hand, projected like its body (after
-   actor_project, which found the hand). 0 if it holds nothing. */
-static int actor_project_item(Actor *a, float *px_buf, float *py_buf, float *z_buf, int *visible) {
-    const CharModel *it = a->item;
-    if (!it || !a->hand_ok) return 0;
+/* The item in a character's right (left) hand, projected like its body
+   (after actor_project, which found the hands). 0 if it holds nothing. */
+static int actor_project_item(Actor *a, int left, float *px_buf, float *py_buf, float *z_buf, int *visible) {
+    const CharModel *it = left ? a->item_l : a->item;
+    if (!it || !(left ? a->hand_l_ok : a->hand_ok)) return 0;
+    const Mat4 *hand = left ? &a->hand_l : &a->hand;
     float cf = cosf(a->facing + 3.14159265f), sf = sinf(a->facing + 3.14159265f);
     for (int vi = 0; vi < it->vertex_count; vi++) {
         float h[3];
-        mat4_vec3(&a->hand, it->positions[vi], h);
+        mat4_vec3(hand, it->positions[vi], h);
         float world[3] = { h[0] * cf + h[2] * sf + a->pos[0], h[1] + a->pos[1], -h[0] * sf + h[2] * cf + a->pos[2] };
         visible[vi] = char_project(a->pos, world, &px_buf[vi], &py_buf[vi], &z_buf[vi]);
     }
@@ -1565,8 +1576,8 @@ static void render_3d_character(void) {
         actor_project(a, px_buf, py_buf, z_buf, visible);
         /* the Z-buffer test in fill_triangle_textured handles self-occlusion,
            the other characters AND the room geometry: draw order doesn't matter */
-        for (int pass = 0; pass < 2; pass++) {
-        if (pass == 1) { if (!actor_project_item(a, px_buf, py_buf, z_buf, visible)) break; m = a->item; } /* then what it holds */
+        for (int pass = 0; pass < 3; pass++) {
+        if (pass > 0) { if (!actor_project_item(a, pass == 2, px_buf, py_buf, z_buf, visible)) continue; m = pass == 2 ? a->item_l : a->item; } /* then what it holds */
         for (int t = 0; t < m->index_count / 3; t++) {
             int i0 = m->indices[t * 3], i1 = m->indices[t * 3 + 1], i2 = m->indices[t * 3 + 2];
             if (!visible[i0] || !visible[i1] || !visible[i2]) continue;
@@ -2928,7 +2939,11 @@ typedef struct {
     char right_hand[48];         /* item held, "" = nothing */
     char slot[MC_COUNT][100];    /* "" = the preset's, "-" = no animation, else "source/name" */
 } Moveset;
-static const char *default_right_hand(const char *model) { return !strcmp(model, "david") ? "daveswrd" : ""; }
+static const char *default_right_hand(const char *model) {
+    if (!strcmp(model, "david")) return "daveswrd";
+    if (!strcmp(model, "fuge")) return "dualswrd"; /* his two blades, one in each hand */
+    return "";
+}
 static int slot_preset_on(const Moveset *ms, int slot) { return slot < MC_FIRST_COMBAT ? ms->human : ms->sword; }
 #define MAX_MOVESETS 64
 static Moveset g_movesets[MAX_MOVESETS];
@@ -3017,10 +3032,68 @@ static CharModel *item_model(const char *name) {
     loaded[n++] = m;
     return m;
 }
-/* what a character model holds in its right hand (only a human skeleton has the grip bone) */
+/* The bone a hand holds things with: the grip bone when it really is in
+   that hand, else the wrist's first child (the hand), else -1. */
+static int grip_node(const CharModel *m, int left) {
+    int grip = left ? LEFT_HAND_NODE : RIGHT_HAND_NODE, wrist = left ? LEFT_WRIST_NODE : RIGHT_WRIST_NODE;
+    if (!m || m->node_count <= wrist) return -1;
+    if (grip < m->node_count && m->node_parent[grip] == wrist) return grip;
+    for (int i = wrist + 1; i < m->node_count; i++) if (m->node_parent[i] == wrist) return i;
+    return -1;
+}
+
+/* A PAIR of weapons packed in one item (dualswrd: two swords crossed at
+   the grip, one blade along -Z, the other along -X): split in two, the -Z
+   one for the right hand, the other turned to -Z for the left hand. Each
+   triangle goes to the blade it lies along. */
+static struct { const CharModel *base; CharModel *right, *left; } g_pairs[16];
+static int g_pair_count = 0;
+static CharModel *item_part(const CharModel *base, int second) {
+    CharModel *m = (CharModel *)malloc(sizeof(CharModel));
+    if (!m) return NULL;
+    *m = *base; /* texture, uvs, weights shared with the base */
+    m->indices = (uint32_t *)malloc(sizeof(uint32_t) * base->index_count);
+    m->index_count = 0;
+    for (int t = 0; t < base->index_count / 3; t++) {
+        float cx = 0, cz = 0;
+        for (int k = 0; k < 3; k++) { cx += base->positions[base->indices[t * 3 + k]][0]; cz += base->positions[base->indices[t * 3 + k]][2]; }
+        if ((fabsf(cx) > fabsf(cz)) != second) continue;
+        for (int k = 0; k < 3; k++) m->indices[m->index_count++] = base->indices[t * 3 + k];
+    }
+    if (second) { /* -X -> -Z: a quarter turn about Y */
+        m->positions = (float (*)[3])malloc(sizeof(float) * 3 * base->vertex_count);
+        for (int v = 0; v < base->vertex_count; v++) {
+            const float *p = base->positions[v];
+            m->positions[v][0] = -p[2]; m->positions[v][1] = p[1]; m->positions[v][2] = p[0];
+        }
+    }
+    return m;
+}
+static int item_is_pair(const CharModel *it) {
+    float minx = 0, minz = 0;
+    for (int v = 0; v < it->vertex_count; v++) { minx = fminf(minx, it->positions[v][0]); minz = fminf(minz, it->positions[v][2]); }
+    return minx < -1.0f && minz < -1.0f;
+}
+/* what a hand holds when `name` is the item */
+static CharModel *item_held(const char *name, int left) {
+    CharModel *base = item_model(name);
+    if (!base) return NULL;
+    for (int i = 0; i < g_pair_count; i++) if (g_pairs[i].base == base) return left ? g_pairs[i].left : g_pairs[i].right;
+    if (!item_is_pair(base) || g_pair_count >= 16) return left ? NULL : base;
+    g_pairs[g_pair_count].base = base;
+    g_pairs[g_pair_count].right = item_part(base, 0);
+    g_pairs[g_pair_count].left = item_part(base, 1);
+    g_pair_count++;
+    return left ? g_pairs[g_pair_count - 1].left : g_pairs[g_pair_count - 1].right;
+}
+/* what a character model holds in its right / left hand */
 static CharModel *model_right_hand(const CharModel *m) {
-    if (!m || m->node_count <= RIGHT_HAND_NODE) return NULL;
-    return item_model(moveset_get(m->name[0] ? m->name : "david")->right_hand);
+    if (grip_node(m, 0) < 0) return NULL;
+    return item_held(moveset_get(m->name[0] ? m->name : "david")->right_hand, 0);
+}
+static CharModel *model_left_hand(const CharModel *m) {
+    if (grip_node(m, 1) < 0) return NULL;
+    return item_held(moveset_get(m->name[0] ? m->name : "david")->right_hand, 1);
 }
 
 static void actor_resolve_clips(Actor *a) {
@@ -3032,6 +3105,7 @@ static void actor_resolve_clips(Actor *a) {
         a->clips[k] = (c >= 0 && anim_lib_fits(c, a->model->node_count)) ? c : -1;
     }
     a->item = model_right_hand(a->model);
+    a->item_l = model_left_hand(a->model);
 }
 
 /* ---- the characters of the room ---- */
@@ -5065,6 +5139,7 @@ static void anim_raster_tri(const CharModel *m, uint32_t *px, float *zb, int W, 
    (yaw/pitch/zoom); follow = frame the whole body, grid = floor grid. */
 static void render_char_view(const CharModel *m, const CharModel *item, int clip, float t, uint32_t *px, int W, int H,
                              float yaw, float pitch, float zoom, int follow, int grid) {
+    const CharModel *item_right = item;
     static float *zb = NULL; static size_t zbn = 0;
     size_t npx = (size_t)W * H;
     if (zbn < npx) { free(zb); zb = (float *)malloc(npx * sizeof(float)); zbn = npx; }
@@ -5152,8 +5227,10 @@ static void render_char_view(const CharModel *m, const CharModel *item, int clip
         float v3[3] = { m->uvs_px[i0][1], m->uvs_px[i1][1], m->uvs_px[i2][1] };
         anim_raster_tri(m, px, zb, W, H, sx3, sy3, sz3, u3, v3, shade);
     }
-    Mat4 hand; /* what it holds in its right hand, in its hand */
-    if (item && item->vertex_count > 0 && m->node_count > RIGHT_HAND_NODE && skeleton_node_global(RIGHT_HAND_NODE, &hand)) {
+    for (int side = 0; side < 2; side++) { /* what it holds, in its hands (the left: a pair's second blade) */
+    Mat4 hand;
+    if (side == 1) { item = NULL; for (int i = 0; i < g_pair_count; i++) if (g_pairs[i].right == item_right) item = g_pairs[i].left; }
+    if (item && item->vertex_count > 0 && skeleton_node_global(grip_node(m, side), &hand)) {
         static float iw3[DAVID_MAX_VERTS][3];
         for (int vi = 0; vi < item->vertex_count; vi++) {
             mat4_vec3(&hand, item->positions[vi], iw3[vi]);
@@ -5172,6 +5249,7 @@ static void render_char_view(const CharModel *m, const CharModel *item, int clip
             float v3[3] = { item->uvs_px[i0][1], item->uvs_px[i1][1], item->uvs_px[i2][1] };
             anim_raster_tri(item, px, zb, W, H, sx3, sy3, sz3, u3, v3, 0.55f + 0.65f * d);
         }
+    }
     }
     #undef ANIM_PROJ
 }
@@ -7671,7 +7749,7 @@ static void ms_layout(HWND hwnd) {
     { char hl[96];
       snprintf(hl, sizeof(hl), "Right hand: %s", ms->right_hand[0] ? ms->right_hand : "nothing");
       ui_addf(B_MS_HAND, 340, 62, 240, 26, hl, "", "What it holds in its right hand (an item of assets/chars/items) -- shown in the game and here. Click: choose in the list.",
-              g_ms_items, g_ms_model->node_count > RIGHT_HAND_NODE, 1); }
+              g_ms_items, grip_node(g_ms_model, 0) >= 0, 1); }
     /* graph nodes */
     int gx = g_ms_graph_rc.left, gy = g_ms_graph_rc.top, gwid = g_ms_graph_rc.right - g_ms_graph_rc.left, gh = g_ms_graph_rc.bottom - g_ms_graph_rc.top;
     int nw = gwid / 5, nh = 48;
@@ -7802,7 +7880,7 @@ static void ms_paint(HWND hwnd, HDC hdc) {
         static uint32_t *px = NULL; static size_t cap = 0;
         if (cap < (size_t)W * H) { free(px); px = (uint32_t *)malloc((size_t)W * H * 4); cap = (size_t)W * H; }
         float dur = anim_lib_duration(clip);
-        const CharModel *held = g_ms_items && g_ms_n > 0 ? item_model(g_item_names[g_ms_list[g_ms_sel]]) : model_right_hand(g_ms_model); /* trying an item: in its hand */
+        const CharModel *held = g_ms_items && g_ms_n > 0 ? item_held(g_item_names[g_ms_list[g_ms_sel]], 0) : model_right_hand(g_ms_model); /* trying an item: in its hand */
         render_char_view(g_ms_model, held, clip, dur > 0 ? fmodf(g_ms_t, dur) : 0.0f, px, W, H, ANIM_DEFAULT_YAW + g_ms_t * 0.25f, 0.15f, 1.0f, 1, 1);
         blit_pixels(hdc, g_ms_stage_rc.left, g_ms_stage_rc.top, W, H, px);
     }
@@ -8088,7 +8166,8 @@ static void render_actor_hires(Actor *a, uint32_t *px, int W, int H, float sc, f
     static int vis[DAVID_MAX_VERTS];
     actor_project(a, vx, vy, vz, vis);
     render_mesh_hires(a->model, vx, vy, vz, vis, px, W, H, sc, zb, zst, stamp);
-    if (actor_project_item(a, vx, vy, vz, vis)) render_mesh_hires(a->item, vx, vy, vz, vis, px, W, H, sc, zb, zst, stamp);
+    if (actor_project_item(a, 0, vx, vy, vz, vis)) render_mesh_hires(a->item, vx, vy, vz, vis, px, W, H, sc, zb, zst, stamp);
+    if (actor_project_item(a, 1, vx, vy, vz, vis)) render_mesh_hires(a->item_l, vx, vy, vz, vis, px, W, H, sc, zb, zst, stamp);
 }
 /* Every character of the room. One depth buffer for all of them, never
    cleared: a pixel's depth only counts if it was written this frame

@@ -1516,3 +1516,17 @@ Validation, before removing the old data:
   right-hand item per model.
 - Music: a new playlist whose first track is the one playing leaves it
   playing (no restart); new scripts start with a Music "None" block.
+
+## 2026-09-29 -- Hands on other skeletons, pairs of weapons (fuge)
+
+- fuge's node 42 hangs from the root, not from the right wrist: the grip
+  is now found per skeleton (grip_node): 42 / 40 when they are children
+  of the wrists 19 / 23, else the wrist's hand bone (20 / 24 -- in David,
+  20 sits at the same place as 42 with the same frame; no clip animates
+  20 or 42).
+- items/dualswrd is two swords crossed at the grip (one blade along -Z,
+  one along -X, same bone, identity bind): split into two items, the -Z
+  blade in the right hand, the other turned to -Z in the left hand. In
+  fuge's stdstill both blades then point forward (right (0.38, 0.13,
+  -0.92), left (0.37, 0.27, -0.89)); as exported the left one would point
+  sideways. fuge holds dualswrd by default.
