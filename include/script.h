@@ -19,6 +19,8 @@ enum {
     ACT_STOP,       /* stop a sound / ambience of this script, all of them, or the music */
     ACT_PLACE,      /* a character (`model`) appears at `pos`, facing `facing` */
     ACT_MOVE,       /* a character walks / runs to `pos`, or through connector `door` */
+    ACT_ANIM,       /* a character plays clip `file` `repeat` times, or (anim_mode 1) until the rest of the row is over */
+    ACT_SPEAK,      /* a character says `file` (a sound): its portrait is shown until the line is over */
     ACT_COUNT
 };
 enum { STOP_ACTION, STOP_ALL_SOUNDS, STOP_MUSIC };
@@ -26,17 +28,19 @@ enum { STOP_ACTION, STOP_ALL_SOUNDS, STOP_MUSIC };
 typedef struct {
     int type, id;                      /* id: unique in its script, never reused */
     float seconds;                     /* WAIT */
-    char file[160];                    /* BACKGROUND: "level/room/name.png" under assets/levels; SOUND / AMBIENCE: file of assets/sound */
+    char file[160];                    /* BACKGROUND: "level/room/name.png" under assets/levels; SOUND / AMBIENCE / SPEAK: file of assets/sound;
+                                          ANIM: the clip, "source/name" */
     int ntracks;                       /* MUSIC */
     char track[AUDIO_MAX_TRACKS][64];
     int track_loop[AUDIO_MAX_TRACKS];
-    int repeat, wait_end;              /* SOUND */
+    int repeat, wait_end;              /* SOUND (ANIM: repeat = times played) */
+    int anim_mode;                     /* ANIM: 0 = `repeat` times, 1 = until the rest of the row is over */
     int loop;                          /* AMBIENCE */
     int stop_kind, stop_ref;           /* STOP: STOP_*; STOP_ACTION: id of the SOUND / AMBIENCE action */
     char model[48];                    /* PLACE: folder name in assets/chars */
     int has_pos;                       /* PLACE / MOVE: pos was picked */
     float pos[3], facing;              /* world point; facing in radians (PLACE) */
-    int actor;                         /* MOVE: 0 = David, else the id of the PLACE action that brought the character in */
+    int actor;                         /* MOVE / ANIM / SPEAK: 0 = David, else the id of the PLACE action that brought the character in */
     int run;                           /* MOVE: 0 walk, 1 run */
     int door;                          /* MOVE: connector shape id to go through, 0 = go to pos */
 } ScriptAction;

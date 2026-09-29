@@ -96,10 +96,12 @@ void action_init(Script *s, ScriptAction *a, int type) {
     if (type == ACT_WAIT) a->seconds = 1.0f;
     if (type == ACT_AMBIENCE) a->loop = 1;
     if (type == ACT_STOP) a->stop_kind = STOP_ALL_SOUNDS;
+    if (type == ACT_ANIM) a->repeat = 1;
 }
 
 const char *action_type_name(int type) {
-    static const char *names[ACT_COUNT] = { "Empty", "Wait", "Background", "Music", "Sound", "Ambience", "Stop sound", "Place character", "Move character" };
+    static const char *names[ACT_COUNT] = { "Empty", "Wait", "Background", "Music", "Sound", "Ambience", "Stop sound", "Place character", "Move character",
+                                            "Animate character", "Speak" };
     return (type >= 0 && type < ACT_COUNT) ? names[type] : "?";
 }
 
@@ -152,6 +154,17 @@ void action_summary(const Script *s, const ScriptAction *a, char *out, int n) {
             else if (a->has_pos) snprintf(out, n, "%s %s to a point", t, a->run ? "runs" : "walks");
             else snprintf(out, n, "%s -- no destination yet", t);
             break;
+        case ACT_ANIM:
+            script_actor_name(s, a->actor, t, sizeof(t));
+            if (!a->file[0]) { snprintf(out, n, "%s -- no animation yet", t); break; }
+            if (a->anim_mode == 1) snprintf(out, n, "%s: %s (while the row)", t, base_name(a->file));
+            else snprintf(out, n, "%s: %s", t, base_name(a->file));
+            if (a->anim_mode == 0 && a->repeat > 1) { size_t l = strlen(out); snprintf(out + l, n - l, "  x%d", a->repeat); }
+            break;
+        case ACT_SPEAK:
+            script_actor_name(s, a->actor, t, sizeof(t));
+            snprintf(out, n, "%s: %s", t, a->file[0] ? a->file : "(no line yet)");
+            break;
     }
 }
 
@@ -167,6 +180,8 @@ void action_summary(const Script *s, const ScriptAction *a, char *out, int n) {
    cell <row> <col> <id> stop action <id> | stop sounds | stop music
    cell <row> <col> <id> place <model> <has_pos> <x> <y> <z> <facing>
    cell <row> <col> <id> move <actor> <run> <door> <has_pos> <x> <y> <z>
+   cell <row> <col> <id> anim <actor> <mode> <times> <source/clip>
+   cell <row> <col> <id> speak <actor> <file>
    end */
 static void parse_cell(Script *s, const char *line) {
     int r, c, id, used = 0;
@@ -197,6 +212,8 @@ static void parse_cell(Script *s, const char *line) {
         else a.stop_kind = STOP_ALL_SOUNDS;
     }
     else if (!strcmp(kind, "place")) { a.type = ACT_PLACE; sscanf(p, "%47s %d %f %f %f %f", a.model, &a.has_pos, &a.pos[0], &a.pos[1], &a.pos[2], &a.facing); if (!strcmp(a.model, "-")) a.model[0] = 0; }
+    else if (!strcmp(kind, "anim")) { a.type = ACT_ANIM; sscanf(p, "%d %d %d %159s", &a.actor, &a.anim_mode, &a.repeat, a.file); }
+    else if (!strcmp(kind, "speak")) { a.type = ACT_SPEAK; sscanf(p, "%d %159s", &a.actor, a.file); }
     else if (!strcmp(kind, "move")) { a.type = ACT_MOVE; sscanf(p, "%d %d %d %d %f %f %f", &a.actor, &a.run, &a.door, &a.has_pos, &a.pos[0], &a.pos[1], &a.pos[2]); }
     else return;
     if (!strcmp(a.file, "-")) a.file[0] = 0;
@@ -249,6 +266,8 @@ static void write_cell(FILE *f, int r, int c, const ScriptAction *a) {
             else fprintf(f, "stop %s\n", a->stop_kind == STOP_MUSIC ? "music" : "sounds");
             break;
         case ACT_PLACE: fprintf(f, "place %s %d %.4f %.4f %.4f %.4f\n", a->model[0] ? a->model : "-", a->has_pos, a->pos[0], a->pos[1], a->pos[2], a->facing); break;
+        case ACT_ANIM: fprintf(f, "anim %d %d %d %s\n", a->actor, a->anim_mode, a->repeat, a->file[0] ? a->file : "-"); break;
+        case ACT_SPEAK: fprintf(f, "speak %d %s\n", a->actor, a->file[0] ? a->file : "-"); break;
         case ACT_MOVE: fprintf(f, "move %d %d %d %d %.4f %.4f %.4f\n", a->actor, a->run, a->door, a->has_pos, a->pos[0], a->pos[1], a->pos[2]); break;
     }
 }

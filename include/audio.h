@@ -31,6 +31,7 @@ void audio_music_now(char *file, int n, int *track);
 int audio_play(const char *file, int kind, int repeat, int loop);
 void audio_stop(int id);
 void audio_stop_kind(int kind);      /* every voice of that kind */
+void audio_fade_kind(int kind, float seconds); /* every voice of that kind fades out, then stops */
 int audio_playing(int id);           /* 1 while the voice is still playing */
 int audio_voices(AudioVoiceInfo *out, int max); /* sounds + ambiences playing */
 

@@ -29,6 +29,7 @@ typedef struct {
     float fb[FB_CAP * 2];      /* decoded frames, stereo */
     int fb_n;
     int repeat_left, loop;
+    float fade, fade_step;     /* volume factor; fading out: - fade_step per frame, freed at 0 */
 } Voice;
 
 static Voice g_voice[MAX_VOICES];
@@ -58,6 +59,7 @@ static stb_vorbis *open_file(const char *file, int *channels, unsigned *rate) {
 static void voice_setup(Voice *vc, stb_vorbis *v, int ch, unsigned rate, const char *file, int kind, int repeat, int loop) {
     vc->v = v; vc->ch = ch; vc->step = (double)rate / OUT_RATE; vc->rpos = 0; vc->fb_n = 0;
     vc->kind = kind; vc->repeat_left = repeat; vc->loop = loop;
+    vc->fade = 1.0f; vc->fade_step = 0.0f;
     snprintf(vc->file, sizeof(vc->file), "%s", file);
     vc->id = g_next_id++;
     vc->used = 1;
@@ -125,9 +127,11 @@ static void mix(short *out, int frames) {
             int i0 = (int)vc->rpos;
             float f = (float)(vc->rpos - i0);
             const float *a = &vc->fb[i0 * 2];
-            acc[i * 2] += (a[0] + (a[2] - a[0]) * f) * g;
-            acc[i * 2 + 1] += (a[1] + (a[3] - a[1]) * f) * g;
+            float gf = g * vc->fade;
+            acc[i * 2] += (a[0] + (a[2] - a[0]) * f) * gf;
+            acc[i * 2 + 1] += (a[1] + (a[3] - a[1]) * f) * gf;
             vc->rpos += vc->step;
+            if (vc->fade_step > 0.0f && (vc->fade -= vc->fade_step) <= 0.0f) { voice_free(vc); break; }
         }
     }
     LeaveCriticalSection(&g_cs);
@@ -244,6 +248,15 @@ void audio_stop_kind(int kind) {
     EnterCriticalSection(&g_cs);
     for (int k = 0; k < MAX_VOICES; k++) if (g_voice[k].used && g_voice[k].kind == kind) voice_free(&g_voice[k]);
     if (kind == AUDIO_MUSIC) { g_ntracks = 0; g_track = -1; }
+    LeaveCriticalSection(&g_cs);
+}
+
+void audio_fade_kind(int kind, float seconds) {
+    if (!g_running) return;
+    if (seconds <= 0.0f) { audio_stop_kind(kind); return; }
+    EnterCriticalSection(&g_cs);
+    for (int k = 0; k < MAX_VOICES; k++)
+        if (g_voice[k].used && g_voice[k].kind == kind) g_voice[k].fade_step = g_voice[k].fade / (seconds * OUT_RATE);
     LeaveCriticalSection(&g_cs);
 }
 

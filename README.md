@@ -31,7 +31,11 @@ No file of the original game is needed.
 
   A turn is committed: repeated orders don't restart it. A new direction
   early in a turn restarts the right one from where his body points.
-- Click to walk, double-click to run. The A* pathfinding runs over a
+- Click to walk, double-click to run. He comes out of a scene connector
+  the way he went in: running if he ran to it, walking otherwise.
+- Through a connector: the picture fades to black, the sounds and
+  ambiences fade out (the music goes on), the game's spinning "Silver"
+  loading animation plays for 2 seconds, then the new room fades in. The A* pathfinding runs over a
   multi-level walkable grid, with a body/step/slope model: stairs yes,
   walls and steep slopes no.
 - Adjustable in the tool panel:
@@ -71,7 +75,14 @@ No file of the original game is needed.
     clicked in the room, facing a direction;
   - **Move character**: David or a placed character walks / runs to a
     point clicked in the room, or through a connector (for David: until
-    he is in the other room).
+    he is in the other room);
+  - **Animate character**: a character plays any animation made for its
+    skeleton (chosen with a live preview), a number of times or over and
+    over while the rest of the row lasts -- e.g. talking during a line;
+  - **Speak**: a character says a line (a sound) with its portrait shown
+    until the line is over. Each character's portrait (sprites
+    `bigports.1-71`) is chosen the first time it speaks and kept for it
+    everywhere (`data/portraits.cfg`).
 - While a script plays, the player can only left-click to skip the current
   row -- not a row that moves a character. Esc stops it (testing).
 - A script plays when David arrives through a connector that names it (the
@@ -154,6 +165,7 @@ data/            this project's data (versioned)
   rooms/<level>/<room>_nav.cfg        per-room navigation settings (only changed values)
   rooms/<level>/<room>_scripts.cfg    the room's scripts
   movesets/<model>.cfg                a character's moveset (only when changed)
+  portraits.cfg                       the portrait each character speaks with
 tools/           scripts that need the original CDs (see tools/README.md)
 docs/PROGRESS.md development history: measurements, decisions, what was tried
 build/           silver_remaster.exe

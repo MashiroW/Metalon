@@ -1450,3 +1450,20 @@ Validation, before removing the old data:
   cycles, starts, turns) per model, Human preset (David's clips) + per-slot
   overrides in data/movesets/<model>.cfg; graph editor with a live
   preview (animation viewer: Moveset..., or from a script action).
+
+## 2026-09-29 -- Room transition, talking characters, run through connectors
+
+- Through a connector: 1 s fade to black (sounds and ambiences fade out
+  with it -- `audio_fade_kind`; the music is untouched), 2 s of the
+  loading spinner (sprites spinall.0-29 at 30 fps, drawn x2 on black; the
+  new room is loaded when it starts, characters and scripts wait), 0.5 s
+  fade in. Any room change stops the sounds and ambiences.
+- He comes out of a connector running if he ran into it
+  (`g_door_travel_run`, captured before his walk mode is reset on arrival
+  -- the old code read it after, so he always walked out).
+- Script actions **Animate character** (a clip over the character's own
+  pose, N times or until the rest of the row is over) and **Speak** (a line
+  + the character's portrait, bigports.1-71, one per model for good in
+  data/portraits.cfg). Clip chooser with a live preview, portrait grid.
+- Checked offline: an ambience fading over 1 s is gone after 1.02 s while
+  the music plays on; anim / speak cells round-trip through the file.
