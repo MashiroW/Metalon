@@ -86,7 +86,8 @@ No file of the original game is needed.
     skeleton (chosen with a live preview), a number of times or over and
     over while the rest of the row lasts -- e.g. talking during a line --,
     or looped until replaced (kept after the script, until another
-    animation, a "Back to normal", or a move order);
+    animation, a "Back to normal", or a move order); at the game's
+    animation speed or at its own (x0.1-x4);
   - **Speak**: a character says a line (a sound -- the room's own lines
     are listed first) with its portrait shown until the line is over. Each
     character's portrait (sprites `bigports.1-71`) is chosen the first time
@@ -157,6 +158,10 @@ No file of the original game is needed.
   on the character. The **Human** preset gives David's clips.
 - Combat tab: the 8 attacks of attack mode, each with its step. The
   combat preset follows the weapon held unless one is chosen.
+- Each blow's sounds ("Sounds: ... edit..."): like a little script,
+  sounds and waits in order from the start of the blow, with a ruler
+  over the clip and "Play with sounds" to check they match; saved with
+  the combat preset (default: one swing of the pool, at once).
 - Sounds tab: pools of swing sounds, hit sounds (kept for when something
   can be hit) and grunts when hit, with the chance a grunt plays.
 - **Equipped weapon** / **Equipped shield** (top right): what the

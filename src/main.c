@@ -213,6 +213,15 @@ enum { MC_RUN90A, MC_RUN90C, MC_RUN180A, MC_RUN180C, MC_TOWALKA, MC_TOWALKC, MC_
 #define LEFT_WRIST_NODE 23
 #define MAX_CHAR_WAYPOINTS 48
 #define MAX_ACTORS 16
+/* An attack's SOUNDS, like a little script: in order from the start of the
+   blow, sounds (they play at once and don't wait) and waits (in seconds of
+   the animation). No list: one of the swings of its sound pool, at once. */
+enum { CUE_SOUND, CUE_SWING, CUE_WAIT };
+#define CUE_MAX 16
+#define COMBAT_SLOTS (MC_COUNT - MC_FIRST_COMBAT)
+typedef struct { int type; float sec; char file[96]; } SoundCue;
+typedef struct { int set; int n; SoundCue c[CUE_MAX]; } CueList;
+typedef struct { CueList list; int i; float wait; int on; } CuePlayer;
 typedef struct {
     int used;
     CharModel *model;
@@ -251,6 +260,8 @@ typedef struct {
     char event_arg[48];
     int trail;                 /* the clip leaves a blue trail behind its blades (specials) */
     int guard;                 /* shield: 0 down, 1 raising / held, 2 lowering */
+    float play_speed;          /* the clip's own speed (script "Animate character"), 0 = the game's animation speed */
+    CuePlayer cue;             /* the attack's sounds playing */
 } Actor;
 static int g_atk_queued = -1;  /* attack mode: the next attack, asked for while one plays */
 static void david_attack(int slot);
@@ -1091,7 +1102,7 @@ static void david_turn_after_clip(void) {
 }
 
 static void set_character_target(float wx, float wy, float wz, int run) {
-    if (g_act->play_attack) { g_act->play_clip = -1; g_act->play_attack = 0; g_act->play_turn = 0.0f; g_act->stepping = 0; g_act->trail = 0; } /* a move order ends an attack */
+    if (g_act->play_attack) { g_act->play_clip = -1; g_act->play_attack = 0; g_act->play_turn = 0.0f; g_act->stepping = 0; g_act->trail = 0; g_act->cue.on = 0; } /* a move order ends an attack */
     if (g_act->play_hold) { g_act->play_clip = -1; g_act->play_hold = 0; } /* ...and a looped script animation */
     float dx = wx - g_char_pos[0], dz = wz - g_char_pos[2];
     if (dx * dx + dz * dz < 1e-6f) return; /* already there */
@@ -1403,7 +1414,7 @@ static void actor_play_end(Actor *a) {
     a->trail = 0;
     a->play_clip = -1; a->play_hold = 0;
     if (a->play_next >= 0) { /* chained (shield: raised, then held) */
-        a->play_clip = a->play_next; a->play_t = 0.0f; a->play_left = a->play_next_loop ? -1 : 1;
+        a->play_clip = a->play_next; a->play_t = 0.0f; a->play_left = a->play_next_loop ? -1 : 1; a->play_speed = 0.0f;
         a->play_next = -1;
         return;
     }
@@ -1417,7 +1428,7 @@ static int advance_character(float dt) {
     if (g_act->play_clip >= 0) { /* a clip over its own pose (attacks, script animations...): its times, then back */
         Actor *a = g_act;
         float d = anim_lib_duration(a->play_clip);
-        a->play_t += dt * g_david_anim_speed;
+        a->play_t += dt * (a->play_speed > 0.0f ? a->play_speed : g_david_anim_speed);
         if (a->stepping && d > 0.0f) { /* the step taken with it, eased */
             float k = fminf(1.0f, a->play_t / d);
             k = k * k * (3.0f - 2.0f * k);
@@ -3158,6 +3169,7 @@ typedef struct {
     char clip[MC_COUNT][100];    /* walking / combat: per slot of its group, "source/name" or a clip name, "" = none */
     float step[MC_COUNT];        /* combat: hitbox diameters, forward (< 0 backward) */
     SoundPools snd;              /* sounds */
+    CueList cues[COMBAT_SLOTS];  /* combat: each blow's sounds (not set: a swing of the pool) */
     char walk[48], combat[48], sound[48], weapon[48], shield[48]; /* model ("combat" "" = from the weapon) */
 } MovePreset;
 static MovePreset g_presets[MOVE_PRESET_MAX];
@@ -3172,6 +3184,69 @@ static void preset_file(char *out, size_t n, const char *name) {
 }
 static void pool_add(SoundPools *sp, int pool, const char *file) {
     if (sp->n[pool] < POOL_MAX) snprintf(sp->file[pool][sp->n[pool]++], 96, "%s", file);
+}
+static const char *pool_pick(const SoundPools *sp, int pool);
+/* a blow's sounds: one step added / read from "sound <file>", "swing", "wait <seconds>" / written */
+static void cue_add(CueList *l, int type, float sec, const char *file) {
+    l->set = 1;
+    if (l->n >= CUE_MAX) return;
+    SoundCue *c = &l->c[l->n++];
+    memset(c, 0, sizeof(*c));
+    c->type = type; c->sec = sec;
+    if (file) snprintf(c->file, sizeof(c->file), "%s", file);
+}
+static void cue_parse(CueList *l, const char *kind, const char *arg) {
+    if (!strcmp(kind, "sound") && arg[0]) cue_add(l, CUE_SOUND, 0.0f, arg);
+    else if (!strcmp(kind, "swing")) cue_add(l, CUE_SWING, 0.0f, NULL);
+    else if (!strcmp(kind, "wait")) cue_add(l, CUE_WAIT, (float)atof(arg), NULL);
+}
+static void cue_write(FILE *f, const char *prefix, const char *slot, const CueList *l) {
+    fprintf(f, "%scues %s\n", prefix, slot);
+    for (int i = 0; i < l->n; i++) {
+        const SoundCue *c = &l->c[i];
+        if (c->type == CUE_SOUND) fprintf(f, "%scue %s sound %s\n", prefix, slot, c->file);
+        else if (c->type == CUE_SWING) fprintf(f, "%scue %s swing\n", prefix, slot);
+        else fprintf(f, "%scue %s wait %.3f\n", prefix, slot, c->sec);
+    }
+}
+/* "cues <slot>" / "cue <slot> <kind> [arg]" (prefix: "own_" in a moveset): 1 if the line was one */
+static int cue_line(const char *line, const char *prefix, CueList *lists, int *has) {
+    char key[64], slot[64], kind[16], arg[128] = "";
+    size_t pl = strlen(prefix);
+    if (strncmp(line, prefix, pl)) return 0;
+    int n = sscanf(line + pl, "%63s %63s %15s %127s", key, slot, kind, arg);
+    if (n < 2 || (strcmp(key, "cues") && strcmp(key, "cue"))) return 0;
+    for (int k = MC_FIRST_COMBAT; k < MC_COUNT; k++) if (!strcmp(slot, MOVE_SLOT_KEY[k])) {
+        CueList *l = &lists[k - MC_FIRST_COMBAT];
+        if (has) has[k - MC_FIRST_COMBAT] = 1;
+        l->set = 1;
+        if (!strcmp(key, "cue") && n >= 3) cue_parse(l, kind, n >= 4 ? arg : "");
+    }
+    return 1;
+}
+/* the time (s) a step of a list starts at */
+static float cue_time(const CueList *l, int upto) {
+    float t = 0.0f;
+    for (int i = 0; i < upto && i < l->n; i++) if (l->c[i].type == CUE_WAIT) t += l->c[i].sec;
+    return t;
+}
+/* Playing a list: start (NULL: the default, a swing of the pool), then
+   each step of the game (dt in seconds of the animation). */
+static void cue_start(CuePlayer *p, const CueList *l) {
+    memset(p, 0, sizeof(*p));
+    if (l) p->list = *l; else cue_add(&p->list, CUE_SWING, 0.0f, NULL);
+    p->on = 1;
+}
+static void cue_run(CuePlayer *p, float dt, const SoundPools *sp) {
+    if (!p->on) return;
+    p->wait -= dt;
+    while (p->on && p->wait <= 0.0f) {
+        if (p->i >= p->list.n) { p->on = 0; break; }
+        const SoundCue *c = &p->list.c[p->i++];
+        if (c->type == CUE_WAIT) { p->wait += c->sec; continue; }
+        const char *f = c->type == CUE_SWING ? pool_pick(sp, POOL_SWING) : c->file;
+        if (f && f[0]) audio_play(f, AUDIO_SOUND, 0, 0);
+    }
 }
 static void presets_load(void) {
     if (g_preset_n >= 0) return;
@@ -3213,6 +3288,7 @@ static void presets_load(void) {
             size_t l = strlen(line); while (l && (line[l - 1] == '\n' || line[l - 1] == '\r')) line[--l] = 0;
             const char *rest = strchr(line, ' ') ? strchr(line, ' ') + 1 : "";
             if (!strncmp(line, "name ", 5)) { snprintf(p->name, sizeof(p->name), "%s", rest); continue; }
+            if (cue_line(line, "", p->cues, NULL)) continue;
             if (sscanf(line, "%63s %127s", key, val) != 2 || key[0] == '#') continue;
             if (!strcmp(key, "group")) { for (int g = 0; g < PG_COUNT; g++) if (!strcmp(val, PG_NAME[g])) p->group = g; }
             else if (!strcmp(key, "step")) { float v; if (sscanf(line + 5 + strlen(val), "%f", &v) == 1) for (int k = 0; k < MC_COUNT; k++) if (!strcmp(val, MOVE_SLOT_KEY[k])) p->step[k] = v; }
@@ -3249,6 +3325,7 @@ static void preset_write(const MovePreset *p) {
             if (slot_group(k) != p->group) continue;
             fprintf(f, "%s %s\n", MOVE_SLOT_KEY[k], p->clip[k][0] ? p->clip[k] : "-");
             if (p->group == PG_COMBAT) fprintf(f, "step %s %.2f\n", MOVE_SLOT_KEY[k], p->step[k]);
+            if (p->group == PG_COMBAT && p->cues[k - MC_FIRST_COMBAT].set) cue_write(f, "", MOVE_SLOT_KEY[k], &p->cues[k - MC_FIRST_COMBAT]);
         }
     if (p->group == PG_SOUND) {
         static const char *pk[POOL_COUNT] = { "swing", "hit", "grunt" };
@@ -3272,6 +3349,8 @@ typedef struct {
     char slot[MC_COUNT][100];    /* "" = the preset's, "-" = no animation, else "source/name" */
     int has_step[MC_COUNT];      /* combat: its own step instead of the preset's */
     float step[MC_COUNT];
+    int has_cues[COMBAT_SLOTS];  /* combat: its own sounds for a blow instead of the preset's */
+    CueList cues[COMBAT_SLOTS];
     char combat_ovr_for[48];     /* the combat preset its combat changes were made on (they only apply to it) */
     int own_sounds;              /* its own sound pools (changed from its sound preset's) */
     SoundPools snd;
@@ -3311,6 +3390,7 @@ static Moveset *moveset_get(const char *model) {
             if (!strncmp(line, "sound_preset ", 13)) { snprintf(ms->sound_preset, sizeof(ms->sound_preset), "%s", rest); continue; }
             if (!strncmp(line, "model_preset ", 13)) { snprintf(ms->model_preset, sizeof(ms->model_preset), "%s", rest); continue; }
             if (!strncmp(line, "combat_changes_for ", 19)) { snprintf(ms->combat_ovr_for, sizeof(ms->combat_ovr_for), "%s", rest); continue; }
+            if (cue_line(line, "own_", ms->cues, ms->has_cues)) continue;
             if (sscanf(line, "%63s %127s", key, val) != 2 || key[0] == '#') continue;
             if (!strcmp(key, "preset")) { snprintf(ms->walk_preset, sizeof(ms->walk_preset), "%s", !strcmp(val, "human") ? "Human" : "-"); continue; } /* older files */
             if (!strcmp(key, "combat")) { snprintf(ms->combat_preset, sizeof(ms->combat_preset), "%s", !strcmp(val, "sword1h") ? "" : "-"); continue; }
@@ -3347,6 +3427,7 @@ static void moveset_save(const Moveset *ms) {
     int custom = strcmp(ms->walk_preset, "Human") || ms->combat_preset[0] || strcmp(ms->sound_preset, default_sound_preset(ms->model)) ||
                  strcmp(ms->right_hand, default_right_hand(ms->model)) || ms->left_hand[0] || ms->own_sounds || ms->model_preset[0];
     for (int k = 0; k < MC_COUNT; k++) if (ms->slot[k][0] || ms->has_step[k]) custom = 1;
+    for (int i = 0; i < COMBAT_SLOTS; i++) if (ms->has_cues[i]) custom = 1;
     g_moveset_gen++;
     if (!custom) { remove(path); return; }
     ensure_parent_dir(path);
@@ -3362,6 +3443,7 @@ static void moveset_save(const Moveset *ms) {
     if (ms->combat_ovr_for[0]) fprintf(f, "combat_changes_for %s\n", ms->combat_ovr_for);
     for (int k = 0; k < MC_COUNT; k++) if (ms->slot[k][0]) fprintf(f, "%s %s\n", MOVE_SLOT_KEY[k], ms->slot[k]);
     for (int k = 0; k < MC_COUNT; k++) if (ms->has_step[k]) fprintf(f, "step %s %.2f\n", MOVE_SLOT_KEY[k], ms->step[k]);
+    for (int k = MC_FIRST_COMBAT; k < MC_COUNT; k++) if (ms->has_cues[k - MC_FIRST_COMBAT]) cue_write(f, "own_", MOVE_SLOT_KEY[k], &ms->cues[k - MC_FIRST_COMBAT]);
     if (ms->own_sounds) {
         static const char *pk[POOL_COUNT] = { "own_swing", "own_hit", "own_grunt" };
         for (int q = 0; q < POOL_COUNT; q++) for (int i = 0; i < ms->snd.n[q]; i++) fprintf(f, "%s %s\n", pk[q], ms->snd.file[q][i]);
@@ -3417,6 +3499,14 @@ static float moveset_step_w(const Moveset *ms, int slot, const char *weapon) {
     if (ms->has_step[slot] && moveset_change_on(ms, slot, weapon)) return ms->step[slot];
     const MovePreset *p = moveset_preset_w(ms, slot_group(slot), weapon);
     return p ? p->step[slot] : 0.0f;
+}
+/* a blow's sounds: its own, else its combat preset's (NULL: the default, a swing of the pool) */
+static const CueList *moveset_cues_w(const Moveset *ms, int slot, const char *weapon) {
+    if (slot < MC_FIRST_COMBAT) return NULL;
+    int i = slot - MC_FIRST_COMBAT;
+    if (ms->has_cues[i] && moveset_change_on(ms, slot, weapon)) return &ms->cues[i];
+    const MovePreset *p = moveset_preset_w(ms, PG_COMBAT, weapon);
+    return p && p->cues[i].set ? &p->cues[i] : NULL;
 }
 /* its sound pools: its own, else its sound preset's (NULL: none) */
 static const SoundPools *moveset_sounds(const Moveset *ms) {
@@ -4363,7 +4453,7 @@ enum {
     B_SV_FIRST_ID = 280, B_SV_LAST_ID = 1399 /* the scripts screen's (sv_action), but 900-999: the moveset screen's */
 };
 typedef struct { int id; RECT r; const char *label; const char *key; const char *desc; int on; int enabled; int kind; } UiButton;
-#define UI_MAX_BTN 200
+#define UI_MAX_BTN 256
 static UiButton g_btn[UI_MAX_BTN];
 static int g_btn_count = 0;
 static char g_btn_text[UI_MAX_BTN][96]; /* labels built on the fly (ui_addf) */
@@ -5196,7 +5286,7 @@ static void actor_play_once(Actor *a, int clip, float step) {
     if (a->turn_clip >= 0) { a->facing = a->turn_to; a->turn_clip = -1; } /* it stops where it stands */
     a->moving = 0; a->walk_mode = 0; a->waypoint_count = 0; a->pending_door = -1;
     if (a == DAVID_ACTOR) g_click_marker_active = 0;
-    a->play_clip = clip; a->play_t = 0.0f; a->play_left = 1; a->play_attack = 0; a->play_next = -1; a->trail = 0; a->play_hold = 0;
+    a->play_clip = clip; a->play_t = 0.0f; a->play_left = 1; a->play_attack = 0; a->play_next = -1; a->trail = 0; a->play_hold = 0; a->play_speed = 0.0f;
     a->play_turn = clip_turn(a, clip);
     actor_plan_step(a, step);
 }
@@ -5223,8 +5313,13 @@ static void david_attack(int slot) {
     const Moveset *ms = moveset_get(a->model->name[0] ? a->model->name : "david");
     actor_play_once(a, clip, moveset_step_w(ms, slot, a->weapon));
     a->play_attack = 1;
-    const char *swing = pool_pick(moveset_sounds(ms), POOL_SWING); /* one of its swing sounds */
-    if (swing) audio_play(swing, AUDIO_SOUND, 0, 0);
+    cue_start(&a->cue, moveset_cues_w(ms, slot, a->weapon)); /* its sounds (the ones at 0 s: now) */
+    cue_run(&a->cue, 0.0f, moveset_sounds(ms));
+}
+/* every step: the attack's sounds go on, in step with the animation */
+static void actor_cue_tick(Actor *a, float dt) {
+    if (!a->cue.on) return;
+    cue_run(&a->cue, dt * g_david_anim_speed, moveset_sounds(moveset_get(a->model && a->model->name[0] ? a->model->name : "david")));
 }
 /* the button went down in the picture, in attack mode */
 static void attack_press(HWND hwnd, int cx, int cy) { g_atk_press = 1; g_atk_x = cx; g_atk_y = cy; SetCapture(hwnd); }
@@ -6823,7 +6918,7 @@ static void run_start_anim(const ScriptAction *a, CellRun *c) {
         return;
     }
     if (clip < 0 || !anim_lib_fits(clip, ac->model->node_count)) { snprintf(g_status, sizeof(g_status), "script: %s can't play '%s'", who, a->file); return; }
-    ac->play_clip = clip; ac->play_t = 0.0f; ac->play_next = -1;
+    ac->play_clip = clip; ac->play_t = 0.0f; ac->play_next = -1; ac->play_speed = a->speed;
     ac->play_left = (a->anim_mode == ANIM_ROW || a->anim_mode == ANIM_LOOP) ? -1 : (a->repeat < 1 ? 1 : a->repeat);
     ac->play_hold = a->anim_mode == ANIM_LOOP;
     if (a->anim_mode == ANIM_LOOP) return; /* the row goes on at once */
@@ -7072,7 +7167,7 @@ static const char *script_step_text(char *buf, size_t n, const char **sub) {
    Right: the selected cell's action and its settings.
    ===================================================================== */
 enum {
-    B_SV_AN_TIMES = 280, B_SV_AN_ROW, B_SV_AN_CLIP, B_SV_PORTRAIT, B_SV_AN_LOOP, B_SV_AN_NORMAL, /* (below B_SV_FIRST_ID: routed like the others) */
+    B_SV_AN_TIMES = 280, B_SV_AN_ROW, B_SV_AN_CLIP, B_SV_PORTRAIT, B_SV_AN_LOOP, B_SV_AN_NORMAL, B_SV_AN_FOLLOW, B_SV_AN_SPD_M, B_SV_AN_SPD_P, /* (below B_SV_FIRST_ID: routed like the others) */
     B_SV_FIRST = 300,
     B_SV_NEW = B_SV_FIRST, B_SV_RENAME, B_SV_DUP, B_SV_DELETE, B_SV_AUTO, B_SV_CLOSE,
     B_SV_PLAY, B_SV_PLAY_ROW, B_SV_ROW_INS, B_SV_ROW_DEL, B_SV_COL_ADD, B_SV_COL_DEL, B_SV_COPY, B_SV_PASTE, B_SV_CLEAR,
@@ -7715,6 +7810,12 @@ static void sv_action(HWND hwnd, int id) {
         case B_SV_REP_M: if (a->repeat > (a->type == ACT_ANIM ? 1 : 0)) a->repeat--; break;
         case B_SV_AN_TIMES: a->anim_mode = ANIM_TIMES; if (a->repeat < 1) a->repeat = 1; break;
         case B_SV_AN_LOOP: a->anim_mode = ANIM_LOOP; break;
+        case B_SV_AN_FOLLOW: a->speed = a->speed > 0.0f ? 0.0f : 1.0f; break;
+        case B_SV_AN_SPD_M: case B_SV_AN_SPD_P:
+            a->speed += id == B_SV_AN_SPD_P ? 0.1f : -0.1f;
+            if (a->speed < 0.1f) a->speed = 0.1f;
+            if (a->speed > 4.0f) a->speed = 4.0f;
+            break;
         case B_SV_AN_NORMAL: a->anim_mode = ANIM_NORMAL; break;
         case B_SV_RM_ROOM: ch_open(CH_ROOM, a->file); return;
         case B_SV_CAM_KEEP: a->cam_target = CAM_KEEP; break;
@@ -8283,7 +8384,19 @@ static void sv_layout_main(HWND hwnd) {
                     svl(ix, iy, iw, 20, 0, a->file[0] ? SVL_VALUE : RGB(255, 150, 120), SV_ONE, "%s", a->file[0] ? a->file : "not chosen yet");
                     iy += 26;
                     ui_add(B_SV_AN_CLIP, ix, iy, iw, rh, "Choose animation...", "", "Pick one of the animations made for this character's skeleton (it plays in a preview).", 0, m != NULL, 0);
-                    iy += rh + 12;
+                    iy += rh + 14;
+                    svl(ix, iy, iw, 16, 1, SVL_SECTION, SV_ONE, "SPEED");
+                    iy += 20;
+                    ui_add(B_SV_AN_FOLLOW, ix, iy, iw, rh, a->speed > 0.0f ? "[  ]  Follow the general speed" : "[x]  Follow the general speed", "",
+                           "Ticked: it plays at the game's animation speed (N: Animation speed). Unticked: at its own speed, set below.", a->speed <= 0.0f, 1, 3);
+                    iy += rh + 6;
+                    if (a->speed > 0.0f) {
+                        ui_add(B_SV_AN_SPD_M, ix, iy, 34, rh, "-", "", "Slower (0.1).", 0, a->speed > 0.1f + 1e-4f, 0);
+                        svl(ix + 42, iy, iw - 84, rh, 0, SVL_VALUE, SV_ONE | DT_CENTER, "x%.1f%s", a->speed, a->speed < 1.0f - 1e-4f ? "  (slower)" : a->speed > 1.0f + 1e-4f ? "  (faster)" : "  (as made)");
+                        ui_add(B_SV_AN_SPD_P, ix + iw - 34, iy, 34, rh, "+", "", "Faster (0.1).", 0, a->speed < 4.0f - 1e-4f, 0);
+                        iy += rh + 6;
+                    }
+                    iy += 6;
                 }
                 if (a->anim_mode == ANIM_TIMES) {
                     ui_add(B_SV_REP_M, ix, iy, 34, rh, "-", "", "Once less.", 0, a->repeat > 1, 0);
@@ -8691,7 +8804,9 @@ static void sv_wheel(int x, int y, int delta) {
 enum { B_MS_FIRST = 900, B_MS_CLOSE = B_MS_FIRST, B_MS_NONE, B_MS_PRESET, B_MS_USE, B_MS_TAB_WALK, B_MS_TAB_COMBAT, B_MS_TAB_SOUND,
        B_MS_TAB_PRESET, B_MS_MODEL_PRESET, B_MS_WEAPON, B_MS_SHIELD, B_MS_ITEM_NONE, B_MS_LIST_BACK, B_MS_STEP_M, B_MS_STEP_P, B_MS_STEP_PRESET,
        B_MS_CHANCE_M, B_MS_CHANCE_P, B_MS_SAVE_OK, B_MS_SAVE_CANCEL, B_MS_SAVE_DEFAULT, B_MS_SOUNDS_RESET,
+       B_MS_CUES, B_MS_CUE_SOUND, B_MS_CUE_SWING, B_MS_CUE_WAIT, B_MS_CUE_PLAY, B_MS_CUE_RESET, B_MS_CUE_DONE,
        B_MS_POOL = 2000 /* + pool * 100: the pool (select); + 1 + i: listen to sound i; + 50 + i: remove it; + 99: add */,
+       B_MS_CUE_ROW = 2400 /* + row * 10 + CUEOP_*: a step of the blow's sounds */,
        B_MS_LAST = 2999 };
 static int g_ms_tab = 0;          /* PG_WALK, PG_COMBAT, PG_SOUND */
 static int g_ms_items = 0;        /* the list shows the items: 1 for the weapon, 2 for the shield */
@@ -8700,6 +8815,12 @@ static int g_ms_pool = POOL_SWING;/* the pool a sound is added to */
 static int g_ms_text = 0;         /* saving a preset: its group + 1, while its name is typed */
 static char g_ms_text_buf[48];
 static int g_ms_text_default = 1; /* ...and it becomes the character's default */
+static int g_ms_cues = 0;         /* the Combat tab edits the selected blow's sounds (its timeline) */
+static int g_ms_cue_sel = -1;     /* the step selected (new ones go after it) */
+static CuePlayer g_ms_cplay;      /* "Play with sounds": the blow from its start, its sounds in step */
+static float g_ms_cplay_t = -1.0f;/* ...its time, -1 = not playing */
+static RECT g_ms_ruler_rc;
+enum { CUEOP_SELECT, CUEOP_UP, CUEOP_DOWN, CUEOP_DEL, CUEOP_M1, CUEOP_M01, CUEOP_P01, CUEOP_P1, CUEOP_LISTEN };
 static SoundRow *g_ms_snd = NULL; /* the sound list's rows */
 static int g_ms_snd_n = 0;
 /* the items of assets/chars/items (a .gltf with its texture: the few without are item animations) */
@@ -8794,6 +8915,7 @@ static void ms_select(int k) {
 /* the list on the slot's clip */
 static void ms_select_slot(int slot) {
     g_ms_slot = slot; g_ms_preview = 0; g_ms_t = 0.0f;
+    g_ms_cue_sel = -1; g_ms_cplay_t = -1.0f;
     if (g_ms_items || g_ms_sounds) return;
     int clip = moveset_clip(ms_cur(), slot, NULL);
     for (int k = 0; k < g_ms_n; k++) if (g_ms_list[k] == clip) {
@@ -8806,7 +8928,7 @@ static void ms_select_slot(int slot) {
 /* what the right-hand list shows: the tab's (clips / sounds), or items */
 static void ms_list_mode(int items) {
     g_ms_items = items;
-    g_ms_sounds = !items && g_ms_tab == PG_SOUND;
+    g_ms_sounds = !items && (g_ms_tab == PG_SOUND || g_ms_cues);
     g_ms_filter[0] = 0; g_ms_filter_len = 0;
     audio_preview(NULL);
     ms_filter();
@@ -8814,6 +8936,7 @@ static void ms_list_mode(int items) {
 }
 static void ms_set_tab(int tab) {
     g_ms_tab = tab;
+    g_ms_cues = 0; g_ms_cplay_t = -1.0f;
     ms_list_mode(0);
     if (tab != PG_SOUND) ms_select_slot(tab == PG_COMBAT ? MC_ATK1 : MC_WALK);
 }
@@ -8830,7 +8953,7 @@ static void ms_open(CharModel *m) {
 static void ms_combat_change(Moveset *ms) {
     const char *now = moveset_combat_name(ms, ms->right_hand);
     if (ms->combat_ovr_for[0] && _stricmp(ms->combat_ovr_for, now))
-        for (int k = MC_FIRST_COMBAT; k < MC_COUNT; k++) { ms->slot[k][0] = 0; ms->has_step[k] = 0; }
+        for (int k = MC_FIRST_COMBAT; k < MC_COUNT; k++) { ms->slot[k][0] = 0; ms->has_step[k] = 0; ms->has_cues[k - MC_FIRST_COMBAT] = 0; }
     snprintf(ms->combat_ovr_for, sizeof(ms->combat_ovr_for), "%s", now);
 }
 static void ms_assign(int clip) {
@@ -8860,6 +8983,7 @@ static SoundPools *ms_own_sounds(Moveset *ms) {
 static int ms_group_changed(const Moveset *ms, int group) {
     if (group == PG_SOUND) return ms->own_sounds;
     for (int k = 0; k < MC_COUNT; k++) if (slot_group(k) == group && (ms->slot[k][0] || ms->has_step[k])) return 1;
+    if (group == PG_COMBAT) for (int i = 0; i < COMBAT_SLOTS; i++) if (ms->has_cues[i]) return 1;
     return 0;
 }
 /* The tab (walking / combat / sounds) as it is now, saved as the preset
@@ -8880,6 +9004,7 @@ static int ms_save_group(Moveset *ms, int group, const char *name, int make_defa
         int c = moveset_clip(ms, k, NULL);
         if (c >= 0) snprintf(np.clip[k], sizeof(np.clip[k]), "%s/%s", anim_lib_source(c), anim_lib_name(c));
         np.step[k] = moveset_step_w(ms, k, ms->right_hand);
+        if (group == PG_COMBAT) { const CueList *cl = moveset_cues_w(ms, k, ms->right_hand); if (cl) np.cues[k - MC_FIRST_COMBAT] = *cl; }
     }
     *p = np;
     preset_write(p);
@@ -8888,7 +9013,7 @@ static int ms_save_group(Moveset *ms, int group, const char *name, int make_defa
         else {
             snprintf(group == PG_COMBAT ? ms->combat_preset : ms->walk_preset, 48, "%s", name);
             for (int k = 0; k < MC_COUNT; k++) if (slot_group(k) == group) { ms->slot[k][0] = 0; ms->has_step[k] = 0; }
-            if (group == PG_COMBAT) ms->combat_ovr_for[0] = 0;
+            if (group == PG_COMBAT) { ms->combat_ovr_for[0] = 0; memset(ms->has_cues, 0, sizeof(ms->has_cues)); }
         }
     }
     moveset_save(ms);
@@ -8932,6 +9057,7 @@ static void ms_apply_model(Moveset *ms, const MovePreset *p) {
     snprintf(ms->left_hand, 48, "%s", p->shield);
     snprintf(ms->model_preset, 48, "%s", p->name);
     for (int k = 0; k < MC_COUNT; k++) { ms->slot[k][0] = 0; ms->has_step[k] = 0; }
+    memset(ms->has_cues, 0, sizeof(ms->has_cues));
     ms->combat_ovr_for[0] = 0; ms->own_sounds = 0;
     moveset_save(ms);
     snprintf(g_status, sizeof(g_status), "model preset '%s' applied", p->name);
@@ -8956,6 +9082,94 @@ static void ms_delete_menu(int group) {
     preset_delete(&g_presets[cmd - 10]);
     snprintf(g_status, sizeof(g_status), "preset '%s' deleted", nm);
 }
+/* THE BLOW'S SOUNDS: the list in use (the default one: a swing of the pool, at once) */
+static const CueList *ms_cues_now(const Moveset *ms, int slot) {
+    static CueList def;
+    const CueList *l = moveset_cues_w(ms, slot, ms->right_hand);
+    if (l) return l;
+    memset(&def, 0, sizeof(def));
+    cue_add(&def, CUE_SWING, 0.0f, NULL);
+    return &def;
+}
+static int ms_cues_changed(const Moveset *ms, int slot) {
+    return slot >= MC_FIRST_COMBAT && ms->has_cues[slot - MC_FIRST_COMBAT] && moveset_change_on(ms, slot, ms->right_hand);
+}
+/* the character's own list for the blow, from the one in use the first time it changes */
+static CueList *ms_own_cues(Moveset *ms) {
+    int i = g_ms_slot - MC_FIRST_COMBAT;
+    ms_combat_change(ms);
+    if (!ms->has_cues[i]) { ms->cues[i] = *ms_cues_now(ms, g_ms_slot); ms->cues[i].set = 1; ms->has_cues[i] = 1; }
+    return &ms->cues[i];
+}
+static void ms_cue_insert(int type, float sec, const char *file) {
+    Moveset *ms = ms_cur();
+    CueList *l = ms_own_cues(ms);
+    if (l->n >= CUE_MAX) { snprintf(g_status, sizeof(g_status), "a blow has at most %d steps", CUE_MAX); return; }
+    int at = g_ms_cue_sel >= 0 && g_ms_cue_sel < l->n ? g_ms_cue_sel + 1 : l->n;
+    memmove(&l->c[at + 1], &l->c[at], sizeof(SoundCue) * (size_t)(l->n - at));
+    memset(&l->c[at], 0, sizeof(SoundCue));
+    l->c[at].type = type; l->c[at].sec = sec;
+    if (file) snprintf(l->c[at].file, sizeof(l->c[at].file), "%s", file);
+    l->n++;
+    g_ms_cue_sel = at;
+    moveset_save(ms);
+}
+/* a step of the list: moved, deleted, its wait changed, listened to */
+static void ms_cue_op(int row, int op) {
+    Moveset *ms = ms_cur();
+    const CueList *now = ms_cues_now(ms, g_ms_slot);
+    if (row < 0 || row >= now->n) return;
+    if (op == CUEOP_SELECT) { g_ms_cue_sel = g_ms_cue_sel == row ? -1 : row; return; }
+    if (op == CUEOP_LISTEN) {
+        const SoundCue *c = &now->c[row];
+        const char *f = c->type == CUE_SWING ? pool_pick(moveset_sounds(ms), POOL_SWING) : c->file;
+        if (f && f[0]) audio_preview(f);
+        g_ms_cue_sel = row;
+        return;
+    }
+    CueList *l = ms_own_cues(ms);
+    SoundCue tmp;
+    switch (op) {
+        case CUEOP_UP: if (row > 0) { tmp = l->c[row - 1]; l->c[row - 1] = l->c[row]; l->c[row] = tmp; g_ms_cue_sel = row - 1; } break;
+        case CUEOP_DOWN: if (row < l->n - 1) { tmp = l->c[row + 1]; l->c[row + 1] = l->c[row]; l->c[row] = tmp; g_ms_cue_sel = row + 1; } break;
+        case CUEOP_DEL:
+            memmove(&l->c[row], &l->c[row + 1], sizeof(SoundCue) * (size_t)(l->n - row - 1));
+            l->n--;
+            if (g_ms_cue_sel >= l->n) g_ms_cue_sel = l->n - 1;
+            break;
+        default: {
+            static const float d[4] = { -0.1f, -0.01f, 0.01f, 0.1f };
+            SoundCue *c = &l->c[row];
+            c->sec += d[op - CUEOP_M1];
+            if (c->sec < 0.0f) c->sec = 0.0f;
+            if (c->sec > 10.0f) c->sec = 10.0f;
+            c->sec = roundf(c->sec * 100.0f) / 100.0f;
+            g_ms_cue_sel = row;
+        }
+    }
+    moveset_save(ms);
+}
+/* "Play with sounds": the blow from its start with its sounds; every step of the game */
+static void ms_cue_play(void) {
+    Moveset *ms = ms_cur();
+    cue_start(&g_ms_cplay, ms_cues_now(ms, g_ms_slot));
+    g_ms_cplay_t = 0.0f;
+    g_ms_preview = 0;
+    cue_run(&g_ms_cplay, 0.0f, moveset_sounds(ms));
+}
+static void ms_cue_tick(float dt) {
+    if (!g_ms_view || g_ms_cplay_t < 0.0f) return;
+    Moveset *ms = ms_cur();
+    g_ms_cplay_t += dt;
+    cue_run(&g_ms_cplay, dt, moveset_sounds(ms));
+    float dur = anim_lib_duration(moveset_clip(ms, g_ms_slot, NULL));
+    if (!g_ms_cplay.on && g_ms_cplay_t > dur + 0.75f) g_ms_cplay_t = -1.0f; /* over: the clip loops again */
+}
+static void ms_cue_label(const SoundCue *c, char *out, int n) {
+    if (c->type == CUE_WAIT) snprintf(out, n, "Wait %.2f s", c->sec);
+    else if (c->type == CUE_SWING) snprintf(out, n, "Swing sound (one of the pool's)");
+    else snprintf(out, n, "Sound: %s", sound_shown(c->file));
+}
 /* "Single Swords (weapon)", "Human", "none" */
 static void ms_preset_label(const Moveset *ms, int group, char *out, int n) {
     const char *v = group == PG_COMBAT ? ms->combat_preset : group == PG_SOUND ? ms->sound_preset : ms->walk_preset;
@@ -8970,6 +9184,15 @@ static void ms_action(int id) {
     switch (id) {
         case B_MS_CLOSE: g_ms_view = 0; audio_preview(NULL); return;
         case B_MS_TAB_WALK: ms_set_tab(PG_WALK); return;
+        case B_MS_CUES: g_ms_cues = 1; g_ms_cue_sel = -1; g_ms_cplay_t = -1.0f; ms_list_mode(0); return;
+        case B_MS_CUE_DONE: g_ms_cues = 0; g_ms_cplay_t = -1.0f; ms_list_mode(0); return;
+        case B_MS_CUE_SOUND:
+            if (g_ms_sounds && g_ms_n > 0 && !ms_row_header(g_ms_sel)) ms_cue_insert(CUE_SOUND, 0.0f, g_ms_snd[g_ms_list[g_ms_sel]].name);
+            return;
+        case B_MS_CUE_SWING: ms_cue_insert(CUE_SWING, 0.0f, NULL); return;
+        case B_MS_CUE_WAIT: ms_cue_insert(CUE_WAIT, 0.1f, NULL); return;
+        case B_MS_CUE_PLAY: ms_cue_play(); return;
+        case B_MS_CUE_RESET: ms->has_cues[g_ms_slot - MC_FIRST_COMBAT] = 0; g_ms_cue_sel = -1; moveset_save(ms); return;
         case B_MS_TAB_COMBAT: ms_set_tab(PG_COMBAT); return;
         case B_MS_TAB_SOUND: ms_set_tab(PG_SOUND); return;
         case B_MS_TAB_PRESET: { /* this tab's preset: choose, save, delete */
@@ -8999,7 +9222,7 @@ static void ms_action(int id) {
             if (g_ms_tab == PG_SOUND) ms->own_sounds = 0;
             else {
                 for (int k = 0; k < MC_COUNT; k++) if (slot_group(k) == g_ms_tab) { ms->slot[k][0] = 0; ms->has_step[k] = 0; }
-                if (g_ms_tab == PG_COMBAT) ms->combat_ovr_for[0] = 0;
+                if (g_ms_tab == PG_COMBAT) { ms->combat_ovr_for[0] = 0; memset(ms->has_cues, 0, sizeof(ms->has_cues)); }
             }
             moveset_save(ms);
             ms_select_slot(g_ms_slot);
@@ -9074,6 +9297,7 @@ static void ms_action(int id) {
                 moveset_save(ms); ms_list_mode(0);
                 return;
             }
+            if (g_ms_sounds && g_ms_cues) { ms_action(B_MS_CUE_SOUND); return; }
             if (g_ms_sounds) {
                 const SoundRow *r = &g_ms_snd[g_ms_list[g_ms_sel]];
                 if (!r->header) { pool_add(ms_own_sounds(ms), g_ms_pool, r->name); moveset_save(ms); }
@@ -9082,6 +9306,7 @@ static void ms_action(int id) {
             ms_assign(g_ms_list[g_ms_sel]);
             return;
     }
+    if (id >= B_MS_CUE_ROW && id < B_MS_CUE_ROW + CUE_MAX * 10) { ms_cue_op((id - B_MS_CUE_ROW) / 10, (id - B_MS_CUE_ROW) % 10); return; }
     if (id >= B_MS_POOL && id < B_MS_POOL + POOL_COUNT * 100) {
         int pool = (id - B_MS_POOL) / 100, op = (id - B_MS_POOL) % 100;
         const SoundPools *cur = moveset_sounds(ms);
@@ -9135,6 +9360,11 @@ static void ms_layout(HWND hwnd) {
         ui_add(B_MS_USE, rx, by, bw, 26, g_ms_items == 2 ? "Hold this shield" : "Hold this weapon", "Enter", "The item selected in the list is equipped (double-click does the same).", 0, g_ms_n > 0, 0);
         ui_add(B_MS_ITEM_NONE, rx + bw + 6, by, bw, 26, "Nothing", "", "It holds nothing there.", 0, 1, 0);
         ui_add(B_MS_LIST_BACK, rx + 2 * (bw + 6), by, bw, 26, "Back", "Esc", "The list shows the tab's again.", 0, 1, 0);
+    } else if (g_ms_cues) {
+        ui_add(B_MS_CUE_SOUND, rx, by, bw * 2 + 6, 26, g_ms_cue_sel >= 0 ? "Add this sound after the selected step" : "Add this sound at the end", "Enter",
+               "The sound selected in the list below joins the blow's sounds (double-click does the same). Space: listen.", 0, g_ms_n > 0, 0);
+        ui_add(B_MS_CUE_DONE, rx + 2 * (bw + 6), by, bw, 26, "Done", "Esc", "Back to the attacks.", 0, 1, 0);
+        list_top = by + 40;
     } else if (g_ms_tab == PG_SOUND) {
         snprintf(t, sizeof(t), "Add to %s", g_ms_pool == POOL_SWING ? "swings" : g_ms_pool == POOL_HIT ? "hits" : "grunts");
         ui_addf(B_MS_USE, rx, by, bw * 2, 26, t, "Enter", "The sound selected in the list joins the chosen pool (double-click does the same). Space: listen.", 0, g_ms_n > 0, 0);
@@ -9153,6 +9383,13 @@ static void ms_layout(HWND hwnd) {
             ui_add(B_MS_STEP_M, rx, sy, 34, 24, "-", "", "A shorter step (0.25 hitbox diameter); below 0 it steps back.", 0, 1, 0);
             ui_addf(B_MS_STEP_PRESET, rx + 40, sy, rw - 80, 24, t, "", "How far it moves with the blow, in diameters of its hitbox (< 0: backward). Click: back to the preset's.", changed, 1, 1);
             ui_add(B_MS_STEP_P, rx + rw - 34, sy, 34, 24, "+", "", "A longer step (0.25 hitbox diameter).", 0, 1, 0);
+            sy += 30;
+            const CueList *cl = ms_cues_now(ms, g_ms_slot);
+            int nsnd = 0; for (int i = 0; i < cl->n; i++) nsnd += cl->c[i].type != CUE_WAIT;
+            if (!moveset_cues_w(ms, g_ms_slot, ms->right_hand)) snprintf(t, sizeof(t), "Sounds: a swing at once (default)  --  edit...");
+            else snprintf(t, sizeof(t), "Sounds: %d sound%s over %.2f s%s  --  edit...", nsnd, nsnd == 1 ? "" : "s", cue_time(cl, cl->n), ms_cues_changed(ms, g_ms_slot) ? "  (changed)" : "");
+            ui_addf(B_MS_CUES, rx, sy, rw, 24, t, "", "The sounds of this blow, like a little script: sounds and waits in order from its start, to match the animation.",
+                    ms_cues_changed(ms, g_ms_slot), 1, 1);
             list_top = sy + 24 + 30;
         }
     }
@@ -9189,6 +9426,36 @@ static void ms_layout(HWND hwnd) {
                 ui_add(B_MS_CHANCE_P, gx + gwid - 46, py + ph - 42, 34, 26, "+", "", "A grunt more often.", 0, !sp || sp->grunt_chance < 100, 0);
             }
         }
+        return;
+    }
+    if (g_ms_tab == PG_COMBAT && g_ms_cues) { /* the blow's sounds: a ruler, then its steps as rows */
+        const CueList *cl = ms_cues_now(ms, g_ms_slot);
+        SetRect(&g_ms_ruler_rc, gx + 12, gy + 62, gx + gwid - 12, gy + 130);
+        int rowh = 30, ry = gy + 170, x0 = gx + 12, x1 = gx + gwid - 12;
+        for (int i = 0; i < cl->n; i++) {
+            int y = ry + i * rowh;
+            if (y + rowh > gy + gh - 52) break;
+            const SoundCue *c = &cl->c[i];
+            int bid = B_MS_CUE_ROW + i * 10, xr = x1;
+            ui_add(bid + CUEOP_DEL, xr - 30, y, 30, 26, "x", "Del", "Remove this step.", 0, 1, 0); xr -= 34;
+            ui_add(bid + CUEOP_DOWN, xr - 30, y, 30, 26, "v", "", "Move it down (later).", 0, i < cl->n - 1, 0); xr -= 34;
+            ui_add(bid + CUEOP_UP, xr - 30, y, 30, 26, "^", "", "Move it up (sooner).", 0, i > 0, 0); xr -= 42;
+            if (c->type == CUE_WAIT) {
+                static const char *lab[4] = { "-0.1", "-.01", "+.01", "+0.1" };
+                for (int k = 3; k >= 0; k--) { ui_add(bid + CUEOP_M1 + k, xr - 44, y, 44, 26, lab[k], "", "A longer / shorter wait (seconds).", 0, 1, 0); xr -= 48; }
+            } else { ui_add(bid + CUEOP_LISTEN, xr - 70, y, 70, 26, "Listen", "", "Hear it.", 0, 1, 0); xr -= 74; }
+            snprintf(t, sizeof(t), "%5.2f s    ", cue_time(cl, i));
+            ms_cue_label(c, t + strlen(t), (int)(sizeof(t) - strlen(t)));
+            ui_addf(bid + CUEOP_SELECT, x0, y, xr - x0 - 4, 26, t, "", "Select it: new steps go after it. Click again: new steps go at the end.", i == g_ms_cue_sel, 1, c->type == CUE_WAIT ? 1 : 3);
+        }
+        int bw6 = (gwid - 24 - 5 * 6) / 6, byy = gy + gh - 40;
+        ui_add(B_MS_CUE_SOUND, gx + 12, byy, bw6, 28, "+ Sound", "", "The sound selected in the list (right) is added after the selected step (or at the end).", 0, g_ms_n > 0, 0);
+        ui_add(B_MS_CUE_SWING, gx + 12 + (bw6 + 6), byy, bw6, 28, "+ Swing (pool)", "", "One of the swing sounds of its sound pool (Sounds tab), at random.", 0, 1, 0);
+        ui_add(B_MS_CUE_WAIT, gx + 12 + 2 * (bw6 + 6), byy, bw6, 28, "+ Wait", "", "A pause before the next sounds (0.10 s; change it with its buttons).", 0, 1, 0);
+        ui_add(B_MS_CUE_PLAY, gx + 12 + 3 * (bw6 + 6), byy, bw6, 28, g_ms_cplay_t >= 0.0f ? "Playing..." : "Play with sounds", "",
+               "The blow plays once from its start on the character, with its sounds -- to check they match.", g_ms_cplay_t >= 0.0f, 1, 0);
+        ui_add(B_MS_CUE_RESET, gx + 12 + 4 * (bw6 + 6), byy, bw6, 28, "Back to preset", "", "Forget this blow's changes: its preset's sounds again.", 0, ms_cues_changed(ms, g_ms_slot), 0);
+        ui_add(B_MS_CUE_DONE, gx + 12 + 5 * (bw6 + 6), byy, bw6, 28, "Done", "Esc", "Back to the attacks.", 0, 1, 0);
         return;
     }
     int nw = gwid / 5, nh = 48;
@@ -9278,6 +9545,52 @@ static void ms_paint(HWND hwnd, HDC hdc) {
                 ui_text(hdc, r->right - 150, r->bottom - 34, 100, 26, t, SVL_VALUE, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
             }
         }
+    } else if (g_ms_tab == PG_COMBAT && g_ms_cues) {
+        const CueList *cl = ms_cues_now(ms, g_ms_slot);
+        int sclip = moveset_clip(ms, g_ms_slot, NULL);
+        float dur = sclip >= 0 ? anim_lib_duration(sclip) : 0.0f, total = cue_time(cl, cl->n);
+        float span = fmaxf(fmaxf(dur, total) + 0.1f, 0.5f);
+        RECT *g = &g_ms_graph_rc;
+        SelectObject(hdc, ui_font(17, 1));
+        snprintf(t, sizeof(t), "SOUNDS OF \"%s\"", MOVE_SLOT_LABEL[g_ms_slot]);
+        ui_text(hdc, g->left + 12, g->top + 8, 600, 24, t, RGB(255, 225, 120), SV_ONE);
+        SelectObject(hdc, ui_font(13, 0));
+        snprintf(t, sizeof(t), "%s (%.2f s).  In order from the start of the blow: sounds play at once, waits delay the ones after them.%s",
+                 sclip >= 0 ? anim_lib_name(sclip) : "no animation", dur, ms_cues_changed(ms, g_ms_slot) ? "  Changed for this character." : "");
+        ui_text(hdc, g->left + 12, g->top + 34, g->right - g->left - 24, 20, t, RGB(190, 190, 200), SV_ONE);
+        /* the ruler: the clip (blue), each sound (gold), the time playing (red) */
+        RECT *r = &g_ms_ruler_rc;
+        int rw2 = r->right - r->left;
+        ui_fill(hdc, r, RGB(24, 24, 32)); ui_frame(hdc, r, RGB(70, 70, 84));
+        #define TX(tt) (r->left + (int)((tt) / span * rw2))
+        RECT cb = { r->left + 1, r->top + 28, TX(dur), r->top + 40 };
+        if (dur > 0) ui_fill(hdc, &cb, RGB(50, 90, 150));
+        SelectObject(hdc, ui_font(11, 0));
+        for (int k = 0; k * 0.1f <= span; k++) {
+            int x = TX(k * 0.1f), big = k % 5 == 0;
+            RECT tk = { x, r->bottom - (big ? 12 : 6), x + 1, r->bottom };
+            ui_fill(hdc, &tk, RGB(110, 110, 125));
+            if (big) { snprintf(t, sizeof(t), "%.1f", k * 0.1f); ui_text(hdc, x + 3, r->bottom - 16, 40, 14, t, RGB(130, 130, 145), SV_ONE); }
+        }
+        ui_text(hdc, TX(dur) + 4, r->top + 26, 120, 14, "clip ends", RGB(110, 150, 210), SV_ONE);
+        int lane = 0;
+        for (int i = 0; i < cl->n; i++) {
+            if (cl->c[i].type == CUE_WAIT) continue;
+            int x = TX(cue_time(cl, i));
+            COLORREF col = i == g_ms_cue_sel ? RGB(255, 240, 150) : RGB(230, 180, 60);
+            RECT ln = { x, r->top + 2, x + 2, r->bottom - 2 };
+            ui_fill(hdc, &ln, col);
+            char nm[64];
+            if (cl->c[i].type == CUE_SWING) snprintf(nm, sizeof(nm), "swing");
+            else { snprintf(nm, sizeof(nm), "%s", sound_shown(cl->c[i].file)); char *dot = strrchr(nm, '.'); if (dot) *dot = 0; }
+            ui_text(hdc, x + 4, r->top + 2 + (lane % 2) * 12, 140, 13, nm, col, SV_ONE);
+            lane++;
+        }
+        if (g_ms_cplay_t >= 0.0f) { int x = TX(fminf(g_ms_cplay_t, span)); RECT ph = { x, r->top, x + 2, r->bottom }; ui_fill(hdc, &ph, RGB(255, 80, 70)); }
+        #undef TX
+        SelectObject(hdc, ui_font(12, 1));
+        ui_text(hdc, g->left + 12, g->top + 146, 400, 16, "STEPS (TIME  -  WHAT)", SVL_SECTION, SV_ONE);
+        if (cl->n == 0) { SelectObject(hdc, ui_font(13, 0)); ui_text(hdc, g->left + 12, g->top + 172, 500, 20, "(no sound: the blow is silent)", RGB(150, 150, 160), SV_ONE); }
     } else if (g_ms_tab == PG_COMBAT) {
         RECT mode = { g_ms_graph_rc.left + 20, CY(MC_SW_UP) - 70, g_ms_graph_rc.left + 20 + (n[MC_ATK1].right - n[MC_ATK1].left), CY(MC_SW_UP) - 22 };
         ui_fill(hdc, &mode, RGB(52, 30, 30)); ui_frame(hdc, &mode, RGB(200, 100, 90));
@@ -9345,7 +9658,9 @@ static void ms_paint(HWND hwnd, HDC hdc) {
         const char *tried = g_ms_items && g_ms_n > 0 ? g_item_names[g_ms_list[g_ms_sel]] : NULL;
         const CharModel *held = g_ms_items == 1 && tried ? item_held(tried, 0) : model_right_hand(g_ms_model);
         const CharModel *shield = g_ms_items == 2 && tried ? item_model(tried) : model_left_shield(g_ms_model);
-        render_char_view(g_ms_model, held, shield, clip, dur > 0 ? fmodf(g_ms_t, dur) : 0.0f, px, W, H, ANIM_DEFAULT_YAW + g_ms_t * 0.25f, 0.15f, 1.0f, 1, 1);
+        float ct = dur > 0 ? fmodf(g_ms_t, dur) : 0.0f;
+        if (g_ms_cplay_t >= 0.0f) ct = dur > 0 ? fminf(g_ms_cplay_t, dur - 0.001f) : 0.0f; /* once, from its start */
+        render_char_view(g_ms_model, held, shield, clip, ct, px, W, H, ANIM_DEFAULT_YAW + g_ms_t * 0.25f, 0.15f, 1.0f, 1, 1);
         blit_pixels(hdc, g_ms_stage_rc.left, g_ms_stage_rc.top, W, H, px);
     }
     ui_frame(hdc, &g_ms_stage_rc, RGB(60, 60, 70));
@@ -9353,13 +9668,18 @@ static void ms_paint(HWND hwnd, HDC hdc) {
     snprintf(t, sizeof(t), "%s%s", g_ms_preview ? "Trying: " : "", clip >= 0 ? anim_lib_name(clip) : "(no animation: rest pose)");
     ui_text(hdc, g_ms_stage_rc.left + 12, g_ms_stage_rc.top + 8, W - 24, 22, t, g_ms_preview ? RGB(255, 210, 90) : RGB(255, 255, 255), SV_ONE);
     int ry = g_ms_stage_rc.bottom + 6;
-    if (g_ms_tab != PG_SOUND && !g_ms_items) {
+    if (g_ms_tab != PG_SOUND && !g_ms_items && !g_ms_cues) {
         SelectObject(hdc, ui_font(15, 1));
         ui_text(hdc, g_ms_stage_rc.left, ry, W, 20, MOVE_SLOT_LABEL[g_ms_slot], RGB(255, 230, 90), SV_ONE);
         SelectObject(hdc, ui_font(13, 0));
         snprintf(t, sizeof(t), "%s  Now: %s%s", MOVE_SLOT_DESC[g_ms_slot], slot_clip >= 0 ? anim_lib_name(slot_clip) : "nothing",
                  how == 0 ? " (preset)" : how == 1 ? " (changed)" : " (no animation)");
         ui_text(hdc, g_ms_stage_rc.left, ry + 22, W, 32, t, RGB(200, 200, 205), DT_LEFT | DT_WORDBREAK | DT_END_ELLIPSIS);
+    } else if (g_ms_cues) {
+        SelectObject(hdc, ui_font(15, 1));
+        ui_text(hdc, g_ms_stage_rc.left, ry, W, 20, MOVE_SLOT_LABEL[g_ms_slot], RGB(255, 230, 90), SV_ONE);
+        SelectObject(hdc, ui_font(13, 0));
+        ui_text(hdc, g_ms_stage_rc.left, ry + 22, W, 32, "Space or a second click: listen. Enter or a double-click: add it to the blow's sounds.", RGB(200, 200, 205), DT_LEFT | DT_WORDBREAK);
     } else if (g_ms_items) {
         SelectObject(hdc, ui_font(15, 1));
         ui_text(hdc, g_ms_stage_rc.left, ry, W, 20, g_ms_items == 2 ? "Equipped shield" : "Equipped weapon", RGB(255, 230, 90), SV_ONE);
@@ -9456,6 +9776,10 @@ static int ms_key(int vk) {
         return 1;
     }
     if (g_ms_items && vk == VK_ESCAPE) { ms_list_mode(0); return 1; }
+    if (g_ms_cues) {
+        if (vk == VK_ESCAPE) { ms_action(B_MS_CUE_DONE); return 1; }
+        if (vk == VK_DELETE && g_ms_cue_sel >= 0) { ms_cue_op(g_ms_cue_sel, CUEOP_DEL); return 1; }
+    }
     if (g_ms_sounds && vk == VK_SPACE) { /* listen */
         if (g_ms_n > 0 && !ms_row_header(g_ms_sel)) { if (audio_preview_playing()) audio_preview(NULL); else audio_preview(g_ms_snd[g_ms_list[g_ms_sel]].name); }
         return 1;
@@ -9864,6 +10188,7 @@ static void game_tick(HWND hwnd) {
             for (int k = 0; k < MAX_ACTORS; k++) {
                 if (!g_actors[k].used) continue;
                 actor_begin(&g_actors[k]); need_repaint |= advance_character((float)dt); actor_end();
+                actor_cue_tick(&g_actors[k], (float)dt);
             }
         } else need_repaint = advance_player(dt);
         if (!frozen && overlays_tick((float)dt)) need_repaint = 1;
@@ -9872,7 +10197,7 @@ static void game_tick(HWND hwnd) {
         if (radial_tick((float)dt)) need_repaint = 1;
         guard_tick();
         if (g_anim_view) { if (!g_anim_paused) g_anim_t += (float)dt * g_anim_speed; need_repaint = 1; }
-        if (g_ms_view) g_ms_t += (float)dt;
+        if (g_ms_view) { g_ms_t += (float)dt; ms_cue_tick((float)dt); }
         if (g_script_view) g_ch_t += (float)dt;
         static int last_run_row = -1;
         int run_row = script_playing() ? g_run.row : -1;

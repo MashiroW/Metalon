@@ -1578,3 +1578,12 @@ Validation, before removing the old data:
   deleting asks first. Sound pools: swing, hit, grunt (+ chance).
 - Scripts: Camera action (target, zoom, slide time); per-room camera
   zoom setting. The view zoom is applied in get_view_window.
+
+## 2026-09-30 -- Blow sound timelines, animation speed
+
+- Script "Animate character": Loop until replaced / Back to normal, and a
+  speed of its own (or the game's animation speed).
+- Combat slots: a list of sound steps per blow (sound, swing of the
+  pool, wait), timed in animation seconds; edited in the moveset screen
+  with a ruler and a synced preview; stored in combat presets
+  (`cues` / `cue` lines) and per character (`own_cue`).
