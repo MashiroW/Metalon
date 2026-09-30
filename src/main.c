@@ -8467,6 +8467,7 @@ enum {
     B_SV_TRACK = 500,   /* + track * 8 + op (0 listen, 1 loop, 2 up, 3 down, 4 remove) */
     B_SV_STOPREF = 600, /* + index in the script's sounds / ambiences */
     B_SV_ACTOR = 700,   /* + index: 0 David, then the script's placed characters */
+    B_SV_ACTOR_MENU = 780, /* the character of an action: the menu of all of them */
     B_SV_OVROW = 1000,  /* + entry * 8 + op (0 select, 1 mode, 2 frame -, 3 frame +) */
     B_SV_RM_DOOR = 1200, /* + index: 0 = where he'd spawn, then the target room's connectors */
     B_SV_RM_SCRIPT = 1300, /* + index: 0 = none, then the target room's scripts */
@@ -9798,6 +9799,28 @@ static void sv_action(HWND hwnd, int id) {
         case B_SV_AN_LOOP: a->anim_mode = ANIM_LOOP; break;
         case B_SV_AN_FOLLOW: a->speed = a->speed > 0.0f ? 0.0f : 1.0f; break;
         case B_SV_AN_FREEZE: a->freeze = !a->freeze; break;
+        case B_SV_ACTOR_MENU: {
+            if (a->type != ACT_MOVE && a->type != ACT_ANIM && a->type != ACT_SPEAK && a->type != ACT_CHAR) return;
+            int ids[64], rows[64], n = sv_actor_list(s, ids, rows, 64);
+            HMENU m = CreatePopupMenu();
+            AppendMenuA(m, MF_STRING | MF_GRAYED, 0, "The character of this action:");
+            AppendMenuA(m, MF_SEPARATOR, 0, NULL);
+            for (int k = 0; k < n; k++) {
+                char lab[128];
+                if (ids[k] == 0) snprintf(lab, sizeof(lab), "David");
+                else { ScriptAction *p = script_find(s, ids[k], NULL, NULL); snprintf(lab, sizeof(lab), "%s  (placed row %d)%s", p && p->model[0] ? p->model : "?", rows[k] + 1, rows[k] >= g_sv_row ? "  -- a later row" : ""); }
+                AppendMenuA(m, MF_STRING | (a->actor == ids[k] ? MF_CHECKED : 0) | ((k % 30 == 0 && k) ? MF_MENUBARBREAK : 0), 10 + k, lab);
+            }
+            POINT pt; GetCursorPos(&pt);
+            int cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_NONOTIFY, pt.x, pt.y, 0, hwnd, NULL);
+            DestroyMenu(m);
+            if (cmd < 10 || cmd - 10 >= n || a->actor == ids[cmd - 10]) return;
+            a->actor = ids[cmd - 10];
+            if (a->type == ACT_ANIM) { a->file[0] = 0; a->npool = 0; } /* another skeleton */
+            sv_changed();
+            if (a->type == ACT_SPEAK) sv_ask_portrait(a);
+            return;
+        }
         case B_SV_TRIM_IN_M: case B_SV_TRIM_IN_P: case B_SV_TRIM_OUT_M: case B_SV_TRIM_OUT_P: {
             float full;
             if (!action_media_length(a, &full)) return;
@@ -10090,13 +10113,20 @@ static int sv_actor_buttons(Script *s, ScriptAction *a, int ix, int iy, int iw, 
     char t[160];
     svl(ix, iy, iw, 16, 1, SVL_SECTION, SV_ONE, "CHARACTER");
     iy += 22;
-    int ids[64], rows[64];
-    int n = sv_actor_list(s, ids, rows, 64);
-    for (int k = 0; k < n && k < 8; k++) {
-        if (ids[k] == 0) snprintf(t, sizeof(t), "David");
-        else { ScriptAction *p = script_find(s, ids[k], NULL, NULL); snprintf(t, sizeof(t), "%s  (placed row %d)", p && p->model[0] ? p->model : "?", rows[k] + 1); }
-        ui_addf(B_SV_ACTOR + k, ix, iy, iw, rh - 2, t, "", "The character of this action. Placed characters must be brought in by an earlier row.", a->actor == ids[k], 1, 3);
-        iy += rh + 3;
+    /* the one chosen; the button opens the list of all of them (David + every character the script places) */
+    int prow = -1;
+    ScriptAction *p = a->actor ? script_find(s, a->actor, &prow, NULL) : NULL;
+    if (a->actor == 0) snprintf(t, sizeof(t), "David");
+    else if (!p) snprintf(t, sizeof(t), "(its Place action is gone -- choose)");
+    else snprintf(t, sizeof(t), "%s  (placed row %d)", p->model[0] ? p->model : "?", prow + 1);
+    size_t l = strlen(t);
+    snprintf(t + l, sizeof(t) - l, "   v");
+    ui_addf(B_SV_ACTOR_MENU, ix, iy, iw, rh, t, "", "The character of this action: click to choose among David and every character this script places.", 1, 1, 1);
+    iy += rh + 3;
+    int zone = script_zone_at(s, g_sv_row) >= 0;
+    if (a->actor && p && prow >= g_sv_row && !(zone && script_zone_at(s, prow) == script_zone_at(s, g_sv_row))) {
+        svl(ix, iy, iw, 18, 0, RGB(255, 150, 120), SV_ONE, "placed by a later row: it won't be there yet");
+        iy += 20;
     }
     return iy + 10;
 }
