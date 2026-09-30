@@ -191,8 +191,10 @@ static RoomCamera g_char_cam; /* roll-free variant of g_room_cam, David's mesh p
    3D blockout seen from a camera flown anywhere -- no picture -- so the
    points of a connector (or a script) can be put where the room's own
    camera doesn't look. It starts as the room's camera (same lens), then:
-   W A S D / arrows to fly, Q / E down / up, Shift faster, the right button
-   dragged to look around, the wheel forward / back. F4 / Esc: back. */
+   the keys where W A S D are on a QWERTY keyboard (Z Q S D on an AZERTY
+   one: by their place, whatever the layout) / arrows to fly, the ones of Q
+   / E (A / E) down / up, Shift faster, the right button dragged to look
+   around, the wheel forward / back. F4 / Esc: back. */
 static int g_free_cam = 0;
 static RoomCamera g_fcam;
 static float g_fcam_yaw = 0.0f, g_fcam_pitch = 0.0f;
@@ -200,6 +202,23 @@ static int g_fcam_look = 0, g_fcam_lx = 0, g_fcam_ly = 0;
 static int g_fcam_resume = 0; /* it was on when a script's point was picked: the next pick flies from there again */
 static int fcam_allowed(void); /* the editor, or picking a script character's point (not a picture point) */
 static const RoomCamera *view_cam(void) { return g_free_cam ? &g_fcam : &g_room_cam; }
+/* the flying keys, by their place on the keyboard (scan codes): forward, left, back, right, down, up */
+enum { FK_FWD, FK_LEFT, FK_BACK, FK_RIGHT, FK_DOWN, FK_UP, FK_COUNT };
+static UINT fcam_key(int k) {
+    static const UINT scan[FK_COUNT] = { 0x11, 0x1E, 0x1F, 0x20, 0x10, 0x12 };
+    UINT vk = MapVirtualKeyA(scan[k], 3 /* MAPVK_VSC_TO_VK_EX */);
+    static const char qwerty[FK_COUNT] = { 'W', 'A', 'S', 'D', 'Q', 'E' };
+    return vk ? vk : (UINT)qwerty[k];
+}
+static int fcam_is_key(UINT vk) { for (int k = 0; k < FK_COUNT; k++) if (fcam_key(k) == vk) return 1; return 0; }
+/* "Z Q S D / arrows fly, A / E down / up" -- the letters of this keyboard */
+static const char *fcam_keys_text(void) {
+    static char t[96];
+    char c[FK_COUNT];
+    for (int k = 0; k < FK_COUNT; k++) { UINT ch = MapVirtualKeyA(fcam_key(k), 2 /* MAPVK_VK_TO_CHAR */) & 0x7FFF; c[k] = ch >= 32 && ch < 127 ? (char)toupper((int)ch) : '?'; }
+    snprintf(t, sizeof(t), "%c %c %c %c / arrows fly, %c / %c down / up", c[FK_FWD], c[FK_LEFT], c[FK_BACK], c[FK_RIGHT], c[FK_DOWN], c[FK_UP]);
+    return t;
+}
 static void fcam_update(void) {
     float cp = cosf(g_fcam_pitch), f[3] = { sinf(g_fcam_yaw) * cp, sinf(g_fcam_pitch), cosf(g_fcam_yaw) * cp };
     float r[3] = { -f[2], 0.0f, f[0] }, rl = sqrtf(r[0] * r[0] + r[2] * r[2]);
@@ -222,15 +241,15 @@ static void fcam_toggle(void) {
     g_fcam_pitch = asinf(fy < -1.0f ? -1.0f : fy > 1.0f ? 1.0f : fy);
     fcam_update();
     g_free_cam = 1;
-    snprintf(g_status, sizeof(g_status), "free camera: W A S D / arrows fly, Q / E down / up, Shift faster, right button dragged: look, wheel: forward / back. F4 / Esc: back");
+    snprintf(g_status, sizeof(g_status), "free camera: %s, Shift faster, right button dragged: look, wheel: forward / back. F4 / Esc: back", fcam_keys_text());
 }
 /* every game step: the keys held fly it. 1 if it moved */
 static int fcam_tick(float dt) {
     if (!g_free_cam || !GetFocus()) return 0; /* (the keys: this window's) */
     #define KEY(k) ((GetKeyState(k) & 0x8000) != 0)
-    float fwd = (float)(KEY('W') || KEY(VK_UP)) - (float)(KEY('S') || KEY(VK_DOWN));
-    float side = (float)(KEY('D') || KEY(VK_RIGHT)) - (float)(KEY('A') || KEY(VK_LEFT));
-    float up = (float)KEY('E') - (float)KEY('Q');
+    float fwd = (float)(KEY(fcam_key(FK_FWD)) || KEY(VK_UP)) - (float)(KEY(fcam_key(FK_BACK)) || KEY(VK_DOWN));
+    float side = (float)(KEY(fcam_key(FK_RIGHT)) || KEY(VK_RIGHT)) - (float)(KEY(fcam_key(FK_LEFT)) || KEY(VK_LEFT));
+    float up = (float)KEY(fcam_key(FK_UP)) - (float)KEY(fcam_key(FK_DOWN));
     float speed = KEY(VK_SHIFT) ? 24.0f : 8.0f;
     #undef KEY
     if (fwd == 0.0f && side == 0.0f && up == 0.0f) return 0;
@@ -619,6 +638,7 @@ static void correct_camera_roll(float q[4], float native_roll_deg) {
    camera's depth buffer is the right one to test against. */
 static int char_project(const float anchor[3], const float world[3], float *px, float *py, float *pz) {
     int w = (int)g_hdr.width, h = (int)g_hdr.height;
+    if (g_free_cam) return camera_world_to_pixel_z(&g_fcam, world, w, h, px, py, pz); /* the free camera: straight through it */
     if (!camera_world_to_pixel_z(&g_char_cam, world, w, h, px, py, pz)) return 0;
     float ax_r, ay_r, az_r, ax_c, ay_c, az_c;
     if (camera_world_to_pixel_z(&g_room_cam, anchor, w, h, &ax_r, &ay_r, &az_r) &&
@@ -1630,47 +1650,6 @@ static int advance_character(float dt) {
     return 1;
 }
 
-/* Fills a triangle directly into g_render_pixels, sampling the
-   character's texture (affine per-triangle UV interpolation, matching the
-   Python prototype's draw_textured_triangle) instead of a flat color. */
-static void fill_triangle_textured(const CharModel *m, float x0, float y0, float x1, float y1, float x2, float y2,
-                                    float z0, float z1, float z2,
-                                    float u0, float v0, float u1, float v1, float u2, float v2,
-                                    float *depth_buf) {
-    int minx = (int)floorf(fminf(x0, fminf(x1, x2)));
-    int maxx = (int)ceilf(fmaxf(x0, fmaxf(x1, x2)));
-    int miny = (int)floorf(fminf(y0, fminf(y1, y2)));
-    int maxy = (int)ceilf(fmaxf(y0, fmaxf(y1, y2)));
-    if (minx < 0) minx = 0;
-    if (miny < 0) miny = 0;
-    if (maxx >= (int)g_hdr.width) maxx = (int)g_hdr.width - 1;
-    if (maxy >= (int)g_hdr.height) maxy = (int)g_hdr.height - 1;
-    float denom = (y1 - y2) * (x0 - x2) + (x2 - x1) * (y0 - y2);
-    if (fabsf(denom) < 1e-6f) return;
-    for (int py = miny; py <= maxy; py++) {
-        for (int px = minx; px <= maxx; px++) {
-            float fx = (float)px + 0.5f, fy = (float)py + 0.5f;
-            float w0 = ((y1 - y2) * (fx - x2) + (x2 - x1) * (fy - y2)) / denom;
-            float w1 = ((y2 - y0) * (fx - x2) + (x0 - x2) * (fy - y2)) / denom;
-            float w2 = 1.0f - w0 - w1;
-            if (w0 < -0.01f || w1 < -0.01f || w2 < -0.01f) continue;
-            size_t idx = (size_t)py * g_dib_stride + px;
-            /* perspective-correct: depth is linear in 1/z across the screen,
-               not in z (linear-z made large near triangles report depths
-               off by 10-60%, i.e. wrong surfaces winning the z-test --
-               measured on gno/eastower against an exact reference) */
-            float z = 1.0f / (w0 / z0 + w1 / z1 + w2 / z2);
-            if (depth_buf && z >= depth_buf[idx]) continue; /* occluded by room geometry or a nearer character triangle */
-            float u = (w0 * u0 / z0 + w1 * u1 / z1 + w2 * u2 / z2) * z;
-            float v = (w0 * v0 / z0 + w1 * v1 / z1 + w2 * v2 / z2) * z;
-            int iu = (int)u; if (iu < 0) iu = 0; if (iu >= m->tex_w) iu = m->tex_w - 1;
-            int iv = (int)v; if (iv < 0) iv = 0; if (iv >= m->tex_h) iv = m->tex_h - 1;
-            const uint8_t *tc = m->tex_rgb + ((size_t)iv * m->tex_w + iu) * 3;
-            g_render_pixels[idx] = ((uint32_t)tc[0] << 16) | ((uint32_t)tc[1] << 8) | tc[2];
-            if (depth_buf) depth_buf[idx] = z;
-        }
-    }
-}
 
 /* The pose of a character right now: the turn-start playing, else its
    walk / run / stand cycle (rest pose for a slot set to "no animation"). */
@@ -1734,32 +1713,6 @@ static int actor_project_item(Actor *a, int left, float *px_buf, float *py_buf, 
 }
 
 /* F3 debug view only: the characters rasterized into the 8-bit room frame. */
-static void render_3d_character(void) {
-    if (!g_has_3d_character) return;
-    static float px_buf[DAVID_MAX_VERTS], py_buf[DAVID_MAX_VERTS], z_buf[DAVID_MAX_VERTS];
-    static int visible[DAVID_MAX_VERTS];
-    for (int k = 0; k < MAX_ACTORS; k++) {
-        Actor *a = &g_actors[k];
-        if (!a->used) continue;
-        const CharModel *m = a->model;
-        actor_project(a, px_buf, py_buf, z_buf, visible);
-        /* the Z-buffer test in fill_triangle_textured handles self-occlusion,
-           the other characters AND the room geometry: draw order doesn't matter */
-        for (int pass = 0; pass < 4; pass++) {
-        if (pass > 0) { if (!actor_project_item(a, pass - 1, px_buf, py_buf, z_buf, visible)) continue; m = pass == 3 ? a->shield_m : pass == 2 ? a->item_l : a->item; } /* then what it holds */
-        for (int t = 0; t < m->index_count / 3; t++) {
-            int i0 = m->indices[t * 3], i1 = m->indices[t * 3 + 1], i2 = m->indices[t * 3 + 2];
-            if (!visible[i0] || !visible[i1] || !visible[i2]) continue;
-            fill_triangle_textured(m, px_buf[i0], py_buf[i0], px_buf[i1], py_buf[i1], px_buf[i2], py_buf[i2],
-                                    z_buf[i0], z_buf[i1], z_buf[i2],
-                                    m->uvs_px[i0][0], m->uvs_px[i0][1],
-                                    m->uvs_px[i1][0], m->uvs_px[i1][1],
-                                    m->uvs_px[i2][0], m->uvs_px[i2][1],
-                                    g_depth_buffer_char);
-        }
-        }
-    }
-}
 
 
 /* Two-pass "prefer front faces" depth rule (same rule as
@@ -4918,7 +4871,7 @@ static void ui_layout(HWND hwnd) {
     ui_add(B_FULL, x, y, half, h, g_is_fullscreen ? "Windowed" : "Fullscreen", "F11", "Switch between window and fullscreen (4:3 picture, tools in the side bars).", g_is_fullscreen, 1, 0);
     y += h + gap;
     ui_add(B_FREECAM, x, y, w, h, g_free_cam ? "Free camera: ON" : "Free camera", "F4",
-           "Scene editor / placing a script's character (its position, where it faces, where it goes): fly a camera anywhere in the room's 3D blockout (no picture), to put the points where the room's camera doesn't look. W A S D / arrows, Q / E, Shift; right button dragged: look; wheel. F4 / Esc: back.",
+           "Scene editor / placing a script's character (its position, where it faces, where it goes): fly a camera anywhere in the room's 3D blockout (no picture), to put the points where the room's camera doesn't look. The keys where W A S D / Q E are on a QWERTY keyboard (Z Q S D / A E on an AZERTY one) or the arrows, Shift; right button dragged: look; wheel. F4 / Esc: back.",
            g_free_cam, fcam_allowed(), 1);
     y += h + gap;
     ui_add(B_SCRIPTS, x, y, w, h, "Scripts...", "S", "This room's scripts (cutscenes): a grid of actions -- waits, music, sounds, ambiences, pictures, characters placed and moved. Play them from there.", 0, g_has_3d_character, 0);
@@ -5171,12 +5124,12 @@ static const char *wizard_step_text(char *buf, size_t n, const char **sub) {
     *sub = "";
     switch (g_wiz) {
         case WIZ_STEP:
-            *sub = g_free_cam ? "Click the floor where David walks to when this connector is clicked (green: where he can stand). Fly: W A S D, Q / E, Shift faster; look: right button dragged; F4: back to the picture."
-                              : "Click the floor where David walks to when this connector is clicked. It's also where he appears when he comes in through it. Only the green floor is accepted. Out of the picture? F4: free camera.";
+            { static char fb[300]; snprintf(fb, sizeof(fb), "Click the floor where David walks to when this connector is clicked (green: where he can stand). Fly: %s, Shift faster; look: right button dragged; F4: back to the picture.", fcam_keys_text());
+              *sub = g_free_cam ? fb : "Click the floor where David walks to when this connector is clicked. It's also where he appears when he comes in through it. Only the green floor is accepted. Out of the picture? F4: free camera."; }
             return g_wiz_other_side ? "Other side -- step 1/2: the doorstep" : "Connector -- step 1/3: the doorstep";
         case WIZ_ARRIVAL:
-            *sub = g_free_cam ? "Click where David walks to, right after coming in through this connector. Fly: W A S D, Q / E, Shift faster; look: right button dragged; F4: back."
-                              : "Click where David walks to, right after coming in through this connector. Out of the picture? F4: free camera.";
+            { static char fb[300]; snprintf(fb, sizeof(fb), "Click where David walks to, right after coming in through this connector. Fly: %s, Shift faster; look: right button dragged; F4: back.", fcam_keys_text());
+              *sub = g_free_cam ? fb : "Click where David walks to, right after coming in through this connector. Out of the picture? F4: free camera."; }
             return g_wiz_other_side ? "Other side -- step 2/2: the arrival point" : "Connector -- step 2/3: the arrival point";
         case WIZ_TARGET:
             *sub = "Pick the room this connector leads to in the list (type to filter, Enter).";
@@ -8462,8 +8415,9 @@ static const char *script_step_text(char *buf, size_t n, const char **sub) {
         snprintf(sb, sizeof(sb), "Click where the overlay's CENTRE goes (it's shown at its place now). Its position is the room's: every script uses it. Esc: cancel.");
         return "Overlays -- place an animation";
     }
-    const char *fc = g_free_cam ? "\nFree camera: W A S D / arrows fly, Q / E down / up, Shift faster, right button dragged: look, wheel: forward / back. F4: back to the picture."
-                                : "\nOut of the picture? F4: free camera.";
+    static char fcb[240];
+    snprintf(fcb, sizeof(fcb), "\nFree camera: %s, Shift faster, right button dragged: look, wheel: forward / back. F4: back to the picture.", fcam_keys_text());
+    const char *fc = g_free_cam ? fcb : "\nOut of the picture? F4: free camera.";
     if (g_sv_pick == SV_PICK_PLACE_POS) {
         snprintf(sb, sizeof(sb), "Click the floor where the character appears (the green floor). Esc: cancel.%s", fc);
         return "Script -- place a character: its position";
@@ -12616,7 +12570,7 @@ static void render_mesh_hires(const CharModel *m, float *vx, float *vy, const fl
     if (X1 >= W) X1 = W - 1;
     if (Y1 >= H) Y1 = H - 1;
     if (X0 > X1 || Y0 > Y1) return;
-    const float *room_depth = room_depth_cached();
+    const float *room_depth = (g_view_mode_3d || g_free_cam) ? g_depth_buffer : room_depth_cached();
     ensure_fg_mask();
     int fg = g_fg_any && !g_view_mode_3d && !g_free_cam;
     int RW = (int)g_hdr.width, RH = (int)g_hdr.height;
@@ -12687,6 +12641,34 @@ static void trails_draw(uint32_t *px, int W, int H, float sc);
 static void proj_models_draw(uint32_t *px, int W, int H, float sc, float *zb, uint32_t *zst, uint32_t stamp);
 static void fx_draw(uint32_t *px, int W, int H, float sc);
 static void orb_glow_draw(Actor *a, uint32_t *px, int W, int H, float sc);
+/* The characters a script places, as they'll stand (while one of its points
+   is picked): its PLACE actions with a position -- the one being placed
+   faces the mouse while its facing is given. Not in the room: drawn only. */
+static int pick_ghosts(Actor *out, int max) {
+    Script *s = sv_cur();
+    if (!g_sv_pick || !s || g_sv_pick == SV_PICK_CAMERA || g_sv_pick == SV_PICK_OVERLAY) return 0;
+    ScriptAction *cur = sv_cell(0);
+    int n = 0;
+    for (int r = 0; r < s->rows && n < max; r++)
+        for (int c = 0; c < s->cols && n < max; c++) {
+            ScriptAction *a = script_at(s, r, c);
+            if (a->type != ACT_PLACE || !a->has_pos || !a->model[0]) continue;
+            if (a == cur && g_sv_pick == SV_PICK_PLACE_POS) continue; /* being put somewhere else */
+            CharModel *m = model_by_name(a->model);
+            if (!m) continue;
+            Actor *g = &out[n++];
+            actor_reset(g, m, a->id);
+            memcpy(g->pos, a->pos, sizeof(g->pos));
+            g->facing = a->facing;
+            if (a == cur && g_sv_pick == SV_PICK_PLACE_FACE) { /* toward the mouse */
+                int rx, ry; float to[3];
+                client_to_room_point(g_mouse_client_x, g_mouse_client_y, &rx, &ry);
+                if (pick_floor_point((float)rx, (float)ry, to) && ((to[0] - a->pos[0]) * (to[0] - a->pos[0]) + (to[2] - a->pos[2]) * (to[2] - a->pos[2])) > 1e-4f)
+                    g->facing = atan2f(to[0] - a->pos[0], to[2] - a->pos[2]);
+            }
+        }
+    return n;
+}
 static void render_david_hires(uint32_t *px, int W, int H, float sc) {
     if (!g_has_3d_character || !g_loaded || W <= 0 || H <= 0) return;
     static float *zb = NULL; static uint32_t *zst = NULL; static size_t zbn = 0; static uint32_t stamp = 0;
@@ -12699,6 +12681,11 @@ static void render_david_hires(uint32_t *px, int W, int H, float sc) {
     }
     stamp++;
     for (int k = 0; k < MAX_ACTORS; k++) if (g_actors[k].used) render_actor_hires(&g_actors[k], px, W, H, sc, zb, zst, stamp);
+    { /* picking a script's point: its placed characters, where they'll stand */
+        static Actor ghosts[MAX_ACTORS];
+        int n = pick_ghosts(ghosts, MAX_ACTORS);
+        for (int k = 0; k < n; k++) render_actor_hires(&ghosts[k], px, W, H, sc, zb, zst, stamp);
+    }
     debris_draw(px, W, H, sc, zb, zst, stamp);
     proj_models_draw(px, W, H, sc, zb, zst, stamp);
     fx_draw(px, W, H, sc);
@@ -12916,7 +12903,7 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             if (wParam == VK_F4 && fcam_allowed()) { fcam_toggle(); InvalidateRect(hwnd, NULL, FALSE); return 0; }
             if (g_free_cam) { /* flying: its keys are its own (fcam_tick reads them) */
                 if (wParam == VK_ESCAPE) { if (g_sv_pick) sv_pick_click(0, 0, 1); else fcam_toggle(); InvalidateRect(hwnd, NULL, FALSE); return 0; } /* a pick: cancelled */
-                if (strchr("WASDQE", (int)wParam) || wParam == VK_UP || wParam == VK_DOWN || wParam == VK_LEFT || wParam == VK_RIGHT) return 0;
+                if (fcam_is_key((UINT)wParam) || wParam == VK_UP || wParam == VK_DOWN || wParam == VK_LEFT || wParam == VK_RIGHT) return 0;
             }
             if (g_sv_pick) { /* picking a script action's point: Esc cancels (a facing: keeps it) */
                 if (wParam == VK_ESCAPE) sv_pick_click(0, 0, 1);
@@ -13266,7 +13253,8 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
                     }
                 }
                 if (!g_free_cam) apply_nav_overlays(); /* P / editor tints, before David so he isn't tinted */
-                if (g_view_mode_3d && !g_free_cam) render_3d_character(); /* normal view: David is drawn at screen resolution below */
+                /* the characters: at screen resolution below, in every view (render_3d_character tested them against
+                   g_depth_buffer_char, never refreshed with the picture off: last frame's depths, they flickered) */
                 if (!g_view_mode_3d && !g_free_cam) fg_restore(); /* foreground parts of the picture back over his shadow */
                 if (!g_free_cam) apply_fg_tint();
 
@@ -13285,7 +13273,7 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
                     GdiFlush();
                     compose_room_layer(vbits, dw, dh, win_w, win_h);
                     double perf_s2 = perf_now_ms(); g_perf_sec[1] = perf_s2 - perf_s1;
-                    if (!g_view_mode_3d && !g_free_cam) render_david_hires(vbits, dw, dh, view_scale);
+                    render_david_hires(vbits, dw, dh, view_scale);
                     g_perf_sec[2] = perf_now_ms() - perf_s2;
                     SetGraphicsMode(vdc, GM_ADVANCED);
                     XFORM xf = { view_scale, 0, 0, view_scale, 0, 0 };
