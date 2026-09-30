@@ -4594,7 +4594,7 @@ enum {
     B_R_RED, B_R_GREEN, B_R_FG, B_R_DOOR, B_R_REDO, B_R_RETARGET, B_R_SCRIPT, B_W_CANCEL, B_SETTINGS, B_SET_RESET, B_SCRIPTS,
     B_ANIMS, B_AV_MODEL, B_AV_MOVESET, B_AV_PREV, B_AV_PLAY, B_AV_NEXT, B_AV_STEPB, B_AV_STEPF, B_AV_SLOWER, B_AV_FASTER, B_AV_FOLLOW, B_AV_RESET, B_AV_CLOSE,
     B_SET_BASE = 100, /* + 2*i (-), + 2*i+1 (+) */
-    B_SV_FIRST_ID = 280, B_SV_LAST_ID = 1399 /* the scripts screen's (sv_action), but 900-999: the moveset screen's */
+    B_SV_FIRST_ID = 280, B_SV_LAST_ID = 1499 /* the scripts screen's (sv_action), but 900-999: the moveset screen's */
 };
 typedef struct { int id; RECT r; const char *label; const char *key; const char *desc; int on; int enabled; int kind; } UiButton;
 #define UI_MAX_BTN 256
@@ -7197,6 +7197,7 @@ static int action_duration_raw(const ScriptAction *a, float *sec) {
                 return DUR_KNOWN;
             }
         case ACT_MOVE: return DUR_DYNAMIC;
+        case ACT_CHAR: return (a->set_weapon || a->set_shield) ? DUR_DYNAMIC : DUR_INSTANT;
         case ACT_OVERLAY:
             for (int i = 0; i < a->nov; i++) if (a->ov_mode[i] == OVM_ONCE || a->ov_mode[i] == OVM_ONCE_HIDE) return DUR_DYNAMIC;
             return DUR_INSTANT;
@@ -7229,6 +7230,8 @@ typedef struct {
     int clip;           /* ANIM */
     int row_long;       /* ANIM "until the rest of the row is over" */
     int portrait;       /* SPEAK: shown until the line is over */
+    int pend_weapon, pend_shield; /* CHAR: its weapon / shield change still to come (one after the other) */
+    char pick[160];     /* ANIM / SOUND: the one picked in its pool */
     float limit;        /* in a timeline: it's cut after this long (its trimmed end), 0 = none */
 } CellRun;
 static struct {
@@ -7292,9 +7295,38 @@ static Actor *actor_place(const ScriptAction *a) {
     memcpy(ac->pos, a->pos, sizeof(ac->pos));
     memcpy(ac->target, a->pos, sizeof(ac->target));
     ac->facing = a->facing;
+    ac->side = a->side ? SIDE_ENEMY : SIDE_ALLY;
+    ac->ai_on = !a->ai_off;
     return ac;
 }
 
+/* CHARACTER SETTINGS: its side and AI at once; its weapon, then its shield, taken out / put away as with the radial menu */
+static void run_char_equip(const ScriptAction *a, CellRun *c) {
+    Actor *ac = c->actor;
+    if (!ac || !ac->used || actor_busy(ac) || ac->dead || ac->down) { if (ac && (ac->dead || ac->down)) c->pend_weapon = c->pend_shield = 0; return; }
+    if (c->pend_weapon) {
+        c->pend_weapon = 0;
+        if (a->item[0]) actor_equip_weapon(ac, a->item);
+        else if (ac->weapon[0]) actor_equip_weapon(ac, ac->weapon); /* the one it holds: put away */
+        return;
+    }
+    if (c->pend_shield) {
+        c->pend_shield = 0;
+        if (a->item2[0]) actor_equip_shield(ac, a->item2);
+        else if (ac->shield[0]) actor_equip_shield(ac, ac->shield);
+    }
+}
+static void run_start_char(const ScriptAction *a, CellRun *c) {
+    Actor *ac = actor_by_place_id(a->actor);
+    if (!ac) { char who[96]; script_actor_name(&g_run.s, a->actor, who, sizeof(who)); snprintf(g_status, sizeof(g_status), "script: %s isn't in the room", who); return; }
+    if (a->set_side) ac->side = a->set_side == 2 ? SIDE_ENEMY : SIDE_ALLY;
+    if (a->set_ai) ac->ai_on = a->set_ai == 1 && ac != DAVID_ACTOR;
+    c->actor = ac;
+    c->pend_weapon = a->set_weapon && strcmp(ac->weapon, a->item) != 0;
+    c->pend_shield = a->set_shield && strcmp(ac->shield, a->item2) != 0;
+    run_char_equip(a, c);
+    c->done = !c->pend_weapon && !c->pend_shield && !actor_busy(ac);
+}
 static void run_start_move(const ScriptAction *a, CellRun *c) {
     char who[96];
     script_actor_name(&g_run.s, a->actor, who, sizeof(who));
@@ -7332,9 +7364,15 @@ static int *run_voice_slot(int action_id) {
 }
 
 static CharModel *run_actor_model(const Script *s, int actor);
+/* ANIM / SOUND: its file, or one of its pool's, at random */
+static const char *action_pick(const ScriptAction *a) {
+    int n = 1 + a->npool, k = n > 1 ? rand() % n : 0;
+    return k == 0 ? a->file : a->pool[k - 1];
+}
 static void run_start_anim(const ScriptAction *a, CellRun *c) {
     Actor *ac = actor_by_place_id(a->actor);
-    int clip = anim_lib_find_ref(a->file);
+    snprintf(c->pick, sizeof(c->pick), "%s", action_pick(a));
+    int clip = anim_lib_find_ref(c->pick);
     char who[96];
     script_actor_name(&g_run.s, a->actor, who, sizeof(who));
     if (!ac) { snprintf(g_status, sizeof(g_status), "script: %s isn't in the room", who); return; }
@@ -7343,7 +7381,7 @@ static void run_start_anim(const ScriptAction *a, CellRun *c) {
         ac->play_hold = 0;
         return;
     }
-    if (clip < 0 || !anim_lib_fits(clip, ac->model->node_count)) { snprintf(g_status, sizeof(g_status), "script: %s can't play '%s'", who, a->file); return; }
+    if (clip < 0 || !anim_lib_fits(clip, ac->model->node_count)) { snprintf(g_status, sizeof(g_status), "script: %s can't play '%s'", who, c->pick); return; }
     ac->play_clip = clip; ac->play_t = 0.0f; ac->play_next = -1; ac->play_speed = a->speed;
     ac->play_left = (a->anim_mode == ANIM_ROW || a->anim_mode == ANIM_LOOP) ? -1 : (a->repeat < 1 ? 1 : a->repeat);
     ac->play_hold = a->anim_mode == ANIM_LOOP;
@@ -7367,7 +7405,8 @@ static void run_start(const ScriptAction *a, CellRun *c) {
         }
         case ACT_SOUND: case ACT_AMBIENCE: {
             int snd = a->type == ACT_SOUND;
-            c->voice = audio_play(a->file, snd ? AUDIO_SOUND : AUDIO_AMBIENCE, snd ? a->repeat : 0, !snd && a->loop);
+            snprintf(c->pick, sizeof(c->pick), "%s", snd ? action_pick(a) : a->file);
+            c->voice = audio_play(c->pick, snd ? AUDIO_SOUND : AUDIO_AMBIENCE, snd ? a->repeat : 0, !snd && a->loop);
             int *slot = run_voice_slot(a->id);
             if (slot) *slot = c->voice;
             if (snd && a->wait_end && c->voice) c->done = 0;
@@ -7381,6 +7420,7 @@ static void run_start(const ScriptAction *a, CellRun *c) {
         case ACT_PLACE: actor_place(a); break;
         case ACT_MOVE: run_start_move(a, c); break;
         case ACT_ANIM: run_start_anim(a, c); break;
+        case ACT_CHAR: run_start_char(a, c); break;
         case ACT_OVERLAY: {
             int wait = 0;
             for (int i = 0; i < a->nov; i++) {
@@ -7439,6 +7479,10 @@ static int run_cell_done(const ScriptAction *a, CellRun *c, float dt) {
             c->done = all;
             break;
         }
+        case ACT_CHAR:
+            run_char_equip(a, c);
+            c->done = !c->actor || !c->actor->used || (!c->pend_weapon && !c->pend_shield && !actor_busy(c->actor));
+            break;
         case ACT_ANIM:
             if (c->row_long) return 0; /* decided by the rest of the row (script_tick) */
             c->done = !c->actor->used || c->actor->play_clip != c->clip || c->actor->play_ended;
@@ -7512,7 +7556,7 @@ static void run_zone_skip(void) {
         if (!g_run.zev_started[i]) {
             g_run.zev_started[i] = 1;
             int t = a->type;
-            if (t == ACT_BACKGROUND || t == ACT_MUSIC || t == ACT_AMBIENCE || t == ACT_STOP || t == ACT_PLACE || t == ACT_OVERLAY || t == ACT_CAMERA || t == ACT_ROOM)
+            if (t == ACT_BACKGROUND || t == ACT_MUSIC || t == ACT_AMBIENCE || t == ACT_STOP || t == ACT_PLACE || t == ACT_OVERLAY || t == ACT_CAMERA || t == ACT_ROOM || t == ACT_CHAR)
                 run_start(a, cr);
             cr->done = 1; cr->row_long = 0;
             continue;
@@ -7566,7 +7610,7 @@ static void zone_trim_start(const ScriptAction *a, CellRun *c) {
     if (a->trim_in <= 0.0f) return;
     if ((a->type == ACT_SOUND || a->type == ACT_SPEAK) && c->voice) {
         audio_stop(c->voice);
-        c->voice = audio_play_at(a->file, AUDIO_SOUND, a->type == ACT_SOUND ? a->repeat : 0, 0, a->trim_in);
+        c->voice = audio_play_at(c->pick[0] ? c->pick : a->file, AUDIO_SOUND, a->type == ACT_SOUND ? a->repeat : 0, 0, a->trim_in);
         if (a->type == ACT_SOUND) { int *slot = run_voice_slot(a->id); if (slot) *slot = c->voice; }
         if (!c->voice) c->done = 1;
     }
@@ -7753,6 +7797,14 @@ enum {
     B_SV_RM_SCRIPT = 1300, /* + index: 0 = none, then the target room's scripts */
     B_SV_ZROWS_M = 1380, B_SV_ZROWS_P, /* the selected timeline: a row less / more */
     B_SV_TRIM_IN_M, B_SV_TRIM_IN_P, B_SV_TRIM_OUT_M, B_SV_TRIM_OUT_P, B_SV_TRIM_RESET, /* a timeline action's trims */
+    B_SV_POOL = 1400,    /* + i: take the pool's entry i out */
+    B_SV_POOL_ADD = 1410,
+    B_SV_CS_SIDE = 1420, /* + 0 unchanged, 1 ally, 2 enemy (Character settings) */
+    B_SV_CS_AI = 1425,   /* + 0 unchanged, 1 on, 2 off */
+    B_SV_CS_WPN = 1430,  /* + 0 unchanged, 1 choose */
+    B_SV_CS_SHD = 1435,  /* + 0 unchanged, 1 choose */
+    B_SV_PL_SIDE = 1440, /* + 0 ally, 1 enemy (Place character) */
+    B_SV_PL_AI = 1445,
     B_SV_LAST = 899
 };
 #define SV_ROW_H 46
@@ -7823,7 +7875,7 @@ static void svl_draw(HDC hdc) {
 static COLORREF action_color(int type) {
     static const COLORREF c[ACT_COUNT] = { RGB(90, 90, 100), RGB(160, 160, 170), RGB(190, 130, 255), RGB(90, 160, 255), RGB(255, 160, 60),
                                            RGB(60, 205, 190), RGB(255, 90, 90), RGB(240, 210, 80), RGB(110, 220, 110),
-                                           RGB(255, 130, 200), RGB(235, 215, 170), RGB(170, 230, 90), RGB(190, 190, 255), RGB(120, 220, 230) };
+                                           RGB(255, 130, 200), RGB(235, 215, 170), RGB(170, 230, 90), RGB(190, 190, 255), RGB(120, 220, 230), RGB(255, 190, 120) };
     return (type >= 0 && type < ACT_COUNT) ? c[type] : RGB(200, 200, 200);
 }
 
@@ -8044,7 +8096,8 @@ static void ch_open(int kind, const char *current) {
     g_ch_scroll = ch_grid() ? 0 : g_ch_sel - 8; if (g_ch_scroll < 0) g_ch_scroll = 0;
     g_ch_t = 0.0f;
 }
-static void ch_close(void) { g_ch = CH_NONE; audio_preview(NULL); }
+static int g_ch_to_pool = 0; /* the chooser adds to the action's random pool (not its main file) */
+static void ch_close(void) { g_ch = CH_NONE; audio_preview(NULL); g_ch_to_pool = 0; }
 static void ch_choose(void) {
     const char *name = ch_current();
     ScriptAction *a = sv_cell(1);
@@ -8054,7 +8107,10 @@ static void ch_choose(void) {
         ch_close();
         return;
     }
-    if (g_ch == CH_PICTURE && a->type == ACT_BACKGROUND) snprintf(a->file, sizeof(a->file), "%s", name);
+    if (g_ch_to_pool && ((g_ch == CH_CLIP && a->type == ACT_ANIM) || (g_ch == CH_SOUND && a->type == ACT_SOUND))) {
+        if (a->npool < SCRIPT_POOL_MAX) snprintf(a->pool[a->npool++], sizeof(a->pool[0]), "%s", name);
+    }
+    else if (g_ch == CH_PICTURE && a->type == ACT_BACKGROUND) snprintf(a->file, sizeof(a->file), "%s", name);
     else if (g_ch == CH_CLIP && a->type == ACT_ANIM) snprintf(a->file, sizeof(a->file), "%s", name);
     else if (g_ch == CH_ROOM && a->type == ACT_ROOM) { snprintf(a->file, sizeof(a->file), "%s", name); a->door = 0; a->script[0] = 0; }
     else if (g_ch == CH_SOUND && (a->type == ACT_SOUND || a->type == ACT_AMBIENCE || a->type == ACT_SPEAK)) snprintf(a->file, sizeof(a->file), "%s", name);
@@ -8918,6 +8974,7 @@ static int sv_changed_would_overlap(Script *s, ScriptAction *a) {
     if (!s || !script_find(s, a->id, &r, NULL) || (zi = script_zone_at(s, r)) < 0) return 0;
     return sv_ids_collide(s, zi, &a->id, 1);
 }
+static int sv_item_menu(HWND hwnd, int shield, char *out, int n);
 static void sv_action(HWND hwnd, int id) {
     Script *s = sv_cur();
     ScriptAction *a = sv_cell(0);
@@ -9055,6 +9112,24 @@ static void sv_action(HWND hwnd, int id) {
             return;
         }
         case B_SV_TRIM_RESET: a->trim_in = a->trim_out = 0.0f; break;
+        case B_SV_POOL_ADD:
+            if (a->type == ACT_ANIM) { g_ch_model = run_actor_model(s, a->actor); if (!g_ch_model) return; ch_open(CH_CLIP, NULL); }
+            else ch_open(CH_SOUND, NULL);
+            g_ch_to_pool = 1;
+            return;
+        case B_SV_CS_WPN + 1: case B_SV_CS_SHD + 1: {
+            char pick[48];
+            if (!sv_item_menu(hwnd, id == B_SV_CS_SHD + 1, pick, sizeof(pick))) return;
+            if (id == B_SV_CS_WPN + 1) { a->set_weapon = 1; snprintf(a->item, sizeof(a->item), "%s", pick); }
+            else { a->set_shield = 1; snprintf(a->item2, sizeof(a->item2), "%s", pick); }
+            break;
+        }
+        case B_SV_CS_WPN: a->set_weapon = 0; break;
+        case B_SV_CS_SHD: a->set_shield = 0; break;
+        case B_SV_CS_SIDE: case B_SV_CS_SIDE + 1: case B_SV_CS_SIDE + 2: a->set_side = id - B_SV_CS_SIDE; break;
+        case B_SV_CS_AI: case B_SV_CS_AI + 1: case B_SV_CS_AI + 2: a->set_ai = id - B_SV_CS_AI; break;
+        case B_SV_PL_SIDE: case B_SV_PL_SIDE + 1: a->side = id - B_SV_PL_SIDE; break;
+        case B_SV_PL_AI: a->ai_off = !a->ai_off; break;
         case B_SV_T_M1: case B_SV_T_M01: case B_SV_T_P01: case B_SV_T_P1: {
             static const float d[4] = { -0.1f, -0.01f, 0.01f, 0.1f };
             float old = a->start;
@@ -9187,7 +9262,10 @@ static void sv_action(HWND hwnd, int id) {
                 int n = sv_actions_of(s, ACT_SOUND, ACT_AMBIENCE, list, rows, 64);
                 int k = id - B_SV_STOPREF;
                 if (k < n) { a->stop_kind = STOP_ACTION; a->stop_ref = list[k]->id; }
-            } else if (id >= B_SV_ACTOR && id < B_SV_ACTOR + 64 && (a->type == ACT_MOVE || a->type == ACT_ANIM || a->type == ACT_SPEAK)) {
+            } else if (id >= B_SV_POOL && id < B_SV_POOL + SCRIPT_POOL_MAX && (a->type == ACT_ANIM || a->type == ACT_SOUND)) {
+                int i = id - B_SV_POOL;
+                if (i < a->npool) { memmove(a->pool[i], a->pool[i + 1], sizeof(a->pool[0]) * (size_t)(a->npool - i - 1)); a->npool--; }
+            } else if (id >= B_SV_ACTOR && id < B_SV_ACTOR + 64 && (a->type == ACT_MOVE || a->type == ACT_ANIM || a->type == ACT_SPEAK || a->type == ACT_CHAR)) {
                 int ids[64], rows[64];
                 int n = sv_actor_list(s, ids, rows, 64), k = id - B_SV_ACTOR;
                 if (k < n && a->actor != ids[k]) {
@@ -9292,6 +9370,24 @@ static int sv_actor_buttons(Script *s, ScriptAction *a, int ix, int iy, int iw, 
         iy += rh + 3;
     }
     return iy + 10;
+}
+/* ANIM / SOUND: its random pool */
+static int sv_pool_buttons(ScriptAction *a, int ix, int iy, int iw, int rh, int anim) {
+    svl(ix, iy, iw, 16, 1, SVL_SECTION, SV_ONE, "RANDOM POOL (ONE OF THEM, EACH TIME)");
+    iy += 20;
+    if (a->npool == 0) {
+        svl(ix, iy, iw, 34, 0, SVL_DIM, DT_LEFT | DT_WORDBREAK, anim ? "Only the animation above. Add others: one of them is picked at random each time it plays."
+                                                                   : "Only the sound above. Add others: one of them is picked at random each time it plays.");
+        iy += 38;
+    }
+    for (int i = 0; i < a->npool; i++) {
+        svl(ix, iy, iw - 42, rh, 0, SVL_TEXT, SV_ONE, "%d.  %s", i + 2, a->pool[i]);
+        ui_add(B_SV_POOL + i, ix + iw - 34, iy, 34, rh, "x", "", "Take it out of the pool.", 0, 1, 0);
+        iy += rh + 4;
+    }
+    ui_add(B_SV_POOL_ADD, ix, iy, iw, rh, anim ? "+ Add another animation..." : "+ Add another sound...", "",
+           "One more for the pool: each time the action plays, one of them (the first above included) is picked at random.", 0, a->npool < SCRIPT_POOL_MAX && a->file[0], 0);
+    return iy + rh + 14;
 }
 /* "FADE OUT": - 2.0 s + (MUSIC, STOP) */
 static int sv_fade_buttons(ScriptAction *a, int ix, int iy, int iw, int rh, const char *title, const char *desc) {
@@ -9435,7 +9531,8 @@ static void sv_layout_main(HWND hwnd) {
             "A character says a line (a sound): its portrait is shown until the line is over. The row waits for it.",
             "The room's environmental animations, already at their place: loop some, play some once, freeze some on a frame, hide some.",
             "Go to another room, as through a connector: David comes in by one of its connectors, then one of its scripts plays. This script ends there.",
-            "Move the view: slide it smoothly to a point of the room (or to David) and zoom in or out. The row waits for the slide." };
+            "Move the view: slide it smoothly to a point of the room (or to David) and zoom in or out. The row waits for the slide.",
+            "Change a character: its side (ally / enemy), its AI on or off, its weapon or shield (taken out as with the radial menu)." };
         for (int t = ACT_WAIT; t < ACT_COUNT; t++) {
             ui_add(B_SV_ADD + t, ix + ((t - 1) % 2) * (half + 6), iy, half, rh, action_type_name(t), "", add_desc[t], 0, 1, 0);
             if ((t - 1) % 2 == 1) iy += rh + 6;
@@ -9505,6 +9602,7 @@ static void sv_layout_main(HWND hwnd) {
             ui_add(B_SV_FILE, ix, iy, half, rh, "Choose file...", "", "Choose a sound of assets/sound (type to filter, Space to listen).", 0, 1, 0);
             ui_add(B_SV_LISTEN, ix + half + 6, iy, half, rh, audio_preview_playing() ? "Stop listening" : "Listen", "", "Hear it (again: stop).", audio_preview_playing(), a->file[0] != 0, 0);
             iy += rh + 14;
+            if (type == ACT_SOUND) iy = sv_pool_buttons(a, ix, iy, iw, rh, 0);
             if (type == ACT_SOUND) {
                 svl(ix, iy, iw, 16, 1, SVL_SECTION, SV_ONE, "REPEAT");
                 iy += 20;
@@ -9567,8 +9665,47 @@ static void sv_layout_main(HWND hwnd) {
             svl(ix + 50, iy, iw - 100, rh, 0, SVL_VALUE, SV_ONE | DT_CENTER, "%.0f deg", a->facing * 57.29578f);
             ui_add(B_SV_FACE_R, ix + iw - 44, iy, 44, rh, ">", "", "Turn it 45 degrees right.", 0, 1, 0);
             iy += rh + 12;
-            svl(ix, iy, iw, 60, 0, SVL_DIM, DT_LEFT | DT_WORDBREAK, "It stands there until a 'Move character' action moves it. It leaves with the room.");
+            svl(ix, iy, iw, 16, 1, SVL_SECTION, SV_ONE, "SIDE");
+            iy += 20;
+            ui_add(B_SV_PL_SIDE, ix, iy, half, rh, "Ally", "", "On David's side: our blows don't touch it; its AI goes for the enemies. Health gone: knocked down, not dead.", !a->side, 1, 3);
+            ui_add(B_SV_PL_SIDE + 1, ix + half + 6, iy, half, rh, "Enemy", "", "Our blows land on it; its AI goes for David and his allies. Health gone: it dies.", a->side, 1, 3);
+            iy += rh + 6;
+            ui_add(B_SV_PL_AI, ix, iy, iw, rh, a->ai_off ? "[  ]  Its AI plays" : "[x]  Its AI plays", "",
+                   "Ticked: it acts on its own (its AI preset, moveset screen). 'Character settings' can change it later.", !a->ai_off, 1, 3);
+            iy += rh + 12;
+            svl(ix, iy, iw, 60, 0, SVL_DIM, DT_LEFT | DT_WORDBREAK, "It stands there until a 'Move character' action (or its AI) moves it. It leaves with the room. 'Character settings' changes its side, AI and equipment later.");
             break;
+        case ACT_CHAR: {
+            iy = sv_actor_buttons(s, a, ix, iy, iw, rh);
+            svl(ix, iy, iw, 16, 1, SVL_SECTION, SV_ONE, "SIDE");
+            iy += 20;
+            int w3 = (iw - 12) / 3;
+            ui_add(B_SV_CS_SIDE, ix, iy, w3, rh, "Unchanged", "", "Its side stays as it is.", a->set_side == 0, 1, 3);
+            ui_add(B_SV_CS_SIDE + 1, ix + w3 + 6, iy, w3, rh, "Ally", "", "It becomes an ally: our blows don't touch it.", a->set_side == 1, 1, 3);
+            ui_add(B_SV_CS_SIDE + 2, ix + 2 * (w3 + 6), iy, w3, rh, "Enemy", "", "It becomes an enemy: our blows land on it.", a->set_side == 2, 1, 3);
+            iy += rh + 12;
+            svl(ix, iy, iw, 16, 1, SVL_SECTION, SV_ONE, "AI");
+            iy += 20;
+            ui_add(B_SV_CS_AI, ix, iy, w3, rh, "Unchanged", "", "Its AI stays as it is.", a->set_ai == 0, 1, 3);
+            ui_add(B_SV_CS_AI + 1, ix + w3 + 6, iy, w3, rh, "On", "", "Its AI plays (never David's: the player).", a->set_ai == 1, 1, 3);
+            ui_add(B_SV_CS_AI + 2, ix + 2 * (w3 + 6), iy, w3, rh, "Off", "", "Its AI stops: only scripts move it.", a->set_ai == 2, 1, 3);
+            iy += rh + 12;
+            char wl[80];
+            svl(ix, iy, iw, 16, 1, SVL_SECTION, SV_ONE, "WEAPON");
+            iy += 20;
+            ui_add(B_SV_CS_WPN, ix, iy, half, rh, "Unchanged", "", "It keeps what it holds.", !a->set_weapon, 1, 3);
+            snprintf(wl, sizeof(wl), a->set_weapon ? "%s..." : "Choose...", a->item[0] ? a->item : "none");
+            ui_addf(B_SV_CS_WPN + 1, ix + half + 6, iy, half, rh, wl, "", "The weapon it takes out (as with the radial menu: sheatmp), or none: it puts its weapon away.", a->set_weapon, 1, 3);
+            iy += rh + 12;
+            svl(ix, iy, iw, 16, 1, SVL_SECTION, SV_ONE, "SHIELD");
+            iy += 20;
+            ui_add(B_SV_CS_SHD, ix, iy, half, rh, "Unchanged", "", "It keeps its shield (or none).", !a->set_shield, 1, 3);
+            snprintf(wl, sizeof(wl), a->set_shield ? "%s..." : "Choose...", a->item2[0] ? a->item2 : "none");
+            ui_addf(B_SV_CS_SHD + 1, ix + half + 6, iy, half, rh, wl, "", "The shield it takes out (shldquip), or none: it puts it away. Not with the double swords.", a->set_shield, 1, 3);
+            iy += rh + 12;
+            svl(ix, iy, iw, 60, 0, SVL_DIM, DT_LEFT | DT_WORDBREAK, "The side and AI change at once; the weapon, then the shield, come out with their animations -- the row waits for them.");
+            break;
+        }
         case ACT_OVERLAY: {
             if (g_ov_n == 0) {
                 svl(ix, iy, iw, 60, 0, SVL_TEXT, DT_LEFT | DT_WORDBREAK, "This room has no overlay (no environmental animation in its folder).");
@@ -9713,6 +9850,7 @@ static void sv_layout_main(HWND hwnd) {
                     iy += 26;
                     ui_add(B_SV_AN_CLIP, ix, iy, iw, rh, "Choose animation...", "", "Pick one of the animations made for this character's skeleton (it plays in a preview).", 0, m != NULL, 0);
                     iy += rh + 14;
+                    iy = sv_pool_buttons(a, ix, iy, iw, rh, 1);
                     svl(ix, iy, iw, 16, 1, SVL_SECTION, SV_ONE, "SPEED");
                     iy += 20;
                     ui_add(B_SV_AN_FOLLOW, ix, iy, iw, rh, a->speed > 0.0f ? "[  ]  Follow the general speed" : "[x]  Follow the general speed", "",
@@ -10283,6 +10421,7 @@ enum { B_MS_FIRST = 900, B_MS_CLOSE = B_MS_FIRST, B_MS_NONE, B_MS_PRESET, B_MS_U
        B_MS_POOL = 2000 /* + pool * 100: the pool (select); + 1 + i: listen to sound i; + 50 + i: remove it; + 99: add */,
        B_MS_CUE_ROW = 2400 /* + row * 10 + CUEOP_*: a step of the blow's sounds */,
        B_MS_LAST = 2999 };
+_Static_assert(B_MS_CUE_DONE < 1000, "the moveset screen's buttons must stay under 1000 (1000+: the scripts screen's)");
 static int g_ms_tab = 0;          /* PG_WALK, PG_COMBAT, PG_SOUND, PG_REACT, PG_AI, PG_STATS */
 static int g_ms_items = 0;        /* the list shows the items: 1 for the weapon, 2 for the shield */
 static int g_ms_sounds = 0;       /* the list shows the sounds (the Sounds tab) */
@@ -10301,6 +10440,22 @@ static int g_ms_snd_n = 0;
 /* the items of assets/chars/items (a .gltf with its texture: the few without are item animations) */
 static char (*g_item_names)[48] = NULL;
 static int g_item_count = -1;
+static void items_scan(void);
+/* Character settings: a weapon / shield from the items (or none); 1 if one was chosen */
+static int sv_item_menu(HWND hwnd, int shield, char *out, int n) {
+    items_scan();
+    HMENU m = CreatePopupMenu();
+    AppendMenuA(m, MF_STRING | MF_GRAYED, 0, shield ? "The shield it takes out:" : "The weapon it takes out:");
+    AppendMenuA(m, MF_SEPARATOR, 0, NULL);
+    AppendMenuA(m, MF_STRING, 1, shield ? "None (it puts its shield away)" : "None (it puts its weapon away)");
+    for (int i = 0; i < g_item_count; i++) AppendMenuA(m, MF_STRING | ((i % 30 == 0 && i) ? MF_MENUBARBREAK : 0), 10 + i, g_item_names[i]);
+    POINT pt; GetCursorPos(&pt);
+    int cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_NONOTIFY, pt.x, pt.y, 0, hwnd, NULL);
+    DestroyMenu(m);
+    if (cmd <= 0) return 0;
+    snprintf(out, n, "%s", cmd == 1 ? "" : g_item_names[cmd - 10]);
+    return 1;
+}
 static void items_scan(void) {
     if (g_item_count >= 0) return;
     g_item_count = 0;

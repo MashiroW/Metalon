@@ -92,6 +92,11 @@ No file of the original game is needed.
     animation speed or at its own (x0.1-x4). A clip followed by another
     one on the next row chains with no idle pose in between; "Freeze on
     the last frame" keeps its last pose until the rest of the row is over;
+  - **Character settings**: a character becomes an ally / an enemy, its
+    AI on / off, takes out a weapon / shield (or puts it away) as with the
+    radial menu. "Place character" chooses its side and AI too;
+  - "Animate character" and "Sound" can have a random pool: one of them
+    is picked each time;
   - **Speak**: a character says a line (a sound -- the room's own lines
     are listed first) with its portrait shown until the line is over. Each
     character's portrait (sprites `bigports.1-71`) is chosen the first time
@@ -205,6 +210,24 @@ No file of the original game is needed.
   for the character, make one its default, apply or delete them.
 - Per character, in `data/movesets/`. From the animation viewer
   (Moveset...) or a script's character actions.
+
+**Combat, reactions, AI** (moveset screen: Reactions, AI, Stats tabs)
+- Two sides: David and his allies, the enemies. A blow lands when a blade
+  touches the hitbox of a character of the other side (a cylinder around
+  it, as tall as its model), once per blow: the attacker's damage, its
+  hit sound, the target's grunt and "Hit" reaction. A raised shield blocks.
+- Health gone: an enemy plays "Death" and stays down for good; an ally
+  (David too) is "Knocked down" until no enemy is left, then "Gets up"
+  with its health back (David at most 10 s later).
+- Reactions tab: Hit, Dodge, Death, Knocked down, Getting up (presets
+  Human, Fuge -- fuge dies with his own fugedie).
+- AI tab (presets; built in: "Fuge - dual blades"): close in to the
+  nearest opponent, strike from a distance, walk or run, a pause between
+  attacks, a chance to dodge our blows.
+- Stats tab (presets): health, damage per blow, boss -- a boss enemy's
+  health bar shows at the top of the screen while it's alive.
+- Model presets bundle walking, reactions, combat, sounds, AI, stats and
+  the equipment.
 
 **Animation viewer** (A)
 - Plays every clip made for the shown character's skeleton: its own

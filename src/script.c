@@ -203,7 +203,7 @@ const char *overlay_mode_name(int mode) {
 
 const char *action_type_name(int type) {
     static const char *names[ACT_COUNT] = { "Empty", "Wait", "Background", "Music", "Sound", "Ambience", "Stop sound", "Place character", "Move character",
-                                            "Animate character", "Speak", "Overlays", "Change room", "Camera" };
+                                            "Animate character", "Speak", "Overlays", "Change room", "Camera", "Character settings" };
     return (type >= 0 && type < ACT_COUNT) ? names[type] : "?";
 }
 
@@ -238,6 +238,7 @@ void action_summary(const Script *s, const ScriptAction *a, char *out, int n) {
             snprintf(out, n, "%s", a->file[0] ? base_name(a->file) : "(no file)");
             if (a->repeat > 0) { size_t l = strlen(out); snprintf(out + l, n - l, "  x%d", a->repeat + 1); }
             if (a->wait_end) { size_t l = strlen(out); snprintf(out + l, n - l, "  (wait)"); }
+            if (a->npool) { size_t l = strlen(out); snprintf(out + l, n - l, "  (or %d other%s, at random)", a->npool, a->npool > 1 ? "s" : ""); }
             break;
         case ACT_AMBIENCE: snprintf(out, n, "%s%s", a->file[0] ? base_name(a->file) : "(no file)", a->loop ? "  (loop)" : ""); break;
         case ACT_STOP:
@@ -251,7 +252,24 @@ void action_summary(const Script *s, const ScriptAction *a, char *out, int n) {
             }
             if (a->fade > 0) { size_t l = strlen(out); snprintf(out + l, n - l, "  (fade out %.1f s)", a->fade); }
             break;
-        case ACT_PLACE: snprintf(out, n, "%s%s", a->model[0] ? a->model : "(no character)", a->has_pos ? "" : "  -- no position yet"); break;
+        case ACT_PLACE:
+            snprintf(out, n, "%s%s%s%s", a->model[0] ? a->model : "(no character)", a->side ? "  (enemy)" : "", a->ai_off ? "  (AI off)" : "",
+                     a->has_pos ? "" : "  -- no position yet");
+            break;
+        case ACT_CHAR: {
+            script_actor_name(s, a->actor, t, sizeof(t));
+            snprintf(out, n, "%s:", t);
+            int any = 0;
+            #define ADD(...) do { size_t l = strlen(out); snprintf(out + l, n - l, __VA_ARGS__); any = 1; } while (0)
+            if (a->set_side) ADD(" %s,", a->set_side == 2 ? "enemy" : "ally");
+            if (a->set_ai) ADD(" AI %s,", a->set_ai == 1 ? "on" : "off");
+            if (a->set_weapon) ADD(" weapon %s,", a->item[0] ? a->item : "none");
+            if (a->set_shield) ADD(" shield %s,", a->item2[0] ? a->item2 : "none");
+            #undef ADD
+            if (!any) { size_t l = strlen(out); snprintf(out + l, n - l, " nothing changes"); }
+            else out[strlen(out) - 1] = 0;
+            break;
+        }
         case ACT_MOVE:
             script_actor_name(s, a->actor, t, sizeof(t));
             if (a->door) snprintf(out, n, "%s %s through connector #%d", t, a->run ? "runs" : "walks", a->door);
@@ -268,6 +286,7 @@ void action_summary(const Script *s, const ScriptAction *a, char *out, int n) {
             if (a->anim_mode == 0 && a->repeat > 1) { size_t l = strlen(out); snprintf(out + l, n - l, "  x%d", a->repeat); }
             if (a->speed > 0) { size_t l = strlen(out); snprintf(out + l, n - l, "  at speed x%.2f", a->speed); }
             if (a->freeze && a->anim_mode == ANIM_TIMES) { size_t l = strlen(out); snprintf(out + l, n - l, "  (freezes)"); }
+            if (a->npool) { size_t l = strlen(out); snprintf(out + l, n - l, "  (or %d other%s, at random)", a->npool, a->npool > 1 ? "s" : ""); }
             break;
         case ACT_SPEAK:
             script_actor_name(s, a->actor, t, sizeof(t));
@@ -348,7 +367,13 @@ static void parse_cell(Script *s, const char *line) {
         const char *fd = strstr(p, " fade ");
         if (fd) sscanf(fd + 6, "%f", &a.fade);
     }
-    else if (!strcmp(kind, "place")) { a.type = ACT_PLACE; sscanf(p, "%47s %d %f %f %f %f", a.model, &a.has_pos, &a.pos[0], &a.pos[1], &a.pos[2], &a.facing); if (!strcmp(a.model, "-")) a.model[0] = 0; }
+    else if (!strcmp(kind, "place")) { a.type = ACT_PLACE; sscanf(p, "%47s %d %f %f %f %f %d %d", a.model, &a.has_pos, &a.pos[0], &a.pos[1], &a.pos[2], &a.facing, &a.side, &a.ai_off); if (!strcmp(a.model, "-")) a.model[0] = 0; }
+    else if (!strcmp(kind, "char")) {
+        a.type = ACT_CHAR;
+        sscanf(p, "%d %d %d %d %47s %d %47s", &a.actor, &a.set_side, &a.set_ai, &a.set_weapon, a.item, &a.set_shield, a.item2);
+        if (!strcmp(a.item, "-")) a.item[0] = 0;
+        if (!strcmp(a.item2, "-")) a.item2[0] = 0;
+    }
     else if (!strcmp(kind, "anim")) { a.type = ACT_ANIM; sscanf(p, "%d %d %d %159s %f %d", &a.actor, &a.anim_mode, &a.repeat, a.file, &a.speed, &a.freeze); }
     else if (!strcmp(kind, "speak")) { a.type = ACT_SPEAK; sscanf(p, "%d %159s", &a.actor, a.file); }
     else if (!strcmp(kind, "overlays")) {
@@ -407,6 +432,12 @@ int scripts_load(const char *path, Script **out) {
             ScriptAction *a;
             if (sscanf(s + 6, "%d %f", &id, &t) == 2 && (a = script_find(&cur, id, NULL, NULL)) != NULL) a->start = t;
         }
+        else if (!strncmp(s, "pool ", 5)) {
+            int id = 0; char f[96] = "";
+            ScriptAction *a;
+            if (sscanf(s + 5, "%d %95s", &id, f) == 2 && (a = script_find(&cur, id, NULL, NULL)) != NULL && a->npool < SCRIPT_POOL_MAX)
+                snprintf(a->pool[a->npool++], sizeof(a->pool[0]), "%s", f);
+        }
         else if (!strncmp(s, "trim ", 5)) {
             int id = 0; float ti = 0.0f, to = 0.0f;
             ScriptAction *a;
@@ -443,7 +474,8 @@ static void write_cell(FILE *f, int r, int c, const ScriptAction *a) {
             if (a->fade > 0) fprintf(f, " fade %.2f", a->fade);
             fprintf(f, "\n");
             break;
-        case ACT_PLACE: fprintf(f, "place %s %d %.4f %.4f %.4f %.4f\n", a->model[0] ? a->model : "-", a->has_pos, a->pos[0], a->pos[1], a->pos[2], a->facing); break;
+        case ACT_PLACE: fprintf(f, "place %s %d %.4f %.4f %.4f %.4f %d %d\n", a->model[0] ? a->model : "-", a->has_pos, a->pos[0], a->pos[1], a->pos[2], a->facing, a->side, a->ai_off); break;
+        case ACT_CHAR: fprintf(f, "char %d %d %d %d %s %d %s\n", a->actor, a->set_side, a->set_ai, a->set_weapon, a->item[0] ? a->item : "-", a->set_shield, a->item2[0] ? a->item2 : "-"); break;
         case ACT_ANIM: fprintf(f, "anim %d %d %d %s %.2f %d\n", a->actor, a->anim_mode, a->repeat, a->file[0] ? a->file : "-", a->speed, a->freeze); break;
         case ACT_SPEAK: fprintf(f, "speak %d %s\n", a->actor, a->file[0] ? a->file : "-"); break;
         case ACT_OVERLAY:
@@ -475,6 +507,7 @@ int scripts_save(const char *path, const Script *s, int n) {
                 const ScriptAction *a = &s[i].cell[(size_t)r * s[i].cols + c];
                 if (a->type != ACT_NONE && script_zone_at(&s[i], r) >= 0) fprintf(f, "start %d %.3f\n", a->id, a->start);
                 if (a->type != ACT_NONE && (a->trim_in > 0.0f || a->trim_out > 0.0f)) fprintf(f, "trim %d %.3f %.3f\n", a->id, a->trim_in, a->trim_out);
+                for (int k = 0; a->type != ACT_NONE && k < a->npool; k++) fprintf(f, "pool %d %s\n", a->id, a->pool[k]);
             }
         fprintf(f, "end\n");
     }

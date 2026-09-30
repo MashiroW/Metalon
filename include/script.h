@@ -29,11 +29,13 @@ enum {
     ACT_OVERLAY,    /* the room's overlays (environmental animations): each one looped, played once, frozen, hidden... */
     ACT_ROOM,       /* go to room `file` (as through a connector): David appears at its connector `door`, then `script` plays */
     ACT_CAMERA,     /* the view slides (`seconds`) to its target (`cam_target`: CAM_*, pos[0..1] a point of the room picture) and zoom */
+    ACT_CHAR,       /* a character's settings change: its side, its AI on / off, its weapon / shield (as with the radial menu) */
     ACT_COUNT
 };
 /* ACT_OVERLAY: what each overlay listed does */
 enum { OVM_KEEP, OVM_LOOP, OVM_ONCE, OVM_ONCE_HIDE, OVM_FREEZE, OVM_HIDE, OVM_COUNT };
 #define SCRIPT_MAX_OVERLAYS 16
+#define SCRIPT_POOL_MAX 8
 enum { STOP_ACTION, STOP_ALL_SOUNDS, STOP_MUSIC };
 enum { CAM_KEEP, CAM_POINT, CAM_DAVID };
 
@@ -73,6 +75,12 @@ typedef struct {
     int ov_mode[SCRIPT_MAX_OVERLAYS];  /* OVM_* */
     int ov_frame[SCRIPT_MAX_OVERLAYS]; /* OVM_FREEZE: the frame shown */
     char script[64];                   /* ROOM: the target room's script played on arrival ("" = its auto script, like a connector without one) */
+    int side, ai_off;                  /* PLACE: 0 an ally, 1 an enemy; its AI off */
+    int set_side, set_ai;              /* CHAR: 0 unchanged; side 1 ally / 2 enemy; AI 1 on / 2 off */
+    int set_weapon, set_shield;        /* CHAR: 0 unchanged, 1 becomes item / item2 ("" = none) */
+    char item[48], item2[48];
+    int npool;                         /* ANIM / SOUND: others picked at random with `file` (one of them each time) */
+    char pool[SCRIPT_POOL_MAX][96];
     float start;                       /* in a timeline zone: when it starts, seconds from the zone's start */
     float trim_in, trim_out;           /* in a timeline zone (SOUND, SPEAK, ANIM played N times): seconds of it skipped
                                           at its start / cut at its end */

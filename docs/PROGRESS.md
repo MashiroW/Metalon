@@ -1604,3 +1604,15 @@ Validation, before removing the old data:
   (stb_vorbis seek, `audio_play_at`) and fade out at the cut; animations
   start further in and hold the frame at the cut. Edge dragging in the
   editor. Group selection (ids) with group moves in rows or in a timeline.
+
+## 2026-09-30 -- Combat, reactions, AI, stats
+
+- Moveset slots hit / dodge / death / down / get_up (Reactions tab, group
+  "reactions"); preset groups ai and stats; model presets bundle them all.
+- Blades sampled when drawn (blade_sample), tested every step against the
+  other side's hitboxes (swept between two poses); damage, hit sound,
+  grunt, hit reaction, shield block; death (enemy) / down then up (ally).
+- Melee AI (actor_ai_tick): path to the nearest foe, strike in range,
+  random pause; dodge rolls when a foe starts a blow.
+- Boss health bar. Scripts: PLACE side / AI, Character settings action,
+  random pools for Animate and Sound (`pool <id> <file>`).
