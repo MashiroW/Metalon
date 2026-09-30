@@ -130,9 +130,35 @@ int script_zone_free_row(Script *s, int z, int col) {
     ScriptZone *zn = &s->zone[z];
     script_ensure_rows(s, zn->row0 + zn->rows);
     for (int r = zn->row0; r < zn->row0 + zn->rows; r++) if (script_at(s, r, col)->type == ACT_NONE) return r;
-    int last = zn->row0 + zn->rows - 1; /* full: one more row, inside the zone */
-    script_insert_row(s, last);
-    return last;
+    script_zone_resize(s, z, zn->rows + 1); /* full: one more row */
+    return zn->row0 + zn->rows - 1;
+}
+int script_zone_resize(Script *s, int z, int rows) {
+    if (z < 0 || z >= s->nzones) return 0;
+    if (rows < 1) rows = 1;
+    while (s->zone[z].rows < rows) { /* a row just after it (the rows below move down), then it's the zone's */
+        int at = s->zone[z].row0 + s->zone[z].rows;
+        script_ensure_rows(s, at);
+        script_insert_row(s, at);
+        s->zone[z].rows++;
+    }
+    while (s->zone[z].rows > rows) {
+        ScriptZone *zn = &s->zone[z];
+        int last = zn->row0 + zn->rows - 1, ok = 1;
+        script_ensure_rows(s, last + 1);
+        for (int c = 0; c < s->cols && ok; c++) { /* its last row's actions go to empty cells of its other rows */
+            ScriptAction *a = script_at(s, last, c);
+            if (a->type == ACT_NONE) continue;
+            ok = 0;
+            for (int r = zn->row0; r < last; r++) {
+                ScriptAction *b = script_at(s, r, c);
+                if (b->type == ACT_NONE) { *b = *a; memset(a, 0, sizeof(*a)); ok = 1; break; }
+            }
+        }
+        if (!ok) break; /* a lane would lose an action: no smaller */
+        script_delete_row(s, last);
+    }
+    return s->zone[z].rows;
 }
 
 void script_add_col(Script *s) { if (s->cols < SCRIPT_MAX_COLS) script_regrid(s, s->cols + 1, -1); }

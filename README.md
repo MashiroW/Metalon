@@ -117,8 +117,9 @@ No file of the original game is needed.
   end" is shown with its last measured length, or an estimate), the
   columns are lanes. Drag an action up / down to set when it starts
   (0.05 s steps, Shift: 0.01) or sideways to another lane; click / double
-  click an empty spot to add one there. Zoom in / out changes the seconds
-  per row. When playing, the zone is over as soon as all its actions
+  click an empty spot to add one there. Make it taller / shorter by
+  dragging its bottom edge (the handle), with "+ Row" / "- Row", or Ins /
+  Delete row on one of its rows. Zoom in / out changes the seconds per row. When playing, the zone is over as soon as all its actions
   are -- not when its rows are -- and the rows after it go on. "Back to
   rows" turns it back into plain rows.
 - A script plays when David arrives through a connector that names it (the

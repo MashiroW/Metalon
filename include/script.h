@@ -114,6 +114,9 @@ int script_zone_make(Script *s, int row0, int n);
 void script_zone_remove(Script *s, int z);
 /* an empty cell of a zone's lane (column) for a new action, the zone grown by a row if full (-1: none) */
 int script_zone_free_row(Script *s, int z, int col);
+/* a zone made taller / shorter (rows added / removed at its end; never fewer
+   than its lanes' actions need): returns its rows */
+int script_zone_resize(Script *s, int z, int rows);
 void action_init(Script *s, ScriptAction *a, int type); /* defaults + a new id */
 
 const char *action_type_name(int type);

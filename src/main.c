@@ -7366,6 +7366,7 @@ enum {
     B_SV_OVROW = 1000,  /* + entry * 8 + op (0 select, 1 mode, 2 frame -, 3 frame +) */
     B_SV_RM_DOOR = 1200, /* + index: 0 = where he'd spawn, then the target room's connectors */
     B_SV_RM_SCRIPT = 1300, /* + index: 0 = none, then the target room's scripts */
+    B_SV_ZROWS_M = 1380, B_SV_ZROWS_P, /* the selected timeline: a row less / more */
     B_SV_LAST = 899
 };
 #define SV_ROW_H 46
@@ -7379,6 +7380,8 @@ static int g_sv_hover = -1;                 /* hovered cell: row * SCRIPT_MAX_CO
 static int g_sv_anchor = 0;                 /* several rows selected: from this row to g_sv_row (Shift) */
 static float g_sv_pending_start = -1.0f;    /* the empty cell selected in a timeline: a new action there starts at this time */
 static int g_sv_drag = 0, g_sv_drag_y0 = 0, g_sv_drag_moved = 0; /* an action of a timeline dragged */
+static int g_sv_zdrag = 0;                  /* a timeline's bottom edge dragged: its index + 1 */
+static int g_sv_zedge_hover = -1;           /* the timeline whose bottom edge is under the mouse */
 static float g_sv_drag_t0 = 0.0f;
 static ScriptAction g_sv_clip;              /* copy / paste */
 static int g_sv_has_clip = 0;
@@ -7914,6 +7917,18 @@ static void sv_paint_zones(HDC hdc, Script *s) {
             ui_text(hdc, zr.right - 330, y1 - 15, 324, 13, t, RGB(255, 170, 90), DT_RIGHT | DT_SINGLELINE);
         }
         RestoreDC(hdc, saved);
+        /* the bottom edge: a handle to drag */
+        if (y1 >= body_top && y1 <= body_bot) {
+            int hot = g_sv_zedge_hover == zi || g_sv_zdrag == zi + 1;
+            int mx = (zr.left + zr.right) / 2;
+            RECT hb = { mx - 40, y1 - 3, mx + 40, y1 + 2 };
+            ui_fill(hdc, &hb, hot ? RGB(140, 240, 240) : RGB(70, 170, 170));
+            if (hot) {
+                SelectObject(hdc, ui_font(11, 1));
+                snprintf(t, sizeof(t), "DRAG: TALLER / SHORTER  (%d ROW%s = %.2g s)", z->rows, z->rows > 1 ? "S" : "", z->rows * z->sec_per_row);
+                ui_text(hdc, mx + 48, y1 - 14, 360, 13, t, RGB(140, 240, 240), DT_LEFT | DT_SINGLELINE);
+            }
+        }
     }
 }
 /* the hovered action of a timeline, in full */
@@ -7969,7 +7984,42 @@ static void sv_drag_move(int x, int y) {
         }
     }
 }
+/* the bottom edge of a timeline under (x, y): its index, else -1 */
+static int sv_zone_edge_at(int x, int y) {
+    Script *s = sv_cur();
+    if (!s || x < g_sv_grid_rc.left + SV_ROWHDR_W || x >= g_sv_grid_rc.right || y < g_sv_grid_rc.top + SV_HDR_H || y >= g_sv_grid_rc.bottom) return -1;
+    for (int z = 0; z < s->nzones; z++) {
+        int y1 = sv_zone_y(&s->zone[z]) + s->zone[z].rows * SV_ROW_H;
+        if (y >= y1 - 5 && y <= y1 + 4) return z;
+    }
+    return -1;
+}
+/* the edge dragged: the zone as many rows tall as the mouse says (never less than its actions need) */
+static void sv_zone_edge_move(int y) {
+    Script *s = sv_cur();
+    int z = g_sv_zdrag - 1;
+    if (!s || z < 0 || z >= s->nzones) { g_sv_zdrag = 0; return; }
+    int in_zone = script_zone_at(s, g_sv_row) == z;
+    int want = (y - sv_zone_y(&s->zone[z]) + SV_ROW_H / 2) / SV_ROW_H;
+    if (want < 1) want = 1;
+    if (want != s->zone[z].rows) {
+        script_zone_resize(s, z, want);
+        if (in_zone && script_zone_at(s, g_sv_row) != z) { g_sv_row = s->zone[z].row0; g_sv_anchor = g_sv_row; }
+        g_sv_drag_moved = 1;
+    }
+}
+/* - Row / + Row, Ins / Delete row in a timeline */
+static void sv_zone_rows(int delta) {
+    Script *s = sv_cur();
+    int z = s ? script_zone_at(s, g_sv_row) : -1;
+    if (z < 0) return;
+    int before = s->zone[z].rows, now = script_zone_resize(s, z, before + delta);
+    if (now == before && delta < 0) { snprintf(g_status, sizeof(g_status), "this timeline can't be shorter: a lane needs all its rows for its actions"); return; }
+    if (script_zone_at(s, g_sv_row) != z) { g_sv_row = s->zone[z].row0 + s->zone[z].rows - 1; g_sv_anchor = g_sv_row; }
+    sv_changed();
+}
 static void sv_drag_end(void) {
+    if (g_sv_zdrag) { g_sv_zdrag = 0; ReleaseCapture(); if (g_sv_drag_moved) sv_changed(); return; }
     if (!g_sv_drag) return;
     g_sv_drag = 0;
     ReleaseCapture();
@@ -8207,6 +8257,8 @@ static void sv_action(HWND hwnd, int id) {
                 sv_changed();
             }
             return;
+        case B_SV_ZROWS_M: sv_zone_rows(-1); return;
+        case B_SV_ZROWS_P: sv_zone_rows(1); return;
         case B_SV_UNZONE: if (s && script_zone_at(s, g_sv_row) >= 0) { script_zone_remove(s, script_zone_at(s, g_sv_row)); sv_changed(); } return;
         case B_SV_ZSCALE_M: case B_SV_ZSCALE_P: {
             int zi = s ? script_zone_at(s, g_sv_row) : -1;
@@ -8221,8 +8273,14 @@ static void sv_action(HWND hwnd, int id) {
             sv_changed();
             return;
         }
-        case B_SV_ROW_INS: if (s) { script_insert_row(s, g_sv_row); sv_changed(); } return;
-        case B_SV_ROW_DEL: if (s && g_sv_row < s->rows) { script_delete_row(s, g_sv_row); sv_changed(); } return;
+        case B_SV_ROW_INS:
+            if (s && script_zone_at(s, g_sv_row) >= 0) { sv_zone_rows(1); return; } /* in a timeline: it grows */
+            if (s) { script_insert_row(s, g_sv_row); sv_changed(); }
+            return;
+        case B_SV_ROW_DEL:
+            if (s && script_zone_at(s, g_sv_row) >= 0) { sv_zone_rows(-1); return; }
+            if (s && g_sv_row < s->rows) { script_delete_row(s, g_sv_row); sv_changed(); }
+            return;
         case B_SV_COL_ADD: if (s) { script_add_col(s); sv_changed(); } return;
         case B_SV_COL_DEL:
             if (s && s->cols > 1) {
@@ -8555,6 +8613,8 @@ static void sv_layout_main(HWND hwnd) {
         { B_SV_CLEAR, 70, "Clear", "Del", "Empty the selected cell.", s != NULL },
         { B_SV_ZONE, 124, "Make timeline", "", "Turn the selected rows (Shift+click or Shift+arrows: several rows) into an ADVANCED TIMELINE: its actions start at their own time, as tall as they last, and can overlap.", s && zfree },
         { B_SV_UNZONE, 110, "Back to rows", "", "Turn this timeline back into plain rows (its actions in the order they start).", zsel >= 0 },
+        { B_SV_ZROWS_M, 64, "- Row", "", "This timeline one row shorter (not below what its actions need). Or drag its bottom edge.", zsel >= 0 && s->zone[zsel].rows > 1 },
+        { B_SV_ZROWS_P, 64, "+ Row", "", "This timeline one row taller: more time for its actions. Or drag its bottom edge.", zsel >= 0 },
         { B_SV_ZSCALE_M, 76, "Zoom in", "", "The timeline shows fewer seconds per row: more room to place its actions precisely.", zsel >= 0 && s->zone[zsel].sec_per_row > 0.26f },
         { B_SV_ZSCALE_P, 76, "Zoom out", "", "More seconds per row: a long timeline in fewer rows.", zsel >= 0 && s->zone[zsel].sec_per_row < 7.9f },
     };
@@ -9285,6 +9345,12 @@ static void sv_mouse_down(HWND hwnd, int x, int y, int dbl) {
     int r, c, zi;
     float zt;
     Script *s = sv_cur();
+    int edge = sv_zone_edge_at(x, y);
+    if (edge >= 0) { /* its bottom edge: drag it to make it taller / shorter */
+        g_sv_zdrag = edge + 1; g_sv_drag_moved = 0;
+        SetCapture(hwnd);
+        return;
+    }
     if (sv_zone_hit(x, y, &zi, &r, &c, &zt)) { /* a timeline: an action (drag it), or a new one there */
         if (r >= 0) {
             sv_select(r, c);
@@ -9309,7 +9375,10 @@ static void sv_mouse_down(HWND hwnd, int x, int y, int dbl) {
 static void sv_mouse_move(int x, int y) {
     int r, c, zi;
     float zt;
+    if (g_sv_zdrag) { sv_zone_edge_move(y); g_sv_hover = -1; return; }
     if (g_sv_drag) sv_drag_move(x, y);
+    g_sv_zedge_hover = g_sv_drag ? -1 : sv_zone_edge_at(x, y);
+    if (g_sv_zedge_hover >= 0) { g_sv_hover = -1; return; }
     if (sv_zone_hit(x, y, &zi, &r, &c, &zt)) { g_sv_hover = r >= 0 ? r * SCRIPT_MAX_COLS + c : -1; return; }
     g_sv_hover = sv_cell_at(x, y, &r, &c) ? r * SCRIPT_MAX_COLS + c : -1;
 }
@@ -11027,7 +11096,7 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             return 0;
         }
         case WM_LBUTTONUP: {
-            if (g_sv_drag) { sv_drag_end(); InvalidateRect(hwnd, NULL, FALSE); return 0; }
+            if (g_sv_drag || g_sv_zdrag) { sv_drag_end(); InvalidateRect(hwnd, NULL, FALSE); return 0; }
             if (attack_release(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam))) return 0;
             if (g_anim_sb_page) { g_anim_sb_page = 0; KillTimer(hwnd, ANIM_SB_TIMER_ID); ReleaseCapture(); InvalidateRect(hwnd, NULL, FALSE); return 0; }
             if (g_anim_drag) { g_anim_drag = 0; ReleaseCapture(); InvalidateRect(hwnd, NULL, FALSE); return 0; }
