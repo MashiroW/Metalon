@@ -269,7 +269,21 @@ typedef struct {
     int play_freeze;           /* ...held until its row is over ("Freeze on the last frame") */
     int hold_step;             /* the script step (g_run.step) it belongs to */
     CuePlayer cue;             /* the attack's sounds playing */
+    /* combat */
+    int side;                  /* SIDE_ALLY (David's side) / SIDE_ENEMY: blows only land on the other side */
+    int hp, hp_max;            /* health (its stats) */
+    int dead, down;            /* health gone: an enemy dead for good / an ally knocked down (until the enemies are beaten) */
+    float down_t;              /* how long it's been down */
+    int hold_last;             /* the clip playing stays on its last frame once over (dying, knocked down) */
+    int ai_on;                 /* its AI plays (a script can turn it off) */
+    float ai_cool, ai_repath;  /* AI: until its next attack / its next new path */
+    int blow;                  /* the clip playing is a blow (it hits what its blades touch) */
+    unsigned hit_mask;         /* ...the characters it has hit already */
+    int dodging;               /* its dodge is playing: blows miss it */
+    float blade[2][2][3], blade_prev[2][2][3]; /* its blades in the world (base, tip) in the last two poses drawn */
+    int blade_ok[2], blade_prev_ok[2];
 } Actor;
+enum { SIDE_ALLY, SIDE_ENEMY };
 static int g_atk_queued = -1;  /* attack mode: the next attack, asked for while one plays */
 static void david_attack(int slot);
 enum { EV_NONE, EV_WEAPON, EV_SHIELD };
@@ -1109,6 +1123,7 @@ static void david_turn_after_clip(void) {
 }
 
 static void set_character_target(float wx, float wy, float wz, int run) {
+    if (g_act->dead || g_act->down) return; /* it can't move */
     if (g_act->play_attack) { g_act->play_clip = -1; g_act->play_attack = 0; g_act->play_turn = 0.0f; g_act->stepping = 0; g_act->trail = 0; g_act->cue.on = 0; } /* a move order ends an attack */
     if (g_act->play_hold) { g_act->play_clip = -1; g_act->play_hold = 0; } /* ...and a looped script animation */
     float dx = wx - g_char_pos[0], dz = wz - g_char_pos[2];
@@ -1425,6 +1440,7 @@ static void actor_play_end(Actor *a) {
         a->play_next = -1;
         return;
     }
+    a->blow = 0; a->dodging = 0;
     if (a->play_attack) {
         a->play_attack = 0;
         if (a == DAVID_ACTOR && g_atk_queued >= 0) { int q = g_atk_queued; g_atk_queued = -1; david_attack(q); }
@@ -1446,10 +1462,10 @@ static int advance_character(float dt) {
         }
         if (a->play_event && a->play_t >= a->play_event_at) actor_apply_event(a); /* e.g. the weapon changes in the middle of the sheathing */
         if (a->play_ended) { if (a->play_t > d - 0.001f) a->play_t = d > 0.001f ? d - 0.001f : 0.0f; } /* a script clip over: held where it is, until the script goes on */
-        else if (d <= 0.0f) { if (a->play_script) { a->play_ended = 1; a->play_t = 0.0f; } else actor_play_end(a); }
+        else if (d <= 0.0f) { if (a->play_script || a->hold_last) { a->play_ended = 1; a->play_t = 0.0f; } else actor_play_end(a); }
         else if (a->play_t >= d) {
             if (a->play_left > 0 && --a->play_left == 0) {
-                if (a->play_script) { a->play_ended = 1; a->play_t = d - 0.001f; } else actor_play_end(a);
+                if (a->play_script || a->hold_last) { a->play_ended = 1; a->play_t = d - 0.001f; } else actor_play_end(a);
             }
             else a->play_t = fmodf(a->play_t, d);
         }
@@ -3803,6 +3819,10 @@ static void actor_reset(Actor *a, CharModel *m, int place_id) {
     a->turn_clip = -1; a->pending_door = -1; a->play_clip = -1; a->play_next = -1;
     snprintf(a->weapon, sizeof(a->weapon), "%s", moveset_get(m && m->name[0] ? m->name : "david")->right_hand);
     snprintf(a->shield, sizeof(a->shield), "%s", moveset_get(m && m->name[0] ? m->name : "david")->left_hand);
+    a->side = SIDE_ALLY;
+    a->hp = a->hp_max = moveset_stats(moveset_get(m && m->name[0] ? m->name : "david"))->hp;
+    a->ai_on = place_id != 0; /* a placed character's AI plays (a script can turn it off); never David's */
+    a->ai_cool = 0.5f;
 }
 /* script characters leave with the room */
 static void actors_clear_npcs(void) {
@@ -5412,6 +5432,7 @@ static void actor_play_once(Actor *a, int clip, float step) {
     if (a == DAVID_ACTOR) g_click_marker_active = 0;
     a->play_clip = clip; a->play_t = 0.0f; a->play_left = 1; a->play_attack = 0; a->play_next = -1; a->trail = 0; a->play_hold = 0; a->play_speed = 0.0f;
     a->play_script = 0; a->play_ended = 0; a->play_freeze = 0;
+    a->blow = 0; a->dodging = 0; a->hold_last = 0;
     a->play_turn = clip_turn(a, clip);
     actor_plan_step(a, step);
 }
@@ -5422,24 +5443,33 @@ static int actor_clip(const Actor *a, const char *name) {
 }
 static int actor_busy(const Actor *a) { return a->play_clip >= 0 || a->guard; }
 
+static void actor_dodge_rolls(Actor *a);
+static int actor_attack(Actor *a, int slot);
 static void david_attack(int slot) {
-    Actor *a = DAVID_ACTOR;
+    if (DAVID_ACTOR->down || DAVID_ACTOR->dead) return;
+    actor_attack(DAVID_ACTOR, slot);
+}
+/* a blow of any character (David: attack mode; the others: their AI). 1 if it started */
+static int actor_attack(Actor *a, int slot) {
     actor_resolve_clips(a);
-    if (a->guard) return; /* behind its shield */
-    if (a->play_clip >= 0 && a->play_attack) { g_atk_queued = slot; return; }
-    if (a->play_clip >= 0) return; /* busy (dodging, sheathing...) */
+    if (a->guard) return 0; /* behind its shield */
+    if (a->play_clip >= 0 && a->play_attack) { if (a == DAVID_ACTOR) g_atk_queued = slot; return 0; }
+    if (a->play_clip >= 0) return 0; /* busy (dodging, sheathing...) */
     if (slot == MC_ATK1) { /* a click: one of the three attacks at random */
         int c[3], n = 0;
         for (int k = MC_ATK1; k <= MC_ATK3; k++) if (a->clips[k] >= 0) c[n++] = k;
         if (n) slot = c[rand() % n];
     }
     int clip = a->clips[slot];
-    if (clip < 0) { snprintf(g_status, sizeof(g_status), "attack: no animation for '%s' in %s's moveset", MOVE_SLOT_LABEL[slot], a->model->name); return; }
+    if (clip < 0) { if (a == DAVID_ACTOR) snprintf(g_status, sizeof(g_status), "attack: no animation for '%s' in %s's moveset", MOVE_SLOT_LABEL[slot], a->model->name); return 0; }
     const Moveset *ms = moveset_get(a->model->name[0] ? a->model->name : "david");
     actor_play_once(a, clip, moveset_step_w(ms, slot, a->weapon));
     a->play_attack = 1;
+    a->blow = 1; a->hit_mask = 0;
     cue_start(&a->cue, moveset_cues_w(ms, slot, a->weapon)); /* its sounds (the ones at 0 s: now) */
     cue_run(&a->cue, 0.0f, moveset_sounds(ms));
+    actor_dodge_rolls(a);
+    return 1;
 }
 /* every step: the attack's sounds go on, in step with the animation */
 static void actor_cue_tick(Actor *a, float dt) {
@@ -5467,7 +5497,7 @@ static int attack_release(int cx, int cy) {
     Actor *a = DAVID_ACTOR;
     int rx, ry; float w[3];
     client_to_room_point(cx, cy, &rx, &ry);
-    if (!(a->play_clip >= 0 && a->play_attack) && click_to_world((float)rx, (float)ry, w)) {
+    if (!(a->play_clip >= 0 && a->play_attack) && !a->down && click_to_world((float)rx, (float)ry, w)) {
         float dx = w[0] - a->pos[0], dz = w[2] - a->pos[2];
         if (dx * dx + dz * dz > 0.04f) { a->facing = atan2f(dx, dz); if (a->turn_clip >= 0) a->turn_clip = -1; }
     }
@@ -5485,10 +5515,12 @@ static double g_guard_press_ms = 0;
 static void guard_press(HWND hwnd) { g_guard_press = 1; g_guard_press_ms = perf_now_ms(); SetCapture(hwnd); }
 static void david_dodge(void) {
     Actor *a = DAVID_ACTOR;
-    int c = actor_clip(a, "dodgeb");
-    if (c < 0 || actor_busy(a)) return;
+    actor_resolve_clips(a);
+    int c = a->clips[MC_DODGE] >= 0 ? a->clips[MC_DODGE] : actor_clip(a, "dodgeb");
+    if (c < 0 || actor_busy(a) || a->down) return;
     actor_play_once(a, c, DODGE_STEP);
     a->play_attack = 1;
+    a->dodging = 1; /* blows miss him while it plays */
 }
 /* game_tick: held long enough -> the shield goes up */
 static void guard_tick(void) {
@@ -5548,6 +5580,7 @@ static void actor_special(Actor *a, const char *clip_name) {
     actor_play_once(a, c, 0.0f);
     a->play_attack = 1;
     a->trail = 1;
+    a->blow = 1; a->hit_mask = 0;
 }
 
 /* ---- weapon trails: the blades' segments over the last moments, fading ---- */
@@ -5561,6 +5594,26 @@ static void trail_push(int who, int hand, const float a[3], const float b[3]) {
     TrailSample *t = &g_trail[g_trail_n++];
     memcpy(t->a, a, sizeof(t->a)); memcpy(t->b, b, sizeof(t->b));
     t->t = perf_now_ms() / 1000.0; t->who = who; t->hand = hand; t->seq = g_trail_seq;
+}
+/* after actor_project: its blades in the world (the pose before kept, for the blows' sweep) */
+static void blade_sample(Actor *a) {
+    for (int hand = 0; hand < 2; hand++) {
+        a->blade_prev_ok[hand] = a->blade_ok[hand];
+        memcpy(a->blade_prev[hand], a->blade[hand], sizeof(a->blade[hand]));
+        a->blade_ok[hand] = 0;
+        const CharModel *it = hand ? a->item_l : a->item;
+        float base[3], tip[3], h[3];
+        if (!it || !(hand ? a->hand_l_ok : a->hand_ok) || !item_blade(it, base, tip)) continue;
+        float cf = cosf(a->facing + 3.14159265f), sf = sinf(a->facing + 3.14159265f);
+        const Mat4 *m = hand ? &a->hand_l : &a->hand;
+        for (int e = 0; e < 2; e++) {
+            mat4_vec3(m, e ? tip : base, h);
+            a->blade[hand][e][0] = h[0] * cf + h[2] * sf + a->pos[0];
+            a->blade[hand][e][1] = h[1] + a->pos[1];
+            a->blade[hand][e][2] = -h[0] * sf + h[2] * cf + a->pos[2];
+        }
+        a->blade_ok[hand] = 1;
+    }
 }
 /* after actor_project: the blades where they are now */
 static void trail_sample(Actor *a) {
@@ -5641,6 +5694,172 @@ static void actor_hit(Actor *a) {
     const SoundPools *sp = moveset_sounds(moveset_get(a->model->name[0] ? a->model->name : "david"));
     const char *g = pool_pick(sp, POOL_GRUNT);
     if (g && rand() % 100 < sp->grunt_chance) audio_play(g, AUDIO_SOUND, 0, 0);
+}
+/* =====================================================================
+   COMBAT. Two sides: David and his allies, the enemies. A blow (an attack
+   or a special) lands when a blade touches the HITBOX of a character of
+   the other side -- a cylinder around it, its body's radius, as tall as
+   its model --, once per blow and target: the attacker's damage (stats),
+   its hit sound, the target's grunt and its "hit" reaction. A raised
+   shield blocks it. Health gone: an enemy dies (held on its last frame,
+   for good), an ally is knocked down until no enemy is left, then gets up
+   with its health back (David also after 10 s, so the player isn't stuck).
+   ===================================================================== */
+static float model_height(const CharModel *m) {
+    static const CharModel *ms[64]; static float hs[64]; static int n = 0;
+    for (int i = 0; i < n; i++) if (ms[i] == m) return hs[i];
+    float h = 0.0f;
+    for (int v = 0; v < m->vertex_count; v++) if (m->positions[v][1] > h) h = m->positions[v][1];
+    if (h <= 0.0f) h = 1.8f;
+    if (n < 64) { ms[n] = m; hs[n] = h; n++; }
+    return h;
+}
+static int actor_alive(const Actor *a) { return a->used && !a->dead && !a->down; }
+static int actor_in_hitbox(const Actor *b, const float p[3]) {
+    float r = g_nav.body_radius * 1.25f, dx = p[0] - b->pos[0], dz = p[2] - b->pos[2];
+    return dx * dx + dz * dz < r * r && p[1] >= b->pos[1] - 0.1f && p[1] <= b->pos[1] + model_height(b->model) * 1.05f;
+}
+/* does a blade of a (now, or on its way since the pose before) go through b's hitbox? */
+static int blade_touches(const Actor *a, const Actor *b) {
+    for (int hand = 0; hand < 2; hand++) {
+        if (!a->blade_ok[hand]) continue;
+        int sweeps = a->blade_prev_ok[hand] ? 4 : 1;
+        for (int s = 0; s < sweeps; s++) {
+            float k = sweeps > 1 ? (float)s / (sweeps - 1) : 1.0f, seg[2][3];
+            for (int e = 0; e < 2; e++) for (int j = 0; j < 3; j++)
+                seg[e][j] = sweeps > 1 ? a->blade_prev[hand][e][j] + (a->blade[hand][e][j] - a->blade_prev[hand][e][j]) * k : a->blade[hand][e][j];
+            for (int i = 0; i <= 6; i++) {
+                float u = i / 6.0f, p[3] = { seg[0][0] + (seg[1][0] - seg[0][0]) * u, seg[0][1] + (seg[1][1] - seg[0][1]) * u, seg[0][2] + (seg[1][2] - seg[0][2]) * u };
+                if (actor_in_hitbox(b, p)) return 1;
+            }
+        }
+    }
+    return 0;
+}
+static const Moveset *actor_moveset(const Actor *a) { return moveset_get(a->model && a->model->name[0] ? a->model->name : "david"); }
+/* health gone: an enemy dies, an ally goes down (both held on their clip's last frame) */
+static void actor_fall(Actor *b) {
+    actor_resolve_clips(b);
+    int enemy = b->side == SIDE_ENEMY, c = b->clips[enemy ? MC_DEATH : MC_DOWN];
+    b->guard = 0; b->cue.on = 0; b->play_next = -1;
+    if (c >= 0) { actor_play_once(b, c, 0.0f); b->hold_last = 1; }
+    else { b->moving = 0; b->waypoint_count = 0; b->play_clip = -1; }
+    if (enemy) b->dead = 1; else { b->down = 1; b->down_t = 0.0f; }
+    if (b == DAVID_ACTOR) g_click_marker_active = 0;
+}
+static void actor_get_up(Actor *b) {
+    actor_resolve_clips(b);
+    b->down = 0; b->hold_last = 0; b->play_ended = 0; b->play_clip = -1;
+    b->hp = b->hp_max;
+    if (b->clips[MC_GETUP] >= 0) actor_play_once(b, b->clips[MC_GETUP], 0.0f);
+}
+/* a's blow lands on b */
+static void actor_take_blow(Actor *a, Actor *b) {
+    if (b->guard) { audio_play("swrdblk1.ogg", AUDIO_SOUND, 0, 0); return; } /* on its shield */
+    const char *hs = pool_pick(moveset_sounds(actor_moveset(a)), POOL_HIT);
+    if (hs) audio_play(hs, AUDIO_SOUND, 0, 0);
+    b->hp -= moveset_stats(actor_moveset(a))->damage;
+    actor_hit(b); /* its grunt, maybe */
+    if (b->hp <= 0) { b->hp = 0; actor_fall(b); return; }
+    actor_resolve_clips(b);
+    if (b->clips[MC_HIT] >= 0) { actor_play_once(b, b->clips[MC_HIT], 0.0f); b->cue.on = 0; }
+}
+/* a starts a blow: the AI characters of the other side close to it may dodge it (their chance) */
+static void actor_dodge_rolls(Actor *a) {
+    for (int k = 0; k < MAX_ACTORS; k++) {
+        Actor *b = &g_actors[k];
+        if (b == a || !actor_alive(b) || b->side == a->side || !b->ai_on || b == DAVID_ACTOR) continue;
+        const AiSettings *ai = moveset_ai(actor_moveset(b));
+        if (!ai || ai->kind != AI_MELEE || ai->dodge <= 0 || (b->play_clip >= 0 && !b->play_attack)) continue;
+        float dx = b->pos[0] - a->pos[0], dz = b->pos[2] - a->pos[2], reach = 2.0f * g_nav.body_radius * 4.0f;
+        if (dx * dx + dz * dz > reach * reach || rand() % 100 >= ai->dodge) continue;
+        actor_resolve_clips(b);
+        int c = b->clips[MC_DODGE];
+        if (c < 0) continue;
+        b->facing = atan2f(-dx, -dz); /* facing the blow, it jumps back */
+        actor_play_once(b, c, -2.5f);
+        b->dodging = 1;
+    }
+}
+/* the nearest character of the other side still standing (NULL: none) */
+static Actor *actor_nearest_foe(const Actor *a) {
+    Actor *best = NULL; float bd = 1e30f;
+    for (int k = 0; k < MAX_ACTORS; k++) {
+        Actor *b = &g_actors[k];
+        if (b == a || !actor_alive(b) || b->side == a->side) continue;
+        float dx = b->pos[0] - a->pos[0], dz = b->pos[2] - a->pos[2], d = dx * dx + dz * dz;
+        if (d < bd) { bd = d; best = b; }
+    }
+    return best;
+}
+/* AI, "close in and strike": to the nearest foe until close enough, then its blows with pauses between them */
+static void actor_ai_tick(Actor *a, float dt) {
+    const AiSettings *ai = moveset_ai(actor_moveset(a));
+    if (!ai || ai->kind != AI_MELEE || !actor_alive(a) || a->play_clip >= 0) return; /* nothing to do, or busy (a blow, a reaction, a script...) */
+    a->ai_cool -= dt; a->ai_repath -= dt;
+    Actor *t = actor_nearest_foe(a);
+    if (!t) return;
+    float dx = t->pos[0] - a->pos[0], dz = t->pos[2] - a->pos[2], dist = sqrtf(dx * dx + dz * dz);
+    float reach = ai->range * 2.0f * g_nav.body_radius;
+    if (dist > reach) {
+        if (a->ai_repath <= 0.0f || !a->moving) {
+            a->ai_repath = 0.35f;
+            float k = dist > 1e-3f ? (dist - reach * 0.7f) / dist : 0.0f, goal[3] = { a->pos[0] + dx * k, t->pos[1], a->pos[2] + dz * k };
+            actor_begin(a); move_to_world_point(goal, ai->run); actor_end();
+        }
+        return;
+    }
+    if (a->moving) { a->moving = 0; a->waypoint_count = 0; a->walk_mode = 0; a->turn_clip = -1; } /* there */
+    a->facing = atan2f(dx, dz);
+    if (a->ai_cool > 0.0f) return;
+    actor_resolve_clips(a);
+    int slots[8], n = 0;
+    for (int s = MC_FIRST_COMBAT; s < MC_COUNT; s++) if (a->clips[s] >= 0 && s != MC_SW_BACKL && s != MC_SW_BACKR) slots[n++] = s; /* not the ones turning around */
+    if (n && actor_attack(a, slots[rand() % n]))
+        a->ai_cool = ai->pause_min + (ai->pause_max - ai->pause_min) * (float)rand() / (float)RAND_MAX;
+}
+/* every game step, once the characters have moved */
+static void combat_tick(float dt) {
+    int enemies = 0;
+    for (int k = 0; k < MAX_ACTORS; k++) if (g_actors[k].used && g_actors[k].side == SIDE_ENEMY && actor_alive(&g_actors[k])) enemies++;
+    for (int k = 0; k < MAX_ACTORS; k++) {
+        Actor *a = &g_actors[k];
+        if (!a->used) continue;
+        if (a->dodging && !(a->play_clip >= 0 && a->play_clip == a->clips[MC_DODGE]) && !(a == DAVID_ACTOR && a->play_attack)) a->dodging = 0;
+        if (a->down) { /* up again once the scene's enemies are beaten (David: after 10 s at most) */
+            a->down_t += dt;
+            if (!enemies || (a == DAVID_ACTOR && a->down_t > 10.0f)) actor_get_up(a);
+            continue;
+        }
+        if (a->blow && a->play_clip >= 0 && actor_alive(a))
+            for (int j = 0; j < MAX_ACTORS; j++) {
+                Actor *b = &g_actors[j];
+                if (b == a || !actor_alive(b) || b->side == a->side || b->dodging || (a->hit_mask & (1u << j))) continue;
+                if (blade_touches(a, b)) { a->hit_mask |= 1u << j; actor_take_blow(a, b); }
+            }
+        if (a->ai_on && k != 0) actor_ai_tick(a, dt);
+    }
+}
+/* a boss enemy alive: its name and health bar at the top of the picture */
+static void boss_bar_draw(HDC hdc) {
+    if (screen_view() || !g_has_3d_character) return;
+    Actor *boss = NULL;
+    for (int k = 1; k < MAX_ACTORS; k++) {
+        Actor *a = &g_actors[k];
+        if (a->used && a->side == SIDE_ENEMY && !a->dead && moveset_stats(actor_moveset(a))->boss) { boss = a; break; }
+    }
+    if (!boss) return;
+    RECT gr; game_rect_client(&gr);
+    int w = (gr.right - gr.left) * 2 / 5, x = (gr.left + gr.right - w) / 2, y = gr.top + 34, h = 14;
+    RECT frame = { x - 2, y - 2, x + w + 2, y + h + 2 }, bg = { x, y, x + w, y + h };
+    ui_fill(hdc, &frame, RGB(200, 160, 64)); ui_fill(hdc, &bg, RGB(30, 10, 10));
+    int fw = boss->hp_max > 0 ? w * boss->hp / boss->hp_max : 0;
+    RECT fill = { x, y, x + fw, y + h };
+    ui_fill(hdc, &fill, RGB(190, 30, 30));
+    SelectObject(hdc, ui_font(16, 1));
+    char t[80]; snprintf(t, sizeof(t), "%s", boss->model->name);
+    if (t[0] >= 'a' && t[0] <= 'z') t[0] -= 32;
+    ui_text(hdc, x, y - 24, w, 20, t, RGB(255, 225, 150), DT_CENTER | DT_SINGLELINE);
 }
 static void shield_break(Actor *a) {
     if (!a->shield[0] || !a->shield_m || !a->hand_s_ok) return;
@@ -7035,6 +7254,7 @@ static void run_stop_anims(void) {
     for (int k = 0; k < MAX_ACTORS; k++) {
         Actor *a = &g_actors[k];
         if (a->play_hold && a->play_clip >= 0) continue;
+        if (a->hold_last) continue; /* dead / down */
         a->play_script = 0; a->play_ended = 0; a->play_freeze = 0;
         if (a->play_event) actor_play_end(a); /* an equipment change isn't lost */
         a->play_clip = -1; a->play_attack = 0; a->play_turn = 0.0f; a->stepping = 0; a->trail = 0; a->play_next = -1;
@@ -7331,6 +7551,7 @@ static void run_release_holds(void) {
         if (!a->play_ended) continue;
         if (a->play_clip < 0) { a->play_ended = a->play_script = a->play_freeze = 0; continue; }
         if (a->play_freeze && g_run.active && a->hold_step == g_run.step) continue;
+        if (a->hold_last) continue; /* dead / down: not a script's */
         actor_play_end(a);
     }
 }
@@ -11460,6 +11681,7 @@ static void render_actor_hires(Actor *a, uint32_t *px, int W, int H, float sc, f
     if (actor_project_item(a, 0, vx, vy, vz, vis)) render_mesh_hires(a->item, vx, vy, vz, vis, px, W, H, sc, zb, zst, stamp);
     if (actor_project_item(a, 1, vx, vy, vz, vis)) render_mesh_hires(a->item_l, vx, vy, vz, vis, px, W, H, sc, zb, zst, stamp);
     if (actor_project_item(a, 2, vx, vy, vz, vis)) render_mesh_hires(a->shield_m, vx, vy, vz, vis, px, W, H, sc, zb, zst, stamp);
+    blade_sample(a);
     if (a->trail) trail_sample(a);
 }
 /* Every character of the room. One depth buffer for all of them, never
@@ -11617,6 +11839,7 @@ static void game_tick(HWND hwnd) {
                 actor_begin(&g_actors[k]); need_repaint |= advance_character((float)dt); actor_end();
                 actor_cue_tick(&g_actors[k], (float)dt);
             }
+            combat_tick((float)dt);
         } else need_repaint = advance_player(dt);
         if (!frozen && overlays_tick((float)dt)) need_repaint = 1;
         if (debris_tick((float)dt) || g_trail_n > 0) need_repaint = 1;
@@ -11845,6 +12068,7 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
                 InvalidateRect(hwnd, NULL, FALSE);
                 return 0;
             }
+            if (g_has_3d_character && DAVID_ACTOR->down) return 0; /* knocked down */
             if (g_has_3d_character) {
                 int dd = door_at_pixel((float)rx, (float)ry);
                 if (dd >= 0) { door_click(dd, dbl); InvalidateRect(hwnd, NULL, FALSE); return 0; }
@@ -12058,6 +12282,7 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
                 SelectClipRgn(hdc, clip);
                 if (!g_tr.phase) draw_editor_overlays(hdc);
                 radial_draw_text(hdc);
+                boss_bar_draw(hdc);
                 SelectClipRgn(hdc, NULL);
                 DeleteObject(clip);
             }
