@@ -1587,3 +1587,6 @@ Validation, before removing the old data:
   pool, wait), timed in animation seconds; edited in the moveset screen
   with a ruler and a synced preview; stored in combat presets
   (`cues` / `cue` lines) and per character (`own_cue`).
+- Music fade out: the Music action fades the music playing out before its
+  playlist starts (the mixer holds the playlist until the fade is over);
+  Stop sound can fade the music / sounds / one sound instead of cutting.

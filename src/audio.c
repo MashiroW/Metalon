@@ -30,6 +30,7 @@ typedef struct {
     int fb_n;
     int repeat_left, loop;
     float fade, fade_step;     /* volume factor; fading out: - fade_step per frame, freed at 0 */
+    int orphan;                /* music fading out that the playlist left: no next track after it */
 } Voice;
 
 static Voice g_voice[MAX_VOICES];
@@ -42,6 +43,7 @@ static int g_next_id = 1;
 /* the music playlist */
 static AudioTrack g_tracks[AUDIO_MAX_TRACKS];
 static int g_ntracks = 0, g_track = -1;
+static long g_music_start_in = 0; /* output frames before the playlist starts (after a fade out), 0 = none pending */
 
 static stb_vorbis *open_file(const char *file, int *channels, unsigned *rate) {
     char path[MAX_PATH * 2];
@@ -60,7 +62,7 @@ static stb_vorbis *open_file(const char *file, int *channels, unsigned *rate) {
 static void voice_setup(Voice *vc, stb_vorbis *v, int ch, unsigned rate, const char *file, int kind, int repeat, int loop) {
     vc->v = v; vc->ch = ch; vc->step = (double)rate / OUT_RATE; vc->rpos = 0; vc->fb_n = 0;
     vc->kind = kind; vc->repeat_left = repeat; vc->loop = loop;
-    vc->fade = 1.0f; vc->fade_step = 0.0f;
+    vc->fade = 1.0f; vc->fade_step = 0.0f; vc->orphan = 0;
     snprintf(vc->file, sizeof(vc->file), "%s", file);
     vc->id = g_next_id++;
     vc->used = 1;
@@ -115,6 +117,12 @@ static void mix(short *out, int frames) {
     static float acc[AUDIO_FRAMES * 2];
     memset(acc, 0, sizeof(float) * 2 * frames);
     EnterCriticalSection(&g_cs);
+    if (g_music_start_in > 0 && (g_music_start_in -= frames) <= 0) { /* the fade is over: the new playlist */
+        g_music_start_in = 0;
+        Voice *vc = NULL;
+        for (int k = 0; k < MAX_VOICES && !vc; k++) if (!g_voice[k].used) vc = &g_voice[k];
+        if (vc && g_ntracks > 0) { g_track = -1; music_next(vc); }
+    }
     for (int k = 0; k < MAX_VOICES; k++) {
         Voice *vc = &g_voice[k];
         if (!vc->used) continue;
@@ -122,7 +130,7 @@ static void mix(short *out, int frames) {
         for (int i = 0; i < frames; i++) {
             while (vc->used && vc->rpos + 1 >= vc->fb_n) {
                 if (voice_refill(vc)) continue;
-                if (vc->kind == AUDIO_MUSIC) music_next(vc); else voice_free(vc);
+                if (vc->kind == AUDIO_MUSIC && !vc->orphan) music_next(vc); else voice_free(vc);
             }
             if (!vc->used) break;
             int i0 = (int)vc->rpos;
@@ -199,7 +207,7 @@ static Voice *free_slot(void) {
     return NULL;
 }
 
-void audio_music_play(const AudioTrack *tracks, int n) {
+void audio_music_play_fade(const AudioTrack *tracks, int n, float fade) {
     if (!g_running) return;
     if (n > AUDIO_MAX_TRACKS) n = AUDIO_MAX_TRACKS;
     EnterCriticalSection(&g_cs);
@@ -207,21 +215,36 @@ void audio_music_play(const AudioTrack *tracks, int n) {
        the same music): it goes on where it is, the new playlist after it */
     for (int k = 0; k < MAX_VOICES && n > 0; k++) {
         Voice *vc = &g_voice[k];
-        if (!vc->used || vc->kind != AUDIO_MUSIC || _stricmp(vc->file, tracks[0].file) != 0) continue;
+        if (!vc->used || vc->kind != AUDIO_MUSIC || vc->orphan || _stricmp(vc->file, tracks[0].file) != 0) continue;
         memcpy(g_tracks, tracks, sizeof(AudioTrack) * n);
-        g_ntracks = n; g_track = 0;
+        g_ntracks = n; g_track = 0; g_music_start_in = 0;
         vc->loop = tracks[0].loop;
         LeaveCriticalSection(&g_cs);
         return;
     }
-    for (int k = 0; k < MAX_VOICES; k++) if (g_voice[k].used && g_voice[k].kind == AUDIO_MUSIC) voice_free(&g_voice[k]);
+    int fading = 0;
+    for (int k = 0; k < MAX_VOICES; k++) {
+        Voice *vc = &g_voice[k];
+        if (!vc->used || vc->kind != AUDIO_MUSIC) continue;
+        if (fade > 0.0f) { /* it fades out on its own, the playlist leaves it */
+            vc->orphan = 1;
+            float step = vc->fade / (fade * OUT_RATE);
+            if (vc->fade_step <= 0.0f || step > vc->fade_step) vc->fade_step = step;
+            fading = 1;
+        } else voice_free(vc);
+    }
     memcpy(g_tracks, tracks, sizeof(AudioTrack) * (n > 0 ? n : 0));
     g_ntracks = n > 0 ? n : 0;
     g_track = -1;
-    Voice *vc = free_slot();
-    if (vc && g_ntracks > 0) music_next(vc);
+    g_music_start_in = 0;
+    if (fading && g_ntracks > 0) g_music_start_in = (long)(fade * OUT_RATE); /* once it's silent */
+    else {
+        Voice *vc = free_slot();
+        if (vc && g_ntracks > 0) music_next(vc);
+    }
     LeaveCriticalSection(&g_cs);
 }
+void audio_music_play(const AudioTrack *tracks, int n) { audio_music_play_fade(tracks, n, 0.0f); }
 void audio_music_stop(void) { audio_music_play(NULL, 0); }
 
 void audio_music_now(char *file, int n, int *track) {
@@ -259,7 +282,15 @@ void audio_stop_kind(int kind) {
     if (!g_running) return;
     EnterCriticalSection(&g_cs);
     for (int k = 0; k < MAX_VOICES; k++) if (g_voice[k].used && g_voice[k].kind == kind) voice_free(&g_voice[k]);
-    if (kind == AUDIO_MUSIC) { g_ntracks = 0; g_track = -1; }
+    if (kind == AUDIO_MUSIC) { g_ntracks = 0; g_track = -1; g_music_start_in = 0; }
+    LeaveCriticalSection(&g_cs);
+}
+
+void audio_fade(int id, float seconds) {
+    if (!g_running || id <= 0) return;
+    if (seconds <= 0.0f) { audio_stop(id); return; }
+    EnterCriticalSection(&g_cs);
+    for (int k = 0; k < MAX_VOICES; k++) if (g_voice[k].used && g_voice[k].id == id) g_voice[k].fade_step = g_voice[k].fade / (seconds * OUT_RATE);
     LeaveCriticalSection(&g_cs);
 }
 

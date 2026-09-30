@@ -131,7 +131,8 @@ void action_summary(const Script *s, const ScriptAction *a, char *out, int n) {
         case ACT_WAIT: snprintf(out, n, "%.1f s", a->seconds); break;
         case ACT_BACKGROUND: snprintf(out, n, "%s", a->file[0] ? base_name(a->file) : "the room's own picture"); break;
         case ACT_MUSIC:
-            if (a->ntracks == 0) { snprintf(out, n, "None (no music)"); break; }
+            if (a->fade > 0) snprintf(out, n, "(fade out %.1f s) ", a->fade);
+            if (a->ntracks == 0) { size_t l = strlen(out); snprintf(out + l, n - l, "None (no music)"); break; }
             for (int i = 0; i < a->ntracks; i++) {
                 size_t l = strlen(out);
                 snprintf(out + l, n - l, "%s%s%s", i ? " > " : "", a->track[i], a->track_loop[i] ? " (loop)" : "");
@@ -152,6 +153,7 @@ void action_summary(const Script *s, const ScriptAction *a, char *out, int n) {
                 if (p) snprintf(out, n, "%s (row %d)", p->file[0] ? p->file : action_type_name(p->type), r + 1);
                 else snprintf(out, n, "(nothing chosen)");
             }
+            if (a->fade > 0) { size_t l = strlen(out); snprintf(out + l, n - l, "  (fade out %.1f s)", a->fade); }
             break;
         case ACT_PLACE: snprintf(out, n, "%s%s", a->model[0] ? a->model : "(no character)", a->has_pos ? "" : "  -- no position yet"); break;
         case ACT_MOVE:
@@ -236,6 +238,7 @@ static void parse_cell(Script *s, const char *line) {
                 if (sscanf(p, "%63s %d %n", a.track[a.ntracks], &a.track_loop[a.ntracks], &k) < 2) break;
                 p += k; a.ntracks++;
             }
+            if (!strncmp(p, "fade ", 5)) sscanf(p + 5, "%f", &a.fade);
         }
     }
     else if (!strcmp(kind, "sound")) { a.type = ACT_SOUND; sscanf(p, "%159s %d %d", a.file, &a.repeat, &a.wait_end); }
@@ -245,6 +248,8 @@ static void parse_cell(Script *s, const char *line) {
         if (!strncmp(p, "action", 6)) { a.stop_kind = STOP_ACTION; sscanf(p + 6, "%d", &a.stop_ref); }
         else if (!strncmp(p, "music", 5)) a.stop_kind = STOP_MUSIC;
         else a.stop_kind = STOP_ALL_SOUNDS;
+        const char *fd = strstr(p, " fade ");
+        if (fd) sscanf(fd + 6, "%f", &a.fade);
     }
     else if (!strcmp(kind, "place")) { a.type = ACT_PLACE; sscanf(p, "%47s %d %f %f %f %f", a.model, &a.has_pos, &a.pos[0], &a.pos[1], &a.pos[2], &a.facing); if (!strcmp(a.model, "-")) a.model[0] = 0; }
     else if (!strcmp(kind, "anim")) { a.type = ACT_ANIM; sscanf(p, "%d %d %d %159s %f", &a.actor, &a.anim_mode, &a.repeat, a.file, &a.speed); }
@@ -312,13 +317,16 @@ static void write_cell(FILE *f, int r, int c, const ScriptAction *a) {
         case ACT_MUSIC:
             fprintf(f, "music %d", a->ntracks);
             for (int i = 0; i < a->ntracks; i++) fprintf(f, " %s %d", a->track[i], a->track_loop[i]);
+            if (a->fade > 0) fprintf(f, " fade %.2f", a->fade);
             fprintf(f, "\n");
             break;
         case ACT_SOUND: fprintf(f, "sound %s %d %d\n", a->file[0] ? a->file : "-", a->repeat, a->wait_end); break;
         case ACT_AMBIENCE: fprintf(f, "ambience %s %d\n", a->file[0] ? a->file : "-", a->loop); break;
         case ACT_STOP:
-            if (a->stop_kind == STOP_ACTION) fprintf(f, "stop action %d\n", a->stop_ref);
-            else fprintf(f, "stop %s\n", a->stop_kind == STOP_MUSIC ? "music" : "sounds");
+            if (a->stop_kind == STOP_ACTION) fprintf(f, "stop action %d", a->stop_ref);
+            else fprintf(f, "stop %s", a->stop_kind == STOP_MUSIC ? "music" : "sounds");
+            if (a->fade > 0) fprintf(f, " fade %.2f", a->fade);
+            fprintf(f, "\n");
             break;
         case ACT_PLACE: fprintf(f, "place %s %d %.4f %.4f %.4f %.4f\n", a->model[0] ? a->model : "-", a->has_pos, a->pos[0], a->pos[1], a->pos[2], a->facing); break;
         case ACT_ANIM: fprintf(f, "anim %d %d %d %s %.2f\n", a->actor, a->anim_mode, a->repeat, a->file[0] ? a->file : "-", a->speed); break;

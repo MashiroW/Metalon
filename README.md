@@ -71,12 +71,14 @@ No file of the original game is needed.
   - **Music**: a playlist of tracks, each looped or not; it replaces the
     music playing and goes on during the next rows. If the music playing
     is already its first track (the same music as the room before), it
-    goes on without restarting. Every new script starts with a Music
+    goes on without restarting. A fade out (0.5-10 s) makes the music
+    playing fade away first, then the new playlist starts (with *None*:
+    the music just fades out). Every new script starts with a Music
     block set to *None* (no music) in its first cell;
   - **Sound**: played 1 + *repeat* times; the row can wait for its end;
   - **Ambience**: an atmosphere sound, looped or not;
   - **Stop sound**: one of the script's sounds / ambiences, all of them,
-    or the music;
+    or the music -- at once or fading out;
   - **Place character**: any character of the game appears at a point
     clicked in the room, facing a direction;
   - **Move character**: David or a placed character walks / runs to a

@@ -6934,7 +6934,7 @@ static void run_start(const ScriptAction *a, CellRun *c) {
         case ACT_MUSIC: {
             AudioTrack t[AUDIO_MAX_TRACKS];
             for (int i = 0; i < a->ntracks; i++) { snprintf(t[i].file, sizeof(t[i].file), "%s", a->track[i]); t[i].loop = a->track_loop[i]; }
-            audio_music_play(t, a->ntracks);
+            audio_music_play_fade(t, a->ntracks, a->fade);
             break;
         }
         case ACT_SOUND: case ACT_AMBIENCE: {
@@ -6946,9 +6946,9 @@ static void run_start(const ScriptAction *a, CellRun *c) {
             break;
         }
         case ACT_STOP:
-            if (a->stop_kind == STOP_MUSIC) audio_music_stop();
-            else if (a->stop_kind == STOP_ALL_SOUNDS) { audio_stop_kind(AUDIO_SOUND); audio_stop_kind(AUDIO_AMBIENCE); }
-            else for (int i = 0; i < g_run.nvoices; i++) if (g_run.voice_action[i] == a->stop_ref) audio_stop(g_run.voice_id[i]);
+            if (a->stop_kind == STOP_MUSIC) audio_music_play_fade(NULL, 0, a->fade);
+            else if (a->stop_kind == STOP_ALL_SOUNDS) { audio_fade_kind(AUDIO_SOUND, a->fade); audio_fade_kind(AUDIO_AMBIENCE, a->fade); }
+            else for (int i = 0; i < g_run.nvoices; i++) if (g_run.voice_action[i] == a->stop_ref) audio_fade(g_run.voice_id[i], a->fade);
             break;
         case ACT_PLACE: actor_place(a); break;
         case ACT_MOVE: run_start_move(a, c); break;
@@ -7167,7 +7167,7 @@ static const char *script_step_text(char *buf, size_t n, const char **sub) {
    Right: the selected cell's action and its settings.
    ===================================================================== */
 enum {
-    B_SV_AN_TIMES = 280, B_SV_AN_ROW, B_SV_AN_CLIP, B_SV_PORTRAIT, B_SV_AN_LOOP, B_SV_AN_NORMAL, B_SV_AN_FOLLOW, B_SV_AN_SPD_M, B_SV_AN_SPD_P, /* (below B_SV_FIRST_ID: routed like the others) */
+    B_SV_AN_TIMES = 280, B_SV_AN_ROW, B_SV_AN_CLIP, B_SV_PORTRAIT, B_SV_AN_LOOP, B_SV_AN_NORMAL, B_SV_AN_FOLLOW, B_SV_AN_SPD_M, B_SV_AN_SPD_P, B_SV_FADE_M, B_SV_FADE_P, /* (below B_SV_FIRST_ID: routed like the others) */
     B_SV_FIRST = 300,
     B_SV_NEW = B_SV_FIRST, B_SV_RENAME, B_SV_DUP, B_SV_DELETE, B_SV_AUTO, B_SV_CLOSE,
     B_SV_PLAY, B_SV_PLAY_ROW, B_SV_ROW_INS, B_SV_ROW_DEL, B_SV_COL_ADD, B_SV_COL_DEL, B_SV_COPY, B_SV_PASTE, B_SV_CLEAR,
@@ -7811,6 +7811,11 @@ static void sv_action(HWND hwnd, int id) {
         case B_SV_AN_TIMES: a->anim_mode = ANIM_TIMES; if (a->repeat < 1) a->repeat = 1; break;
         case B_SV_AN_LOOP: a->anim_mode = ANIM_LOOP; break;
         case B_SV_AN_FOLLOW: a->speed = a->speed > 0.0f ? 0.0f : 1.0f; break;
+        case B_SV_FADE_M: case B_SV_FADE_P:
+            a->fade += id == B_SV_FADE_P ? 0.5f : -0.5f;
+            if (a->fade < 0.01f) a->fade = 0.0f;
+            if (a->fade > 10.0f) a->fade = 10.0f;
+            break;
         case B_SV_AN_SPD_M: case B_SV_AN_SPD_P:
             a->speed += id == B_SV_AN_SPD_P ? 0.1f : -0.1f;
             if (a->speed < 0.1f) a->speed = 0.1f;
@@ -8031,6 +8036,19 @@ static int sv_actor_buttons(Script *s, ScriptAction *a, int ix, int iy, int iw, 
     }
     return iy + 10;
 }
+/* "FADE OUT": - 2.0 s + (MUSIC, STOP) */
+static int sv_fade_buttons(ScriptAction *a, int ix, int iy, int iw, int rh, const char *title, const char *desc) {
+    svl(ix, iy, iw, 16, 1, SVL_SECTION, SV_ONE, "%s", title);
+    iy += 20;
+    ui_add(B_SV_FADE_M, ix, iy, 34, rh, "-", "", "A shorter fade (0.5 s).", 0, a->fade > 0.0f, 0);
+    if (a->fade > 0.0f) svl(ix + 42, iy, iw - 84, rh, 0, SVL_VALUE, SV_ONE | DT_CENTER, "%.1f s", a->fade);
+    else svl(ix + 42, iy, iw - 84, rh, 0, SVL_VALUE, SV_ONE | DT_CENTER, "none (at once)");
+    ui_add(B_SV_FADE_P, ix + iw - 34, iy, 34, rh, "+", "", "A longer fade (0.5 s).", 0, a->fade < 10.0f, 0);
+    iy += rh + 4;
+    svl(ix, iy, iw, 34, 0, SVL_DIM, DT_LEFT | DT_WORDBREAK, "%s", desc);
+    return iy + 40;
+}
+
 static void sv_layout_main(HWND hwnd) {
     RECT rc; GetClientRect(hwnd, &rc);
     SetRect(&g_sv_port_rc, 0, 0, 0, 0);
@@ -8166,7 +8184,9 @@ static void sv_layout_main(HWND hwnd) {
             }
             if (a->ntracks == 0) { svl(ix, iy, iw, 20, 0, RGB(255, 150, 120), SV_ONE, "None: no music here (stops the music playing)."); iy += 26; }
             ui_add(B_SV_MU_ADD, ix, iy, iw, rh, "Add a track...", "", "Choose a music file (assets/sound) to add at the end of the playlist.", 0, a->ntracks < AUDIO_MAX_TRACKS, 0);
-            iy += rh + 12;
+            iy += rh + 14;
+            iy = sv_fade_buttons(a, ix, iy, iw, rh, "FADE OUT (the music playing before)",
+                                 a->ntracks ? "The music playing fades out over this time, then the new playlist starts." : "The music fades out over this time instead of stopping at once.");
             svl(ix, iy, iw, 90, 0, SVL_DIM, DT_LEFT | DT_WORDBREAK,
                 "It replaces the music playing and its playlist -- but if the music playing is already this playlist's first track (the same music as the room before), it goes on without restarting. The row doesn't wait for it.");
             break;
@@ -8206,6 +8226,7 @@ static void sv_layout_main(HWND hwnd) {
             iy += rh + 5;
             ui_add(B_SV_ST_MUSIC, ix, iy, iw, rh, "The music", "", "Stop the music and its playlist.", a->stop_kind == STOP_MUSIC, 1, 3);
             iy += rh + 12;
+            iy = sv_fade_buttons(a, ix, iy, iw, rh, "FADE OUT", "What's stopped fades out over this time instead of stopping at once.");
             ScriptAction *list[64]; int rows[64];
             int n = sv_actions_of(s, ACT_SOUND, ACT_AMBIENCE, list, rows, 64);
             svl(ix, iy, iw, 16, 1, SVL_SECTION, SV_ONE, "OR ONE OF THIS SCRIPT'S SOUNDS");

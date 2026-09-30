@@ -25,6 +25,9 @@ void audio_shutdown(void);
    first one, it goes on (no restart); else the new playlist starts. */
 void audio_music_play(const AudioTrack *tracks, int n);
 void audio_music_stop(void);
+/* same, the music playing fading out over `fade` seconds first (the new
+   playlist starts once it's silent; 0 = at once) */
+void audio_music_play_fade(const AudioTrack *tracks, int n, float fade);
 /* file of the track playing ("" if none), its index in the playlist */
 void audio_music_now(char *file, int n, int *track);
 
@@ -33,6 +36,7 @@ void audio_music_now(char *file, int n, int *track);
    can't be played */
 int audio_play(const char *file, int kind, int repeat, int loop);
 void audio_stop(int id);
+void audio_fade(int id, float seconds);  /* that voice fades out, then stops (0 = at once) */
 void audio_stop_kind(int kind);      /* every voice of that kind */
 void audio_fade_kind(int kind, float seconds); /* every voice of that kind fades out, then stops */
 int audio_playing(int id);           /* 1 while the voice is still playing */
