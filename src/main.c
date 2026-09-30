@@ -2511,6 +2511,8 @@ typedef struct {
     float t;
     uint32_t **img;           /* frames, loaded the first time they're drawn (0xAARRGGBB) */
     int *iw, *ih;
+    char from[128];           /* imported: the room whose folder has its frames ("" = this room's own) */
+    char file[32];            /* ...and their name there (<file>.<n>.png) */
 } RoomOverlay;
 static RoomOverlay g_ov[MAX_ROOM_OVERLAYS];
 static int g_ov_n = 0;
@@ -2538,6 +2540,9 @@ static void overlays_load(const char *label) {
         o.fps = 15.0f;
         if (sscanf(line, "overlay %31s %d %d %d %d %d %47s %7s %f", o.name, &o.frames, &o.x, &o.y, &o.w, &o.h, o.bg, o.conf, &o.fps) < 6 || o.frames <= 0) continue;
         if (o.fps <= 0.5f || o.fps > 120.0f) o.fps = 15.0f;
+        const char *fr = strstr(line, " from ");
+        if (fr) sscanf(fr + 6, "%127s %31s", o.from, o.file);
+        if (!o.file[0]) snprintf(o.file, sizeof(o.file), "%s", o.name);
         o.img = (uint32_t **)calloc(o.frames, sizeof(uint32_t *));
         o.iw = (int *)calloc(o.frames, sizeof(int)); o.ih = (int *)calloc(o.frames, sizeof(int));
         g_ov[g_ov_n++] = o;
@@ -2552,11 +2557,106 @@ static void overlays_save(void) {
     fprintf(f, "# Silver Remaster: this room's overlays (environmental animations) -- tools/find_overlay_positions.py\n");
     fprintf(f, "# overlay <name> <frames> <x> <y> <width> <height> <picture it matched> <sure|guess|none|set> <fps>\n");
     fprintf(f, "# frames: assets/levels/<level>/<room>/<name>.<0..frames-1>.png, drawn with their top-left corner at x y of the room picture\n");
+    fprintf(f, "# imported from another room: ... from <level>/<room> <its file name> (the frames are read in that room's folder)\n");
     for (int i = 0; i < g_ov_n; i++) {
         RoomOverlay *o = &g_ov[i];
-        fprintf(f, "overlay %s %d %d %d %d %d %s %s %.2f\n", o->name, o->frames, o->x, o->y, o->w, o->h, o->bg[0] ? o->bg : "-", o->conf[0] ? o->conf : "set", o->fps);
+        fprintf(f, "overlay %s %d %d %d %d %d %s %s %.2f", o->name, o->frames, o->x, o->y, o->w, o->h, o->bg[0] ? o->bg : "-", o->conf[0] ? o->conf : "set", o->fps);
+        if (o->from[0]) fprintf(f, " from %s %s", o->from, o->file[0] ? o->file : o->name);
+        fprintf(f, "\n");
     }
     fclose(f);
+}
+/* IMPORT: overlays of other rooms (a menu of the rooms that have some, then
+   one of theirs or all of them) join this room's -- the frames stay in their
+   folder. Their place is a guess (the one they had there): placed next.
+   Returns how many were imported; their names in names[] (the new ones: a
+   name already taken here gets _2, _3...). */
+static int overlay_find(const char *name);
+static int overlays_import_menu(HWND hwnd, char names[][32], int max) {
+    static char rooms[200][128];
+    static char lines[200][32][200];
+    static int count[200];
+    int nr = 0;
+    char pat[1024];
+    WIN32_FIND_DATAA lv, fd;
+    root_path(pat, sizeof(pat), "data/rooms/*");
+    HANDLE hl = FindFirstFileA(pat, &lv);
+    if (hl != INVALID_HANDLE_VALUE) {
+        do {
+            if (!(lv.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || lv.cFileName[0] == '.') continue;
+            root_path(pat, sizeof(pat), "data/rooms/%s/*_overlays.cfg", lv.cFileName);
+            HANDLE h = FindFirstFileA(pat, &fd);
+            if (h == INVALID_HANDLE_VALUE) continue;
+            do {
+                if (nr >= 200) break;
+                char room[96]; snprintf(room, sizeof(room), "%.*s", (int)(strlen(fd.cFileName) - strlen("_overlays.cfg")), fd.cFileName);
+                snprintf(rooms[nr], sizeof(rooms[0]), "%s/%s", lv.cFileName, room);
+                if (!_stricmp(rooms[nr], g_ov_room)) continue; /* this room's own */
+                char path[1024], line[512];
+                root_path(path, sizeof(path), "data/rooms/%s_overlays.cfg", rooms[nr]);
+                FILE *f = fopen(path, "r");
+                if (!f) continue;
+                count[nr] = 0;
+                while (fgets(line, sizeof(line), f) && count[nr] < 32) if (!strncmp(line, "overlay ", 8)) snprintf(lines[nr][count[nr]++], sizeof(lines[0][0]), "%s", line);
+                fclose(f);
+                if (count[nr]) nr++;
+            } while (FindNextFileA(h, &fd));
+            FindClose(h);
+        } while (FindNextFileA(hl, &lv));
+        FindClose(hl);
+    }
+    HMENU m = CreatePopupMenu();
+    AppendMenuA(m, MF_STRING | MF_GRAYED, 0, "Import overlays of another room (their frames stay in its folder):");
+    AppendMenuA(m, MF_SEPARATOR, 0, NULL);
+    if (!nr) AppendMenuA(m, MF_STRING | MF_GRAYED, 0, "(no other room has overlays)");
+    for (int r = 0; r < nr; r++) {
+        HMENU sub = CreatePopupMenu();
+        char lab[160]; snprintf(lab, sizeof(lab), "All %d of them", count[r]);
+        AppendMenuA(sub, MF_STRING, 1000 + r * 40, lab);
+        AppendMenuA(sub, MF_SEPARATOR, 0, NULL);
+        for (int i = 0; i < count[r]; i++) {
+            char nm[32] = "", fr[8]; int frames = 0;
+            sscanf(lines[r][i], "overlay %31s %d", nm, &frames);
+            snprintf(lab, sizeof(lab), "%s  (%d frames)", nm, frames);
+            AppendMenuA(sub, MF_STRING, 1000 + r * 40 + 1 + i, lab);
+            (void)fr;
+        }
+        AppendMenuA(m, MF_POPUP | ((r % 30 == 0 && r) ? MF_MENUBARBREAK : 0), (UINT_PTR)sub, rooms[r]);
+    }
+    POINT pt; GetCursorPos(&pt);
+    int cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_NONOTIFY, pt.x, pt.y, 0, hwnd, NULL);
+    DestroyMenu(m);
+    if (cmd < 1000) return 0;
+    int r = (cmd - 1000) / 40, which = (cmd - 1000) % 40, n = 0;
+    for (int i = 0; i < count[r] && n < max && g_ov_n < MAX_ROOM_OVERLAYS; i++) {
+        if (which && i != which - 1) continue;
+        RoomOverlay o; memset(&o, 0, sizeof(o));
+        o.fps = 15.0f;
+        if (sscanf(lines[r][i], "overlay %31s %d %d %d %d %d %47s %7s %f", o.name, &o.frames, &o.x, &o.y, &o.w, &o.h, o.bg, o.conf, &o.fps) < 6 || o.frames <= 0) continue;
+        const char *fr = strstr(lines[r][i], " from ");
+        if (fr) sscanf(fr + 6, "%127s %31s", o.from, o.file); /* imported there already: from its own room */
+        else { snprintf(o.from, sizeof(o.from), "%s", rooms[r]); snprintf(o.file, sizeof(o.file), "%s", o.name); }
+        char base[32]; snprintf(base, sizeof(base), "%.24s", o.name);
+        for (int k = 2; overlay_find(o.name) >= 0; k++) snprintf(o.name, sizeof(o.name), "%s_%d", base, k);
+        snprintf(o.conf, sizeof(o.conf), "guess"); /* where it was in its room: to check here */
+        snprintf(o.bg, sizeof(o.bg), "-");
+        o.img = (uint32_t **)calloc(o.frames, sizeof(uint32_t *));
+        o.iw = (int *)calloc(o.frames, sizeof(int)); o.ih = (int *)calloc(o.frames, sizeof(int));
+        g_ov[g_ov_n++] = o;
+        snprintf(names[n++], 32, "%s", o.name);
+    }
+    return n;
+}
+static void overlays_save(void);
+/* an imported overlay taken out of this room */
+static void overlay_remove(int k) {
+    if (k < 0 || k >= g_ov_n) return;
+    RoomOverlay *o = &g_ov[k];
+    if (o->img) for (int f = 0; f < o->frames; f++) free(o->img[f]);
+    free(o->img); free(o->iw); free(o->ih);
+    memmove(&g_ov[k], &g_ov[k + 1], sizeof(RoomOverlay) * (size_t)(g_ov_n - k - 1));
+    g_ov_n--;
+    overlays_save();
 }
 static int overlay_find(const char *name) {
     for (int i = 0; i < g_ov_n; i++) if (!strcmp(g_ov[i].name, name)) return i;
@@ -2567,8 +2667,8 @@ static const uint32_t *overlay_frame(RoomOverlay *o, int f, int *w, int *h) {
     if (f >= o->frames) f = o->frames - 1;
     if (!o->img[f]) {
         char level[64], room[64], path[1024];
-        split_label(g_ov_room, level, sizeof(level), room, sizeof(room));
-        root_path(path, sizeof(path), "assets/levels/%s/%s/%s.%d.png", level, room, o->name, f);
+        split_label(o->from[0] ? o->from : g_ov_room, level, sizeof(level), room, sizeof(room)); /* imported: its own room's folder */
+        root_path(path, sizeof(path), "assets/levels/%s/%s/%s.%d.png", level, room, o->file[0] ? o->file : o->name, f);
         o->img[f] = image_load(path, &o->iw[f], &o->ih[f]);
         if (!o->img[f]) { o->iw[f] = o->ih[f] = 0; }
     }
@@ -8396,6 +8496,7 @@ enum {
     B_SV_PL_MODEL, B_SV_PL_POS, B_SV_FACE_L, B_SV_FACE_R, B_SV_MV_DEST, B_SV_MV_WALK, B_SV_MV_RUN, B_SV_MOVESET,
     B_CH_OK, B_CH_CANCEL, B_CH_LISTEN, B_CH_SCOPE0, B_CH_SCOPE1, B_CH_SCOPE2,
     B_SV_OV_LEFT, B_SV_OV_RIGHT, B_SV_OV_UP, B_SV_OV_DOWN, B_SV_OV_PICK, B_SV_OV_WAIT, B_SV_OV_RELOAD, B_SV_RM_ROOM,
+    B_SV_OV_IMPORT, B_SV_OV_REMOVE, B_SV_HS_L, B_SV_HS_R,
     B_SV_CAM_KEEP, B_SV_CAM_POINT, B_SV_CAM_DAVID, B_SV_CAM_PICK, B_SV_CAM_ZM, B_SV_CAM_ZP, B_SV_CAM_ZROOM, B_SV_CAM_SM, B_SV_CAM_SP,
     B_SV_ADD = 400,     /* + action type */
     B_SV_TRACK = 500,   /* + track * 8 + op (0 listen, 1 loop, 2 up, 3 down, 4 remove) */
@@ -8792,6 +8893,28 @@ static int sv_grid_rows_total(void) {
     for (int z = 0; s && z < s->nzones; z++) if (n < s->zone[z].row0 + s->zone[z].rows + 1) n = s->zone[z].row0 + s->zone[z].rows + 1;
     return n;
 }
+/* More columns than fit (each at least SV_MIN_COL_W wide): they scroll
+   sideways -- g_sv_hscroll is the first one shown (Shift + wheel, the
+   header's arrows, or following the selected cell). */
+#define SV_MIN_COL_W 170
+static int g_sv_hscroll = 0;
+static int sv_cols_visible(const Script *s) {
+    int w = g_sv_grid_rc.right - g_sv_grid_rc.left - SV_ROWHDR_W, v = w / SV_MIN_COL_W;
+    if (v < 1) v = 1;
+    return s && v > s->cols ? s->cols : v;
+}
+static void sv_hscroll_clamp(const Script *s) {
+    int m = s ? s->cols - sv_cols_visible(s) : 0;
+    if (g_sv_hscroll > m) g_sv_hscroll = m;
+    if (g_sv_hscroll < 0) g_sv_hscroll = 0;
+}
+static int sv_col_w(const Script *s) { return (g_sv_grid_rc.right - g_sv_grid_rc.left - SV_ROWHDR_W) / sv_cols_visible(s); }
+static int sv_col_x(const Script *s, int c) { return g_sv_grid_rc.left + SV_ROWHDR_W + (c - g_sv_hscroll) * sv_col_w(s); }
+static int sv_col_shown(const Script *s, int c) { return c >= g_sv_hscroll && c < g_sv_hscroll + sv_cols_visible(s); }
+static int sv_col_at(const Script *s, int x) {
+    int d = x - g_sv_grid_rc.left - SV_ROWHDR_W;
+    return g_sv_hscroll + (d >= 0 ? d / sv_col_w(s) : -1);
+}
 static void sv_select(int row, int col) {
     Script *s = sv_cur();
     if (!s) return;
@@ -8804,20 +8927,21 @@ static void sv_select(int row, int col) {
     int vis = sv_grid_rows_visible();
     if (g_sv_row < g_sv_scroll) g_sv_scroll = g_sv_row;
     if (g_sv_row >= g_sv_scroll + vis) g_sv_scroll = g_sv_row - vis + 1;
+    int vc = sv_cols_visible(s); /* its column in sight */
+    if (g_sv_col < g_sv_hscroll) g_sv_hscroll = g_sv_col;
+    if (g_sv_col >= g_sv_hscroll + vc) g_sv_hscroll = g_sv_col - vc + 1;
 }
 static void sv_cell_rect(int row, int col, RECT *r) {
     Script *s = sv_cur();
-    int cols = s ? s->cols : SCRIPT_DEFAULT_COLS;
-    int cw = (g_sv_grid_rc.right - g_sv_grid_rc.left - SV_ROWHDR_W) / cols;
-    int x = g_sv_grid_rc.left + SV_ROWHDR_W + col * cw, y = g_sv_grid_rc.top + SV_HDR_H + (row - g_sv_scroll) * SV_ROW_H;
+    int cw = s ? sv_col_w(s) : (g_sv_grid_rc.right - g_sv_grid_rc.left - SV_ROWHDR_W) / SCRIPT_DEFAULT_COLS;
+    int x = s ? sv_col_x(s, col) : g_sv_grid_rc.left + SV_ROWHDR_W + col * cw, y = g_sv_grid_rc.top + SV_HDR_H + (row - g_sv_scroll) * SV_ROW_H;
     SetRect(r, x + 2, y + 2, x + cw - 2, y + SV_ROW_H - 2);
 }
 static int sv_cell_at(int x, int y, int *row, int *col) {
     Script *s = sv_cur();
     if (!s || x < g_sv_grid_rc.left + SV_ROWHDR_W || x >= g_sv_grid_rc.right || y < g_sv_grid_rc.top + SV_HDR_H || y >= g_sv_grid_rc.bottom) return 0;
-    int cw = (g_sv_grid_rc.right - g_sv_grid_rc.left - SV_ROWHDR_W) / s->cols;
-    int c = (x - g_sv_grid_rc.left - SV_ROWHDR_W) / cw, r = g_sv_scroll + (y - g_sv_grid_rc.top - SV_HDR_H) / SV_ROW_H;
-    if (c >= s->cols) return 0;
+    int c = sv_col_at(s, x), r = g_sv_scroll + (y - g_sv_grid_rc.top - SV_HDR_H) / SV_ROW_H;
+    if (c < 0 || c >= s->cols || !sv_col_shown(s, c)) return 0;
     *row = r; *col = c;
     return 1;
 }
@@ -8869,8 +8993,8 @@ static void sv_event_geom(Script *s, int zi, int r, int c, RECT *out, int *kind,
             if (k2 == DUR_INSTANT) continue;
             if ((b->start < a->start || (b->start == a->start && rr < r)) && b->start + l2 > a->start + 1e-4f) depth++;
         }
-    int cw = (g_sv_grid_rc.right - g_sv_grid_rc.left - SV_ROWHDR_W) / s->cols;
-    int lx = g_sv_grid_rc.left + SV_ROWHDR_W + c * cw;
+    int cw = sv_col_w(s);
+    int lx = sv_col_x(s, c);
     int x0 = lx + 4 + depth * 16, x1 = lx + cw - 4;
     if (x0 > x1 - 40) x0 = x1 - 40;
     int y = sv_zone_y(z) + (int)(a->start * pps);
@@ -8881,9 +9005,8 @@ static void sv_event_geom(Script *s, int zi, int r, int c, RECT *out, int *kind,
 static int sv_zone_hit(int x, int y, int *zi, int *row, int *col, float *t) {
     Script *s = sv_cur();
     if (!s || x < g_sv_grid_rc.left + SV_ROWHDR_W || x >= g_sv_grid_rc.right || y < g_sv_grid_rc.top + SV_HDR_H || y >= g_sv_grid_rc.bottom) return 0;
-    int cw = (g_sv_grid_rc.right - g_sv_grid_rc.left - SV_ROWHDR_W) / s->cols;
-    int c = (x - g_sv_grid_rc.left - SV_ROWHDR_W) / cw;
-    if (c >= s->cols) return 0;
+    int c = sv_col_at(s, x);
+    if (c < 0 || c >= s->cols || !sv_col_shown(s, c)) return 0;
     for (int z = 0; z < s->nzones; z++) {
         int y0 = sv_zone_y(&s->zone[z]), y1 = y0 + s->zone[z].rows * SV_ROW_H;
         if (y < y0 || y >= y1) continue;
@@ -8909,18 +9032,18 @@ static int sv_zone_hit(int x, int y, int *zi, int *row, int *col, float *t) {
 }
 static void sv_paint_zones(HDC hdc, Script *s) {
     char t[300];
-    int cw = (g_sv_grid_rc.right - g_sv_grid_rc.left - SV_ROWHDR_W) / s->cols;
+    int cw = sv_col_w(s), vcols = sv_cols_visible(s);
     int gx = g_sv_grid_rc.left + SV_ROWHDR_W, body_top = g_sv_grid_rc.top + SV_HDR_H, body_bot = g_sv_grid_rc.bottom;
     for (int zi = 0; zi < s->nzones; zi++) {
         const ScriptZone *z = &s->zone[zi];
         int y0 = sv_zone_y(z), y1 = y0 + z->rows * SV_ROW_H;
         if (y1 < body_top || y0 > body_bot) continue;
         int saved = SaveDC(hdc);
-        IntersectClipRect(hdc, g_sv_grid_rc.left, body_top, g_sv_grid_rc.right, body_bot);
-        RECT zr = { gx, y0, gx + cw * s->cols, y1 };
+        IntersectClipRect(hdc, g_sv_grid_rc.left + SV_ROWHDR_W, body_top, g_sv_grid_rc.right, body_bot);
+        RECT zr = { gx, y0, gx + cw * vcols, y1 };
         ui_fill(hdc, &zr, RGB(16, 30, 34));
         for (int k = 1; k < z->rows; k++) { RECT ln = { gx, y0 + k * SV_ROW_H, zr.right, y0 + k * SV_ROW_H + 1 }; ui_fill(hdc, &ln, RGB(30, 54, 60)); }
-        for (int c = 1; c < s->cols; c++) { RECT ln = { gx + c * cw, y0, gx + c * cw + 1, y1 }; ui_fill(hdc, &ln, RGB(36, 60, 66)); }
+        for (int c = 1; c < vcols; c++) { RECT ln = { gx + c * cw, y0, gx + c * cw + 1, y1 }; ui_fill(hdc, &ln, RGB(36, 60, 66)); }
         ui_frame(hdc, &zr, RGB(70, 170, 170));
         SelectObject(hdc, ui_font(11, 1));
         snprintf(t, sizeof(t), "ADVANCED TIMELINE  -  %.2g s PER ROW", z->sec_per_row);
@@ -9219,8 +9342,7 @@ static void sv_drag_move(int x, int y) {
         sv_group_shift(s, dt);
     }
     g_sv_last_dt = dt;
-    int cw = (g_sv_grid_rc.right - g_sv_grid_rc.left - SV_ROWHDR_W) / s->cols;
-    c = (x - g_sv_grid_rc.left - SV_ROWHDR_W) / cw;
+    c = sv_col_at(s, x);
     if (c < 0) c = 0;
     if (c >= s->cols) c = s->cols - 1;
     int dc = c - g_sv_drag_c0;
@@ -9252,6 +9374,7 @@ static void sv_band_select(Script *s) {
     for (int r = g_sv_scroll; r < g_sv_scroll + vis && r < s->rows; r++) {
         if (script_zone_at(s, r) >= 0) continue;
         for (int c = 0; c < s->cols; c++) {
+            if (!sv_col_shown(s, c)) continue;
             RECT cr; sv_cell_rect(r, c, &cr);
             if (IntersectRect(&tmp, &cr, &band)) sv_sel_add(s, r, c);
         }
@@ -9622,6 +9745,8 @@ static void sv_action(HWND hwnd, int id) {
         case B_SV_AUTO: if (s) { s->auto_run = !s->auto_run; sv_changed(); } return;
         case B_SV_PLAY: sv_play(0); return;
         case B_SV_PLAY_ROW: sv_play(g_sv_row); return;
+        case B_SV_HS_L: g_sv_hscroll--; if (s) sv_hscroll_clamp(s); return;
+        case B_SV_HS_R: g_sv_hscroll++; if (s) sv_hscroll_clamp(s); return;
         case B_SV_ZONE:
             if (s) {
                 int lo, hi; sv_sel_range(&lo, &hi);
@@ -9774,6 +9899,32 @@ static void sv_action(HWND hwnd, int id) {
         case B_SV_CAM_SM: a->seconds = a->seconds - 0.5f < 0.0f ? 0.0f : a->seconds - 0.5f; break;
         case B_SV_CAM_SP: a->seconds = a->seconds + 0.5f > 10.0f ? 10.0f : a->seconds + 0.5f; break;
         case B_SV_OV_WAIT: a->wait_end = !a->wait_end; break;
+        case B_SV_OV_IMPORT: {
+            char names[32][32];
+            int n = overlays_import_menu(hwnd, names, 32);
+            if (!n) return;
+            overlays_save();
+            for (int i = 0; i < n && a->nov < SCRIPT_MAX_OVERLAYS; i++) { /* in this action too, looping */
+                snprintf(a->ov_name[a->nov], sizeof(a->ov_name[0]), "%s", names[i]);
+                a->ov_mode[a->nov] = OVM_LOOP; a->ov_frame[a->nov] = 0;
+                g_sv_ov_sel = a->nov++;
+            }
+            snprintf(g_status, sizeof(g_status), "%d overlay%s imported: place %s in this room (Place in the room..., or the arrows)", n, n > 1 ? "s" : "", n > 1 ? "them" : "it");
+            break;
+        }
+        case B_SV_OV_REMOVE: {
+            int k = g_sv_ov_sel < a->nov ? overlay_find(a->ov_name[g_sv_ov_sel]) : -1;
+            if (k < 0 || !g_ov[k].from[0]) return;
+            char q[200]; snprintf(q, sizeof(q), "Take the imported overlay \"%s\" out of this room? (Its frames stay in %s.)", g_ov[k].name, g_ov[k].from);
+            if (MessageBoxA(hwnd, q, "Silver Remaster -- overlays", MB_YESNO | MB_ICONQUESTION) != IDYES) return;
+            overlay_remove(k);
+            memmove(&a->ov_name[g_sv_ov_sel], &a->ov_name[g_sv_ov_sel + 1], sizeof(a->ov_name[0]) * (size_t)(a->nov - g_sv_ov_sel - 1));
+            memmove(&a->ov_mode[g_sv_ov_sel], &a->ov_mode[g_sv_ov_sel + 1], sizeof(a->ov_mode[0]) * (size_t)(a->nov - g_sv_ov_sel - 1));
+            memmove(&a->ov_frame[g_sv_ov_sel], &a->ov_frame[g_sv_ov_sel + 1], sizeof(a->ov_frame[0]) * (size_t)(a->nov - g_sv_ov_sel - 1));
+            a->nov--;
+            if (g_sv_ov_sel >= a->nov) g_sv_ov_sel = a->nov > 0 ? a->nov - 1 : 0;
+            break;
+        }
         case B_SV_OV_RELOAD:
             for (int k = 0; k < g_ov_n && a->nov < SCRIPT_MAX_OVERLAYS; k++) {
                 int listed = 0;
@@ -10071,6 +10222,14 @@ static void sv_layout_main(HWND hwnd) {
         tx += tb[i].w + gap;
     }
     g_sv_grid_rc.top = ty + th + 12;
+    if (s) {
+        sv_hscroll_clamp(s);
+        if (s->cols > sv_cols_visible(s)) {
+            ui_add(B_SV_HS_L, g_sv_grid_rc.left + 2, g_sv_grid_rc.top, SV_ROWHDR_W / 2 - 2, SV_HDR_H - 2, "<", "", "The columns to the left (Shift + wheel over the grid scrolls sideways too).", 0, g_sv_hscroll > 0, 0);
+            ui_add(B_SV_HS_R, g_sv_grid_rc.left + SV_ROWHDR_W / 2 + 1, g_sv_grid_rc.top, SV_ROWHDR_W / 2 - 2, SV_HDR_H - 2, ">", "", "The columns to the right (Shift + wheel over the grid scrolls sideways too).", 0,
+                   g_sv_hscroll < s->cols - sv_cols_visible(s), 0);
+        }
+    }
 
     /* right: the selected cell */
     int ix = g_sv_insp_rc.left + 12, iw = g_sv_insp_rc.right - g_sv_insp_rc.left - 24, iy = g_sv_insp_rc.top + 10;
@@ -10317,7 +10476,9 @@ static void sv_layout_main(HWND hwnd) {
         }
         case ACT_OVERLAY: {
             if (g_ov_n == 0) {
-                svl(ix, iy, iw, 60, 0, SVL_TEXT, DT_LEFT | DT_WORDBREAK, "This room has no overlay (no environmental animation in its folder).");
+                svl(ix, iy, iw, 60, 0, SVL_TEXT, DT_LEFT | DT_WORDBREAK, "This room has no overlay (no environmental animation in its folder). Another room's can be used here:");
+                iy += 64;
+                ui_add(B_SV_OV_IMPORT, ix, iy, iw, rh, "Import from another room...", "", "Use overlays of another room here: pick the room, then one of its overlays or all of them. Their frames stay in that room's folder; place them here next.", 0, 1, 0);
                 break;
             }
             int th = iw * (int)g_hdr.height / ((int)g_hdr.width > 0 ? (int)g_hdr.width : 1);
@@ -10348,7 +10509,8 @@ static void sv_layout_main(HWND hwnd) {
                     iy += 20;
                     svl(ix, iy, iw, 18, 0, SVL_TEXT, SV_ONE, "%d frames, %.0f fps, %dx%d at %d, %d", o->frames, o->fps, o->w, o->h, o->x, o->y);
                     iy += 18;
-                    if (strcmp(o->bg, own) && o->bg[0] && strcmp(o->bg, "-")) { svl(ix, iy, iw, 18, 0, RGB(255, 190, 120), SV_ONE, "made for the picture '%s' of this room", o->bg); iy += 18; }
+                    if (o->from[0]) { svl(ix, iy, iw, 18, 0, RGB(150, 210, 255), SV_ONE, "imported from %s (%s)", o->from, o->file); iy += 18; }
+                    else if (strcmp(o->bg, own) && o->bg[0] && strcmp(o->bg, "-")) { svl(ix, iy, iw, 18, 0, RGB(255, 190, 120), SV_ONE, "made for the picture '%s' of this room", o->bg); iy += 18; }
                     if (!strcmp(o->conf, "guess") || !strcmp(o->conf, "none")) { svl(ix, iy, iw, 18, 0, RGB(255, 150, 120), SV_ONE, "its place is a guess: check it, move it if needed"); iy += 18; }
                     iy += 4;
                     int q = 32;
@@ -10359,6 +10521,10 @@ static void sv_layout_main(HWND hwnd) {
                     ui_add(B_SV_OV_PICK, ix + 4 * (q + 3) + 6, iy, iw - 4 * (q + 3) - 6, rh, "Place in the room...", "",
                            "Click in the room where its centre goes. Its place belongs to the room (every script uses it).", 0, 1, 0);
                     iy += rh + 6;
+                    if (o->from[0]) {
+                        ui_add(B_SV_OV_REMOVE, ix, iy, iw, rh, "Take it out of this room", "", "This room stops using this imported overlay (asks first). Its frames stay in the room it comes from.", 0, 1, 0);
+                        iy += rh + 6;
+                    }
                     if (a->ov_mode[g_sv_ov_sel] == OVM_FREEZE) {
                         ui_add(B_SV_OVROW + g_sv_ov_sel * 8 + 2, ix, iy, 40, rh, "-", "", "The frame before (Shift: 10).", 0, a->ov_frame[g_sv_ov_sel] > 0, 0);
                         svl(ix + 46, iy, iw - 92, rh, 0, SVL_VALUE, SV_ONE | DT_CENTER, "frozen on frame %d / %d", a->ov_frame[g_sv_ov_sel], o->frames - 1);
@@ -10377,6 +10543,9 @@ static void sv_layout_main(HWND hwnd) {
                 if (!listed) missing++;
             }
             if (missing) { ui_addf(B_SV_OV_RELOAD, ix, iy, iw, rh, "Add the room's other overlays", "", "List the overlays of this room that this action doesn't have yet (unchanged).", 0, a->nov < SCRIPT_MAX_OVERLAYS, 0); iy += rh + 5; }
+            ui_add(B_SV_OV_IMPORT, ix, iy, iw, rh, "Import from another room...", "", "Use overlays of another room here: pick the room, then one of its overlays or all of them. Their frames stay in that room's folder; place them here next.",
+                   0, a->nov < SCRIPT_MAX_OVERLAYS && g_ov_n < MAX_ROOM_OVERLAYS, 0);
+            iy += rh + 5;
             break;
         }
         case ACT_CAMERA: {
@@ -10565,11 +10734,19 @@ static void sv_paint(HWND hwnd, HDC hdc) {
     /* grid */
     ui_fill(hdc, &g_sv_grid_rc, RGB(20, 20, 26));
     if (s) {
-        int cw = (g_sv_grid_rc.right - g_sv_grid_rc.left - SV_ROWHDR_W) / s->cols;
+        int cw = sv_col_w(s), vcols = sv_cols_visible(s);
         SelectObject(hdc, ui_font(12, 1));
-        for (int c = 0; c < s->cols; c++) {
-            snprintf(t, sizeof(t), "COLUMN %d", c + 1);
-            ui_text(hdc, g_sv_grid_rc.left + SV_ROWHDR_W + c * cw, g_sv_grid_rc.top, cw, SV_HDR_H, t, c == g_sv_col ? RGB(255, 210, 90) : SVL_SECTION, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        for (int c = g_sv_hscroll; c < g_sv_hscroll + vcols && c < s->cols; c++) {
+            if (c == g_sv_hscroll && g_sv_hscroll > 0) snprintf(t, sizeof(t), "<  COLUMN %d", c + 1);
+            else if (c == g_sv_hscroll + vcols - 1 && c < s->cols - 1) snprintf(t, sizeof(t), "COLUMN %d  >", c + 1);
+            else snprintf(t, sizeof(t), "COLUMN %d", c + 1);
+            ui_text(hdc, sv_col_x(s, c), g_sv_grid_rc.top, cw, SV_HDR_H, t, c == g_sv_col ? RGB(255, 210, 90) : SVL_SECTION, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        }
+        if (s->cols > vcols) { /* where the columns shown are among all of them */
+            int tw = g_sv_grid_rc.right - g_sv_grid_rc.left - SV_ROWHDR_W, bw = tw * vcols / s->cols;
+            int bx = g_sv_grid_rc.left + SV_ROWHDR_W + (tw - bw) * g_sv_hscroll / (s->cols - vcols);
+            RECT tr = { g_sv_grid_rc.left + SV_ROWHDR_W, g_sv_grid_rc.bottom - 5, g_sv_grid_rc.right, g_sv_grid_rc.bottom - 1 }, br = { bx, tr.top, bx + bw, tr.bottom };
+            ui_fill(hdc, &tr, RGB(34, 34, 42)); ui_fill(hdc, &br, RGB(110, 110, 125));
         }
         int vis = sv_grid_rows_visible(), total = sv_grid_rows_total();
         for (int r = g_sv_scroll; r < g_sv_scroll + vis && r < total + vis; r++) {
@@ -10592,7 +10769,7 @@ static void sv_paint(HWND hwnd, HDC hdc) {
             snprintf(t, sizeof(t), "%d", r + 1);
             ui_text(hdc, g_sv_grid_rc.left, y, SV_ROWHDR_W - 6, SV_ROW_H - 14, t, beyond ? RGB(70, 70, 80) : r == g_sv_row ? RGB(255, 210, 90) : RGB(170, 170, 180), DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
             if (!beyond && script_row_has_move(s, r)) { SelectObject(hdc, ui_font(11, 0)); ui_text(hdc, g_sv_grid_rc.left, y + SV_ROW_H - 18, SV_ROWHDR_W - 6, 14, "no skip", RGB(150, 130, 90), DT_RIGHT | DT_SINGLELINE); }
-            for (int c = 0; c < s->cols; c++) {
+            for (int c = g_sv_hscroll; c < s->cols && c < g_sv_hscroll + sv_cols_visible(s); c++) {
                 RECT cr; sv_cell_rect(r, c, &cr);
                 ScriptAction *a = script_at(s, r, c);
                 int sel = r == g_sv_row && c == g_sv_col, hov = g_sv_hover == r * SCRIPT_MAX_COLS + c;
@@ -10621,7 +10798,7 @@ static void sv_paint(HWND hwnd, HDC hdc) {
                 int rr, cc;
                 if (!script_find(s, g_sv_sel_ids[i], &rr, &cc)) continue;
                 RECT dr; sv_cell_rect(rr + g_sv_cdrag_dr, cc + g_sv_cdrag_dc, &dr);
-                if (dr.bottom < g_sv_grid_rc.top + SV_HDR_H || dr.top > g_sv_grid_rc.bottom) continue;
+                if (dr.bottom < g_sv_grid_rc.top + SV_HDR_H || dr.top > g_sv_grid_rc.bottom || !sv_col_shown(s, cc + g_sv_cdrag_dc)) continue;
                 COLORREF gc = ok ? RGB(110, 230, 140) : RGB(255, 100, 90);
                 ui_frame(hdc, &dr, gc); InflateRect(&dr, -2, -2); ui_frame(hdc, &dr, gc);
             }
@@ -11008,6 +11185,12 @@ static void sv_wheel(int x, int y, int delta) {
         return;
     }
     (void)y;
+    if (GetKeyState(VK_SHIFT) & 0x8000) { /* sideways: the columns */
+        Script *cs = sv_cur();
+        g_sv_hscroll -= n;
+        if (cs) sv_hscroll_clamp(cs);
+        return;
+    }
     g_sv_scroll -= n * 2;
     int maxs = sv_grid_rows_total() + 1 - sv_grid_rows_visible();
     if (g_sv_scroll > maxs) g_sv_scroll = maxs;

@@ -103,7 +103,7 @@ typedef struct {
 } Script;
 
 #define SCRIPT_DEFAULT_COLS 3
-#define SCRIPT_MAX_COLS 8
+#define SCRIPT_MAX_COLS 16
 
 void script_init(Script *s, const char *name);
 void script_free(Script *s);

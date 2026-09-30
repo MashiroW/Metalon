@@ -97,6 +97,10 @@ No file of the original game is needed.
     radial menu. "Place character" chooses its side and AI too;
   - "Animate character" and "Sound" can have a random pool: one of them
     is picked each time;
+  - **Overlays** can come from another room too ("Import from another
+    room...": one of its overlays or all of them; their frames stay in that
+    room's folder, their place is set here; an imported one can be taken
+    out again);
   - **Speak**: a character says a line (a sound -- the room's own lines
     are listed first) with its portrait shown until the line is over. Each
     character's portrait (sprites `bigports.1-71`) is chosen the first time
