@@ -42,6 +42,10 @@ void script_ensure_rows(Script *s, int rows) {
 void script_insert_row(Script *s, int row) {
     if (row < 0) row = 0;
     if (row > s->rows) row = s->rows;
+    for (int z = 0; z < s->nzones; z++) { /* before a zone: it moves down; inside: it grows */
+        if (row <= s->zone[z].row0) s->zone[z].row0++;
+        else if (row < s->zone[z].row0 + s->zone[z].rows) s->zone[z].rows++;
+    }
     script_ensure_rows(s, s->rows + 1);
     memmove(&s->cell[(size_t)(row + 1) * s->cols], &s->cell[(size_t)row * s->cols], sizeof(ScriptAction) * (size_t)(s->rows - 1 - row) * s->cols);
     memset(&s->cell[(size_t)row * s->cols], 0, sizeof(ScriptAction) * s->cols);
@@ -49,6 +53,25 @@ void script_insert_row(Script *s, int row) {
 
 void script_delete_row(Script *s, int row) {
     if (row < 0 || row >= s->rows) return;
+    for (int z = 0; z < s->nzones; z++) {
+        ScriptZone *zn = &s->zone[z];
+        if (row < zn->row0) { zn->row0--; continue; }
+        if (row >= zn->row0 + zn->rows) continue;
+        /* a row of a zone: its actions move to empty cells of their lane first (the zone only shrinks) */
+        for (int c = 0; c < s->cols; c++) {
+            ScriptAction *a = script_at(s, row, c);
+            if (a->type == ACT_NONE) continue;
+            for (int r = zn->row0; r < zn->row0 + zn->rows; r++) {
+                ScriptAction *b = script_at(s, r, c);
+                if (r != row && b->type == ACT_NONE) { *b = *a; memset(a, 0, sizeof(*a)); break; }
+            }
+        }
+        zn->rows--;
+    }
+    for (int z = 0; z < s->nzones; z++) if (s->zone[z].rows <= 0) { /* a zone of no row: gone */
+        memmove(&s->zone[z], &s->zone[z + 1], sizeof(ScriptZone) * (size_t)(s->nzones - z - 1));
+        s->nzones--; z--;
+    }
     memmove(&s->cell[(size_t)row * s->cols], &s->cell[(size_t)(row + 1) * s->cols], sizeof(ScriptAction) * (size_t)(s->rows - 1 - row) * s->cols);
     s->rows--;
 }
@@ -65,6 +88,53 @@ static void script_regrid(Script *s, int cols, int drop) {
     free(s->cell);
     s->cell = c; s->cols = cols;
 }
+int script_zone_at(const Script *s, int row) {
+    for (int z = 0; z < s->nzones; z++) if (row >= s->zone[z].row0 && row < s->zone[z].row0 + s->zone[z].rows) return z;
+    return -1;
+}
+int script_zone_make(Script *s, int row0, int n) {
+    if (row0 < 0 || n < 1 || s->nzones >= SCRIPT_MAX_ZONES) return -1;
+    for (int z = 0; z < s->nzones; z++)
+        if (row0 < s->zone[z].row0 + s->zone[z].rows && s->zone[z].row0 < row0 + n) return -1;
+    script_ensure_rows(s, row0 + n);
+    int z = 0;
+    while (z < s->nzones && s->zone[z].row0 < row0) z++;
+    memmove(&s->zone[z + 1], &s->zone[z], sizeof(ScriptZone) * (size_t)(s->nzones - z));
+    s->nzones++;
+    s->zone[z].row0 = row0; s->zone[z].rows = n; s->zone[z].sec_per_row = 1.0f;
+    for (int r = row0; r < row0 + n; r++) /* what's there already starts at its row's time */
+        for (int c = 0; c < s->cols; c++) script_at(s, r, c)->start = (float)(r - row0) * s->zone[z].sec_per_row;
+    return z;
+}
+void script_zone_remove(Script *s, int z) {
+    if (z < 0 || z >= s->nzones) return;
+    ScriptZone zn = s->zone[z];
+    /* each lane's actions in the order they start, from the zone's first row */
+    for (int c = 0; c < s->cols; c++) {
+        ScriptAction tmp[256]; int n = 0;
+        for (int r = zn.row0; r < zn.row0 + zn.rows && n < 256; r++) {
+            ScriptAction *a = script_at(s, r, c);
+            if (a->type != ACT_NONE) tmp[n++] = *a;
+        }
+        for (int i = 1; i < n; i++) for (int j = i; j > 0 && tmp[j].start < tmp[j - 1].start; j--) { ScriptAction t = tmp[j]; tmp[j] = tmp[j - 1]; tmp[j - 1] = t; }
+        for (int r = zn.row0, i = 0; r < zn.row0 + zn.rows; r++, i++) {
+            ScriptAction *a = script_at(s, r, c);
+            if (i < n) { *a = tmp[i]; a->start = 0.0f; } else memset(a, 0, sizeof(*a));
+        }
+    }
+    memmove(&s->zone[z], &s->zone[z + 1], sizeof(ScriptZone) * (size_t)(s->nzones - z - 1));
+    s->nzones--;
+}
+int script_zone_free_row(Script *s, int z, int col) {
+    if (z < 0 || z >= s->nzones || col < 0 || col >= s->cols) return -1;
+    ScriptZone *zn = &s->zone[z];
+    script_ensure_rows(s, zn->row0 + zn->rows);
+    for (int r = zn->row0; r < zn->row0 + zn->rows; r++) if (script_at(s, r, col)->type == ACT_NONE) return r;
+    int last = zn->row0 + zn->rows - 1; /* full: one more row, inside the zone */
+    script_insert_row(s, last);
+    return last;
+}
+
 void script_add_col(Script *s) { if (s->cols < SCRIPT_MAX_COLS) script_regrid(s, s->cols + 1, -1); }
 void script_delete_col(Script *s, int col) { if (s->cols > 1 && col >= 0 && col < s->cols) script_regrid(s, s->cols - 1, col); }
 
@@ -299,7 +369,20 @@ int scripts_load(const char *path, Script **out) {
         else if (!strncmp(s, "auto ", 5)) cur.auto_run = atoi(s + 5) != 0;
         else if (!strncmp(s, "columns ", 8)) { int c = atoi(s + 8); if (c >= 1 && c <= SCRIPT_MAX_COLS && cur.rows == 0) cur.cols = c; }
         else if (!strncmp(s, "cell ", 5)) parse_cell(&cur, s);
+        else if (!strncmp(s, "zone ", 5)) {
+            ScriptZone z; memset(&z, 0, sizeof(z));
+            if (sscanf(s + 5, "%d %d %f", &z.row0, &z.rows, &z.sec_per_row) == 3 && z.rows > 0 && cur.nzones < SCRIPT_MAX_ZONES) {
+                if (z.sec_per_row <= 0.0f) z.sec_per_row = 1.0f;
+                cur.zone[cur.nzones++] = z;
+            }
+        }
+        else if (!strncmp(s, "start ", 6)) {
+            int id = 0; float t = 0.0f;
+            ScriptAction *a;
+            if (sscanf(s + 6, "%d %f", &id, &t) == 2 && (a = script_find(&cur, id, NULL, NULL)) != NULL) a->start = t;
+        }
         else if (!strcmp(s, "end")) {
+            for (int z = 0; z < cur.nzones; z++) script_ensure_rows(&cur, cur.zone[z].row0 + cur.zone[z].rows);
             if (n == cap) { cap = cap ? cap * 2 : 8; *out = (Script *)realloc(*out, sizeof(Script) * cap); }
             (*out)[n++] = cur;
             in = 0;
@@ -350,10 +433,16 @@ int scripts_save(const char *path, const Script *s, int n) {
     fprintf(f, "# Silver Remaster room scripts (Scripts screen: S). One action per cell; rows play one after the other.\n");
     for (int i = 0; i < n; i++) {
         fprintf(f, "script %s\nauto %d\ncolumns %d\n", s[i].name, s[i].auto_run, s[i].cols);
+        for (int z = 0; z < s[i].nzones; z++) fprintf(f, "zone %d %d %.3f\n", s[i].zone[z].row0, s[i].zone[z].rows, s[i].zone[z].sec_per_row);
         for (int r = 0; r < s[i].rows; r++)
             for (int c = 0; c < s[i].cols; c++) {
                 const ScriptAction *a = &s[i].cell[(size_t)r * s[i].cols + c];
                 if (a->type != ACT_NONE) write_cell(f, r, c, a);
+            }
+        for (int r = 0; r < s[i].rows; r++) /* when the actions of a timeline zone start */
+            for (int c = 0; c < s[i].cols; c++) {
+                const ScriptAction *a = &s[i].cell[(size_t)r * s[i].cols + c];
+                if (a->type != ACT_NONE && script_zone_at(&s[i], r) >= 0) fprintf(f, "start %d %.3f\n", a->id, a->start);
             }
         fprintf(f, "end\n");
     }

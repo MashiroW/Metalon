@@ -110,6 +110,17 @@ No file of the original game is needed.
 - Camera action: the view slides (over the chosen seconds) to David, to
   a point of the room, or stays, and zooms (x1-x3, or the room's own
   zoom). Each room's zoom is a setting (N in the editor: Camera zoom).
+- **Advanced timeline**: select rows (Shift+click / Shift+arrows), then
+  "Make timeline". In it the actions start at their own time and can
+  overlap: each is a block as tall as it lasts (instant ones are thin
+  lines; a character walking somewhere or an animation "until the others
+  end" is shown with its last measured length, or an estimate), the
+  columns are lanes. Drag an action up / down to set when it starts
+  (0.05 s steps, Shift: 0.01) or sideways to another lane; click / double
+  click an empty spot to add one there. Zoom in / out changes the seconds
+  per row. When playing, the zone is over as soon as all its actions
+  are -- not when its rows are -- and the rows after it go on. "Back to
+  rows" turns it back into plain rows.
 - A script plays when David arrives through a connector that names it (the
   connector wizard asks for it; also "Arrival script..." on a connector),
   or, entering the room otherwise, the room's first script marked *auto*.

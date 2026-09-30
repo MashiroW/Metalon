@@ -1594,3 +1594,9 @@ Validation, before removing the old data:
   the script goes on (released after the next row started, so an
   animation there follows with no idle frame); optional freeze until the
   end of its row.
+- Advanced timeline zones: a range of rows (`zone <row0> <rows> <s/row>`)
+  whose actions have a start time (`start <id> <s>`); played on a clock,
+  overlapping, ended when all are over. Durations: instant / known /
+  dynamic (measured when played, estimate before). Editor: blocks as tall
+  as they last, lanes = columns, drag to move, hover for details,
+  zoom, make / end a timeline from a row selection.

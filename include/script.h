@@ -2,6 +2,11 @@
    after the other; every action of a row starts at the same time and the
    next row starts once all of them are finished. Any number of rows,
    3 columns by default (more can be added).
+   A range of rows can be an ADVANCED TIMELINE (a zone): its actions start
+   at their own time (`start`, seconds from the zone's start) and may
+   overlap; the columns are its lanes, the rows only hold the actions (and
+   give the zone its height: `sec_per_row` seconds each). The zone is over
+   once all its actions are, then the rows after it go on.
    Saved per room in data/rooms/<level>/<room>_scripts.cfg -- see
    scripts_save for the format. */
 #ifndef SILVER_SCRIPT_H
@@ -68,14 +73,20 @@ typedef struct {
     int ov_mode[SCRIPT_MAX_OVERLAYS];  /* OVM_* */
     int ov_frame[SCRIPT_MAX_OVERLAYS]; /* OVM_FREEZE: the frame shown */
     char script[64];                   /* ROOM: the target room's script played on arrival ("" = its auto script, like a connector without one) */
+    float start;                       /* in a timeline zone: when it starts, seconds from the zone's start */
     int cam_target;                    /* CAMERA: CAM_* */
     float zoom;                        /* CAMERA: x1..x3, 0 = the room's own */
 } ScriptAction;
 const char *overlay_mode_name(int mode);
 
+#define SCRIPT_MAX_ZONES 16
+typedef struct { int row0, rows; float sec_per_row; } ScriptZone;
+
 typedef struct {
     char name[64];
     int auto_run;                      /* played when David enters the room */
+    int nzones;                        /* advanced timeline zones, by row */
+    ScriptZone zone[SCRIPT_MAX_ZONES];
     int cols, rows;
     ScriptAction *cell;                /* rows * cols, row by row */
     int next_id;
@@ -96,6 +107,13 @@ void script_delete_col(Script *s, int col);
 int script_used_rows(const Script *s);                  /* last row holding an action + 1 */
 int script_row_empty(const Script *s, int row);
 ScriptAction *script_find(Script *s, int id, int *row, int *col);
+/* timeline zones: the one holding `row` (-1: none); rows row0..row0+n-1 become one
+   (their actions start at their row's time; -1 if it would overlap another); back to rows */
+int script_zone_at(const Script *s, int row);
+int script_zone_make(Script *s, int row0, int n);
+void script_zone_remove(Script *s, int z);
+/* an empty cell of a zone's lane (column) for a new action, the zone grown by a row if full (-1: none) */
+int script_zone_free_row(Script *s, int z, int col);
 void action_init(Script *s, ScriptAction *a, int type); /* defaults + a new id */
 
 const char *action_type_name(int type);
