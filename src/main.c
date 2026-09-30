@@ -261,6 +261,10 @@ typedef struct {
     int trail;                 /* the clip leaves a blue trail behind its blades (specials) */
     int guard;                 /* shield: 0 down, 1 raising / held, 2 lowering */
     float play_speed;          /* the clip's own speed (script "Animate character"), 0 = the game's animation speed */
+    int play_script;           /* the clip is a script's "Animate character" */
+    int play_ended;            /* ...and it's over: held on its last frame until the script goes on (no idle in between) */
+    int play_freeze;           /* ...held until its row is over ("Freeze on the last frame") */
+    int hold_step;             /* the script step (g_run.step) it belongs to */
     CuePlayer cue;             /* the attack's sounds playing */
 } Actor;
 static int g_atk_queued = -1;  /* attack mode: the next attack, asked for while one plays */
@@ -1412,7 +1416,7 @@ static void actor_play_end(Actor *a) {
     if (a->stepping) { memcpy(a->pos, a->step_to, sizeof(float) * 2); a->pos[2] = a->step_to[2]; a->stepping = 0; }
     if (a->play_event) actor_apply_event(a);
     a->trail = 0;
-    a->play_clip = -1; a->play_hold = 0;
+    a->play_clip = -1; a->play_hold = 0; a->play_script = 0; a->play_ended = 0; a->play_freeze = 0;
     if (a->play_next >= 0) { /* chained (shield: raised, then held) */
         a->play_clip = a->play_next; a->play_t = 0.0f; a->play_left = a->play_next_loop ? -1 : 1; a->play_speed = 0.0f;
         a->play_next = -1;
@@ -1438,9 +1442,12 @@ static int advance_character(float dt) {
             if (g_room_mesh_tri_count > 0 && floor_below(a->pos[0], a->pos[2], a->pos[1], NAV_MAX_STEP, g_room_mesh_tris, g_room_mesh_tri_count, &gy)) a->pos[1] = gy;
         }
         if (a->play_event && a->play_t >= a->play_event_at) actor_apply_event(a); /* e.g. the weapon changes in the middle of the sheathing */
-        if (d <= 0.0f) actor_play_end(a);
+        if (a->play_ended) a->play_t = d > 0.001f ? d - 0.001f : 0.0f; /* a script clip over: its last frame, until the script goes on */
+        else if (d <= 0.0f) { if (a->play_script) { a->play_ended = 1; a->play_t = 0.0f; } else actor_play_end(a); }
         else if (a->play_t >= d) {
-            if (a->play_left > 0 && --a->play_left == 0) actor_play_end(a);
+            if (a->play_left > 0 && --a->play_left == 0) {
+                if (a->play_script) { a->play_ended = 1; a->play_t = d - 0.001f; } else actor_play_end(a);
+            }
             else a->play_t = fmodf(a->play_t, d);
         }
     }
@@ -5287,6 +5294,7 @@ static void actor_play_once(Actor *a, int clip, float step) {
     a->moving = 0; a->walk_mode = 0; a->waypoint_count = 0; a->pending_door = -1;
     if (a == DAVID_ACTOR) g_click_marker_active = 0;
     a->play_clip = clip; a->play_t = 0.0f; a->play_left = 1; a->play_attack = 0; a->play_next = -1; a->trail = 0; a->play_hold = 0; a->play_speed = 0.0f;
+    a->play_script = 0; a->play_ended = 0; a->play_freeze = 0;
     a->play_turn = clip_turn(a, clip);
     actor_plan_step(a, step);
 }
@@ -6821,6 +6829,7 @@ static struct {
     CellRun cell[SCRIPT_MAX_COLS];
     int voice_action[RUN_MAX_VOICES], voice_id[RUN_MAX_VOICES], nvoices;
     int leave;          /* a "Change room" started: the script ends once its row has started */
+    int step;           /* +1 each time the script goes on to its next row */
 } g_run;
 
 static int script_playing(void) { return g_run.active; }
@@ -6830,6 +6839,7 @@ static void run_stop_anims(void) {
     for (int k = 0; k < MAX_ACTORS; k++) {
         Actor *a = &g_actors[k];
         if (a->play_hold && a->play_clip >= 0) continue;
+        a->play_script = 0; a->play_ended = 0; a->play_freeze = 0;
         if (a->play_event) actor_play_end(a); /* an equipment change isn't lost */
         a->play_clip = -1; a->play_attack = 0; a->play_turn = 0.0f; a->stepping = 0; a->trail = 0; a->play_next = -1;
     }
@@ -6921,6 +6931,8 @@ static void run_start_anim(const ScriptAction *a, CellRun *c) {
     ac->play_clip = clip; ac->play_t = 0.0f; ac->play_next = -1; ac->play_speed = a->speed;
     ac->play_left = (a->anim_mode == ANIM_ROW || a->anim_mode == ANIM_LOOP) ? -1 : (a->repeat < 1 ? 1 : a->repeat);
     ac->play_hold = a->anim_mode == ANIM_LOOP;
+    ac->play_script = 1; ac->play_ended = 0; ac->hold_step = g_run.step;
+    ac->play_freeze = a->freeze && a->anim_mode == ANIM_TIMES;
     if (a->anim_mode == ANIM_LOOP) return; /* the row goes on at once */
     c->actor = ac; c->clip = clip;
     c->row_long = a->anim_mode == ANIM_ROW;
@@ -7013,7 +7025,7 @@ static int run_cell_done(const ScriptAction *a, CellRun *c, float dt) {
         }
         case ACT_ANIM:
             if (c->row_long) return 0; /* decided by the rest of the row (script_tick) */
-            c->done = !c->actor->used || c->actor->play_clip != c->clip;
+            c->done = !c->actor->used || c->actor->play_clip != c->clip || c->actor->play_ended;
             break;
         case ACT_MOVE: {
             Actor *ac = c->actor;
@@ -7081,6 +7093,20 @@ static void script_skip_row(void) {
     if (!g_run.row_started) { g_run.row++; }
 }
 
+/* The script clips that are over (held on their last frame) go back to the
+   character's own pose -- once the next row has started, so a clip it
+   starts follows with no idle in between. A frozen one ("Freeze on the
+   last frame") waits for the end of its row. */
+static void run_release_holds(void) {
+    for (int k = 0; k < MAX_ACTORS; k++) {
+        Actor *a = &g_actors[k];
+        if (!a->play_ended) continue;
+        if (a->play_clip < 0) { a->play_ended = a->play_script = a->play_freeze = 0; continue; }
+        if (a->play_freeze && g_run.active && a->hold_step == g_run.step) continue;
+        actor_play_end(a);
+    }
+}
+
 /* Every game step: a room just entered starts its script, then the one
    playing goes on (several rows in one step if they finish at once). */
 static void script_tick(HWND hwnd, float dt) {
@@ -7121,8 +7147,9 @@ static void script_tick(HWND hwnd, float dt) {
             if (cr->actor && cr->actor->play_clip == cr->clip) cr->actor->play_clip = -1;
             cr->done = 1;
         }
-        g_run.row++; g_run.row_started = 0;
+        g_run.row++; g_run.row_started = 0; g_run.step++;
     }
+    run_release_holds();
 }
 
 enum { SV_PICK_NONE, SV_PICK_PLACE_POS, SV_PICK_PLACE_FACE, SV_PICK_MOVE, SV_PICK_OVERLAY, SV_PICK_CAMERA };
@@ -7167,7 +7194,7 @@ static const char *script_step_text(char *buf, size_t n, const char **sub) {
    Right: the selected cell's action and its settings.
    ===================================================================== */
 enum {
-    B_SV_AN_TIMES = 280, B_SV_AN_ROW, B_SV_AN_CLIP, B_SV_PORTRAIT, B_SV_AN_LOOP, B_SV_AN_NORMAL, B_SV_AN_FOLLOW, B_SV_AN_SPD_M, B_SV_AN_SPD_P, B_SV_FADE_M, B_SV_FADE_P, /* (below B_SV_FIRST_ID: routed like the others) */
+    B_SV_AN_TIMES = 280, B_SV_AN_ROW, B_SV_AN_CLIP, B_SV_PORTRAIT, B_SV_AN_LOOP, B_SV_AN_NORMAL, B_SV_AN_FOLLOW, B_SV_AN_SPD_M, B_SV_AN_SPD_P, B_SV_FADE_M, B_SV_FADE_P, B_SV_AN_FREEZE, /* (below B_SV_FIRST_ID: routed like the others) */
     B_SV_FIRST = 300,
     B_SV_NEW = B_SV_FIRST, B_SV_RENAME, B_SV_DUP, B_SV_DELETE, B_SV_AUTO, B_SV_CLOSE,
     B_SV_PLAY, B_SV_PLAY_ROW, B_SV_ROW_INS, B_SV_ROW_DEL, B_SV_COL_ADD, B_SV_COL_DEL, B_SV_COPY, B_SV_PASTE, B_SV_CLEAR,
@@ -7811,6 +7838,7 @@ static void sv_action(HWND hwnd, int id) {
         case B_SV_AN_TIMES: a->anim_mode = ANIM_TIMES; if (a->repeat < 1) a->repeat = 1; break;
         case B_SV_AN_LOOP: a->anim_mode = ANIM_LOOP; break;
         case B_SV_AN_FOLLOW: a->speed = a->speed > 0.0f ? 0.0f : 1.0f; break;
+        case B_SV_AN_FREEZE: a->freeze = !a->freeze; break;
         case B_SV_FADE_M: case B_SV_FADE_P:
             a->fade += id == B_SV_FADE_P ? 0.5f : -0.5f;
             if (a->fade < 0.01f) a->fade = 0.0f;
@@ -8423,6 +8451,10 @@ static void sv_layout_main(HWND hwnd) {
                     ui_add(B_SV_REP_M, ix, iy, 34, rh, "-", "", "Once less.", 0, a->repeat > 1, 0);
                     svl(ix + 42, iy, iw - 84, rh, 0, SVL_VALUE, SV_ONE | DT_CENTER, "%d time%s", a->repeat, a->repeat > 1 ? "s" : "");
                     ui_add(B_SV_REP_P, ix + iw - 34, iy, 34, rh, "+", "", "Once more.", 0, a->repeat < 99, 0);
+                    iy += rh + 6;
+                    ui_add(B_SV_AN_FREEZE, ix, iy, iw, rh, a->freeze ? "[x]  Freeze on the last frame" : "[  ]  Freeze on the last frame", "",
+                           "Ticked: once over, it stays on its last frame until the other actions of the row are over. Not ticked: it goes back to its own pose (unless the next row animates it).",
+                           a->freeze, 1, 3);
                     iy += rh + 12;
                 }
                 svl(ix, iy, iw, 60, 0, SVL_DIM, DT_LEFT | DT_WORDBREAK,

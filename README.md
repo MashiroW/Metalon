@@ -89,7 +89,9 @@ No file of the original game is needed.
     over while the rest of the row lasts -- e.g. talking during a line --,
     or looped until replaced (kept after the script, until another
     animation, a "Back to normal", or a move order); at the game's
-    animation speed or at its own (x0.1-x4);
+    animation speed or at its own (x0.1-x4). A clip followed by another
+    one on the next row chains with no idle pose in between; "Freeze on
+    the last frame" keeps its last pose until the rest of the row is over;
   - **Speak**: a character says a line (a sound -- the room's own lines
     are listed first) with its portrait shown until the line is over. Each
     character's portrait (sprites `bigports.1-71`) is chosen the first time

@@ -1590,3 +1590,7 @@ Validation, before removing the old data:
 - Music fade out: the Music action fades the music playing out before its
   playlist starts (the mixer holds the playlist until the fade is over);
   Stop sound can fade the music / sounds / one sound instead of cutting.
+- Script clips chain: a clip that ends is held on its last frame until
+  the script goes on (released after the next row started, so an
+  animation there follows with no idle frame); optional freeze until the
+  end of its row.

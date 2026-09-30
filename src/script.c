@@ -171,6 +171,7 @@ void action_summary(const Script *s, const ScriptAction *a, char *out, int n) {
             else snprintf(out, n, "%s: %s", t, base_name(a->file));
             if (a->anim_mode == 0 && a->repeat > 1) { size_t l = strlen(out); snprintf(out + l, n - l, "  x%d", a->repeat); }
             if (a->speed > 0) { size_t l = strlen(out); snprintf(out + l, n - l, "  at speed x%.2f", a->speed); }
+            if (a->freeze && a->anim_mode == ANIM_TIMES) { size_t l = strlen(out); snprintf(out + l, n - l, "  (freezes)"); }
             break;
         case ACT_SPEAK:
             script_actor_name(s, a->actor, t, sizeof(t));
@@ -214,7 +215,7 @@ void action_summary(const Script *s, const ScriptAction *a, char *out, int n) {
    cell <row> <col> <id> stop action <id> | stop sounds | stop music
    cell <row> <col> <id> place <model> <has_pos> <x> <y> <z> <facing>
    cell <row> <col> <id> move <actor> <run> <door> <has_pos> <x> <y> <z>
-   cell <row> <col> <id> anim <actor> <mode> <times> <source/clip> <speed, 0 = the game's>
+   cell <row> <col> <id> anim <actor> <mode> <times> <source/clip> <speed, 0 = the game's> <freeze>
    cell <row> <col> <id> speak <actor> <file>
    cell <row> <col> <id> overlays <wait for the 'once' ones> <n> [<name> <OVM_* mode> <frozen frame>]...
    cell <row> <col> <id> room <level/room> <connector id> <script name (rest of the line) | ->
@@ -252,7 +253,7 @@ static void parse_cell(Script *s, const char *line) {
         if (fd) sscanf(fd + 6, "%f", &a.fade);
     }
     else if (!strcmp(kind, "place")) { a.type = ACT_PLACE; sscanf(p, "%47s %d %f %f %f %f", a.model, &a.has_pos, &a.pos[0], &a.pos[1], &a.pos[2], &a.facing); if (!strcmp(a.model, "-")) a.model[0] = 0; }
-    else if (!strcmp(kind, "anim")) { a.type = ACT_ANIM; sscanf(p, "%d %d %d %159s %f", &a.actor, &a.anim_mode, &a.repeat, a.file, &a.speed); }
+    else if (!strcmp(kind, "anim")) { a.type = ACT_ANIM; sscanf(p, "%d %d %d %159s %f %d", &a.actor, &a.anim_mode, &a.repeat, a.file, &a.speed, &a.freeze); }
     else if (!strcmp(kind, "speak")) { a.type = ACT_SPEAK; sscanf(p, "%d %159s", &a.actor, a.file); }
     else if (!strcmp(kind, "overlays")) {
         a.type = ACT_OVERLAY;
@@ -329,7 +330,7 @@ static void write_cell(FILE *f, int r, int c, const ScriptAction *a) {
             fprintf(f, "\n");
             break;
         case ACT_PLACE: fprintf(f, "place %s %d %.4f %.4f %.4f %.4f\n", a->model[0] ? a->model : "-", a->has_pos, a->pos[0], a->pos[1], a->pos[2], a->facing); break;
-        case ACT_ANIM: fprintf(f, "anim %d %d %d %s %.2f\n", a->actor, a->anim_mode, a->repeat, a->file[0] ? a->file : "-", a->speed); break;
+        case ACT_ANIM: fprintf(f, "anim %d %d %d %s %.2f %d\n", a->actor, a->anim_mode, a->repeat, a->file[0] ? a->file : "-", a->speed, a->freeze); break;
         case ACT_SPEAK: fprintf(f, "speak %d %s\n", a->actor, a->file[0] ? a->file : "-"); break;
         case ACT_OVERLAY:
             fprintf(f, "overlays %d %d", a->wait_end, a->nov);

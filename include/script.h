@@ -52,6 +52,7 @@ typedef struct {
     int repeat, wait_end;              /* SOUND (ANIM: repeat = times played) */
     int anim_mode;                     /* ANIM: ANIM_TIMES, ANIM_ROW, ANIM_LOOP, ANIM_NORMAL */
     float speed;                       /* ANIM: playback factor, 0 = the game's animation speed */
+    int freeze;                        /* ANIM (ANIM_TIMES): once over, held on its last frame until the rest of the row is over */
     float fade;                        /* MUSIC: the music playing fades out over it first; STOP: fades out instead of cutting (s, 0 = at once) */
     int loop;                          /* AMBIENCE */
     int stop_kind, stop_ref;           /* STOP: STOP_*; STOP_ACTION: id of the SOUND / AMBIENCE action */
