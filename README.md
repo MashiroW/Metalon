@@ -100,6 +100,9 @@ No file of the original game is needed.
     connector David comes in by, and the script that plays there.
 - While a script plays, the player can only left-click to skip the current
   row -- not a row that moves a character. Esc stops it (testing).
+- Camera action: the view slides (over the chosen seconds) to David, to
+  a point of the room, or stays, and zooms (x1-x3, or the room's own
+  zoom). Each room's zoom is a setting (N in the editor: Camera zoom).
 - A script plays when David arrives through a connector that names it (the
   connector wizard asks for it; also "Arrival script..." on a connector),
   or, entering the room otherwise, the room's first script marked *auto*.
@@ -115,7 +118,13 @@ No file of the original game is needed.
 - 8 slots around the click (kept inside the picture), each with its
   ornament on the ring; the view doesn't scroll while it's open.
 - Food, Orbs, Ranged, Magical, Backpack (Inventory, Potions, Keys),
-  Shields, Weapons, Specials. The centre goes back up.
+  Shields, Weapons, Specials. Right click goes back one level (closes it
+  at the top). A small arc points at the slot under the mouse.
+- Picking an item equips it: its slot on the first ring then shows its
+  icon (Weapons, Shields, Magical, Ranged, Orbs, Specials).
+- Sounds: pieopen when a ring opens, pieclse when it closes, pieslice on
+  hover, pieselct on a pick. Drawing or changing a weapon plays swrdeqp1
+  or swrdeqp2.
 - Weapons: short sword, broad sword, battle axe, long sword, war hammer,
   mace, bastard sword, dual knightly swords -- drawn or put away with
   `sheatmp` (the one held: put away).
@@ -135,7 +144,7 @@ No file of the original game is needed.
   left 1.25, right 1.5, down 1.5 back -- as far as the floor allows).
 - Right click: a dodge back (`dodgeb`, 4 hitbox diameters). Right button
   held: the shield up (`shldup`, `shldhold` while held, `shlddown`).
-- The weapon's combat preset: **Single Swords** (rchop / rchopp /
+- The weapon's combat preset (chosen with the weapon): **Single Swords** (rchop / rchopp /
   rchoppp, lstab, headchop, revslice, rchp180a/c) or **Double Swords** for
   the dual swords (rchoptwo, stabtwo, rslice2, hedchop2 -- `lslice2`
   isn't in the blockouts --, rlc2180a/c).
@@ -144,14 +153,19 @@ No file of the original game is needed.
 - Walking tab: the 13 clips a character walks with (stand, walk, run, the
   starts and the turns), shown as a graph with the selected clip playing
   on the character. The **Human** preset gives David's clips.
-- Combat tab: the 8 attacks of attack mode, each with its step and a pool
-  of sounds (one plays at random with the attack). The combat preset
-  follows the weapon held unless one is chosen. And what the character
-  holds in its right hand (a pair of weapons like fuge's `dualswrd`: one
-  in each hand).
-- Presets: Human, Single Swords, Double Swords, and your own -- "Save this
-  tab as a new preset" (`data/presets/`). Any slot can take another clip
-  or "no animation" without changing its preset.
+- Combat tab: the 8 attacks of attack mode, each with its step. The
+  combat preset follows the weapon held unless one is chosen.
+- Sounds tab: pools of swing sounds, hit sounds (kept for when something
+  can be hit) and grunts when hit, with the chance a grunt plays.
+- **Equipped weapon** / **Equipped shield** (top right): what the
+  character holds (a pair of weapons like fuge's `dualswrd`: one in each
+  hand) and wears on its left arm.
+- Presets for each tab (Human, Single Swords, Double Swords, David's
+  sounds, and your own in `data/presets/`): choose, save (optionally as
+  the character's default), delete (asks first). Any slot can take
+  another clip or "no animation" without changing its preset.
+- **Model presets** bundle the three tabs and the equipment: save them
+  for the character, make one its default, apply or delete them.
 - Per character, in `data/movesets/`. From the animation viewer
   (Moveset...) or a script's character actions.
 
@@ -201,6 +215,7 @@ Every tool is also a button in the side panel, with its shortcut shown.
 | Right click | the radial menu (weapons, shields, specials...) |
 | Ctrl held | attack mode: click = attack, button held + swing up / left / right / down = the other blows, right click = dodge, right button held = shield |
 | Ctrl+K | break the shield (test: nothing hits yet) |
+| Ctrl+H | David is hit: a grunt, by the moveset's chance (test) |
 | E | scene editor: V select, 1 rectangle, 2 circle, 3 polygon, Ctrl+Z undo, Del delete, right-click = roles |
 | N (editor) | David & navigation settings |
 

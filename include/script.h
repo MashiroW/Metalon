@@ -23,12 +23,14 @@ enum {
     ACT_SPEAK,      /* a character says `file` (a sound): its portrait is shown until the line is over */
     ACT_OVERLAY,    /* the room's overlays (environmental animations): each one looped, played once, frozen, hidden... */
     ACT_ROOM,       /* go to room `file` (as through a connector): David appears at its connector `door`, then `script` plays */
+    ACT_CAMERA,     /* the view slides (`seconds`) to its target (`cam_target`: CAM_*, pos[0..1] a point of the room picture) and zoom */
     ACT_COUNT
 };
 /* ACT_OVERLAY: what each overlay listed does */
 enum { OVM_KEEP, OVM_LOOP, OVM_ONCE, OVM_ONCE_HIDE, OVM_FREEZE, OVM_HIDE, OVM_COUNT };
 #define SCRIPT_MAX_OVERLAYS 16
 enum { STOP_ACTION, STOP_ALL_SOUNDS, STOP_MUSIC };
+enum { CAM_KEEP, CAM_POINT, CAM_DAVID };
 
 typedef struct {
     int type, id;                      /* id: unique in its script, never reused */
@@ -54,6 +56,8 @@ typedef struct {
     int ov_mode[SCRIPT_MAX_OVERLAYS];  /* OVM_* */
     int ov_frame[SCRIPT_MAX_OVERLAYS]; /* OVM_FREEZE: the frame shown */
     char script[64];                   /* ROOM: the target room's script played on arrival ("" = its auto script, like a connector without one) */
+    int cam_target;                    /* CAMERA: CAM_* */
+    float zoom;                        /* CAMERA: x1..x3, 0 = the room's own */
 } ScriptAction;
 const char *overlay_mode_name(int mode);
 

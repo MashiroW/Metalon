@@ -1564,3 +1564,17 @@ Validation, before removing the old data:
 - Radial menu, dodge (dodgeb), shield (shldup / shldhold / shlddown),
   equipment (sheatmp, shldquip), specials with blade trails, shield
   breaking (Ctrl+K until something hits).
+
+## 2026-09-30 -- Sounds tab, model presets, camera action
+
+- A weapon picked in the radial menu brings its combat preset: dualswrd
+  Double Swords, every other sword Single Swords.
+- Radial menu: smaller, right click = back, no centre hub, an arc on the
+  hovered slot, the equipped item's icon on its first-ring slot; pie*
+  sounds; swrdeqp1/2 when a weapon comes out or changes.
+- Moveset screen: Walking / Combat / Sounds tabs; equipped weapon and
+  shield (shields drawn in every preview); presets per tab and model
+  presets (all tabs + equipment), each can be the character's default;
+  deleting asks first. Sound pools: swing, hit, grunt (+ chance).
+- Scripts: Camera action (target, zoom, slide time); per-room camera
+  zoom setting. The view zoom is applied in get_view_window.

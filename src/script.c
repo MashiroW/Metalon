@@ -97,6 +97,7 @@ void action_init(Script *s, ScriptAction *a, int type) {
     if (type == ACT_AMBIENCE) a->loop = 1;
     if (type == ACT_STOP) a->stop_kind = STOP_ALL_SOUNDS;
     if (type == ACT_ANIM) a->repeat = 1;
+    if (type == ACT_CAMERA) { a->seconds = 1.0f; a->cam_target = CAM_DAVID; }
 }
 
 const char *overlay_mode_name(int mode) {
@@ -106,7 +107,7 @@ const char *overlay_mode_name(int mode) {
 
 const char *action_type_name(int type) {
     static const char *names[ACT_COUNT] = { "Empty", "Wait", "Background", "Music", "Sound", "Ambience", "Stop sound", "Place character", "Move character",
-                                            "Animate character", "Speak", "Overlays", "Change room" };
+                                            "Animate character", "Speak", "Overlays", "Change room", "Camera" };
     return (type >= 0 && type < ACT_COUNT) ? names[type] : "?";
 }
 
@@ -182,6 +183,13 @@ void action_summary(const Script *s, const ScriptAction *a, char *out, int n) {
             if (!shown) snprintf(out, n, "(nothing changes)");
             break;
         }
+        case ACT_CAMERA: {
+            char z[32];
+            if (a->zoom > 0) snprintf(z, sizeof(z), "zoom x%.1f", a->zoom); else snprintf(z, sizeof(z), "the room's zoom");
+            snprintf(out, n, "%s, %s, %.1f s", a->cam_target == CAM_POINT ? (a->has_pos ? "to a point" : "(no point yet)") : a->cam_target == CAM_DAVID ? "to David" : "where it looks",
+                     z, a->seconds);
+            break;
+        }
         case ACT_ROOM:
             if (!a->file[0]) { snprintf(out, n, "(no room yet)"); break; }
             snprintf(out, n, "%s%s%s", a->file, a->script[0] ? ", then " : "", a->script);
@@ -205,6 +213,7 @@ void action_summary(const Script *s, const ScriptAction *a, char *out, int n) {
    cell <row> <col> <id> speak <actor> <file>
    cell <row> <col> <id> overlays <wait for the 'once' ones> <n> [<name> <OVM_* mode> <frozen frame>]...
    cell <row> <col> <id> room <level/room> <connector id> <script name (rest of the line) | ->
+   cell <row> <col> <id> camera <CAM_* target> <zoom, 0 = the room's> <slide seconds> <has_pos> <x> <y>
    end */
 static void parse_cell(Script *s, const char *line) {
     int r, c, id, used = 0;
@@ -248,6 +257,7 @@ static void parse_cell(Script *s, const char *line) {
             }
         }
     }
+    else if (!strcmp(kind, "camera")) { a.type = ACT_CAMERA; sscanf(p, "%d %f %f %d %f %f", &a.cam_target, &a.zoom, &a.seconds, &a.has_pos, &a.pos[0], &a.pos[1]); }
     else if (!strcmp(kind, "room")) {
         a.type = ACT_ROOM;
         int k = 0;
@@ -315,6 +325,7 @@ static void write_cell(FILE *f, int r, int c, const ScriptAction *a) {
             for (int i = 0; i < a->nov; i++) fprintf(f, " %s %d %d", a->ov_name[i], a->ov_mode[i], a->ov_frame[i]);
             fprintf(f, "\n");
             break;
+        case ACT_CAMERA: fprintf(f, "camera %d %.2f %.2f %d %.1f %.1f\n", a->cam_target, a->zoom, a->seconds, a->has_pos, a->pos[0], a->pos[1]); break;
         case ACT_ROOM: fprintf(f, "room %s %d %s\n", a->file[0] ? a->file : "-", a->door, a->script[0] ? a->script : "-"); break;
         case ACT_MOVE: fprintf(f, "move %d %d %d %d %.4f %.4f %.4f\n", a->actor, a->run, a->door, a->has_pos, a->pos[0], a->pos[1], a->pos[2]); break;
     }
