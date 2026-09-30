@@ -123,6 +123,10 @@ No file of the original game is needed.
   A sound, a line or an animation can be cut: drag its top edge down to
   start further into it, its bottom edge up to end it earlier (a wait or
   a camera slide: its length); orange dots mark a cut end.
+  Blocks of a lane never go into each other: a dragged block (or group)
+  or edge stops against its neighbour, an action made longer (another
+  file, more repeats...) pushes the next ones of its lane later. Instant
+  ones may sit on a block's edge, not inside it.
 - Groups of actions: Ctrl+click adds / removes one, Shift+click takes all
   the actions of the rows from the selected one, a rectangle drawn from an
   empty spot takes the ones it touches. Drag one of them to move them all

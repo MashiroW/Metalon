@@ -7439,6 +7439,8 @@ static int g_sv_band = 0, g_sv_band_zone = -1, g_sv_band_x0, g_sv_band_y0, g_sv_
 static int g_sv_cdrag = 0, g_sv_cdrag_r0, g_sv_cdrag_c0, g_sv_cdrag_dr, g_sv_cdrag_dc; /* plain rows: the group dragged by (dr, dc) cells */
 static float g_sv_gt0[SV_MAX_SEL];          /* a timeline group dragged: each one's start, lane, when it began */
 static int g_sv_glane0[SV_MAX_SEL], g_sv_gdc = 0, g_sv_drag_c0 = 0, g_sv_drag_id = 0;
+static float g_sv_last_dt = 0.0f, g_sv_rsz_last = 0.0f; /* the last position a drag / an edge had with nothing overlapping */
+static int g_sv_drag_free = 0;              /* the dragged ones already overlapped something when the drag began: not held back */
 static int sv_sel_has(int id);
 static int g_sv_rsz = 0;                    /* an action of a timeline resized: 1 its top edge, 2 its bottom edge */
 static float g_sv_rsz_start, g_sv_rsz_in, g_sv_rsz_out, g_sv_rsz_sec, g_sv_rsz_len;
@@ -7495,7 +7497,8 @@ static ScriptAction *sv_cell(int make) {
     if (make) script_ensure_rows(s, g_sv_row + 1);
     return script_at(s, g_sv_row, g_sv_col);
 }
-static void sv_changed(void) { room_scripts_save(); }
+static void sv_zones_unoverlap(Script *s);
+static void sv_changed(void) { Script *s = sv_cur(); if (s) sv_zones_unoverlap(s); room_scripts_save(); }
 
 /* every SOUND / AMBIENCE action (STOP targets) or PLACE action (MOVE characters) of a script */
 static int sv_actions_of(Script *s, int t1, int t2, ScriptAction **out, int *rows, int max) {
@@ -8030,6 +8033,63 @@ static void sv_paint_zone_tip(HDC hdc) {
     ui_text(hdc, x + 8, y + 40, w - 16, 16, l3, RGB(140, 210, 210), SV_ONE);
 }
 static int sv_sel_has(int id) { for (int i = 0; i < g_sv_sel_n; i++) if (g_sv_sel_ids[i] == id) return 1; return 0; }
+/* ---- NO OVERLAP IN A LANE: two blocks of a lane never go into each other;
+   an instant one may be on a block's edge, not inside it; two instant ones
+   stay 0.05 s apart. (Other lanes: anything goes, that's what they're for.) ---- */
+static int sv_ev_collide(float s1, float l1, int i1, float s2, float l2, int i2) {
+    const float e = 1e-4f;
+    if (i1 && i2) return fabsf(s1 - s2) < 0.05f - e;
+    if (i1) return s2 + e < s1 && s1 < s2 + l2 - e;
+    if (i2) return s1 + e < s2 && s2 < s1 + l1 - e;
+    return s1 < s2 + l2 - e && s2 < s1 + l1 - e;
+}
+/* would one of these actions (ids) overlap another action of its lane (not one of them)? */
+static int sv_ids_collide(Script *s, int zi, const int *ids, int n) {
+    const ScriptZone *z = &s->zone[zi];
+    for (int i = 0; i < n; i++) {
+        int r, c;
+        const ScriptAction *a = script_find(s, ids[i], &r, &c);
+        if (!a || script_zone_at(s, r) != zi) continue;
+        int k1; float l1 = sv_event_len(s, zi, a, &k1);
+        for (int rr = z->row0; rr < z->row0 + z->rows && rr < s->rows; rr++) {
+            const ScriptAction *b = script_at(s, rr, c);
+            if (b->type == ACT_NONE || b == a) continue;
+            int mine = 0;
+            for (int j = 0; j < n; j++) if (ids[j] == b->id) mine = 1;
+            if (mine) continue;
+            int k2; float l2 = sv_event_len(s, zi, b, &k2);
+            if (sv_ev_collide(a->start, l1, k1 == DUR_INSTANT, b->start, l2, k2 == DUR_INSTANT)) return 1;
+        }
+    }
+    return 0;
+}
+/* After any change (a longer sound, another clip, a new action dropped in a
+   block...): in each lane, in the order they start, an action that would go
+   into the one before it starts at its end instead (and so on down the lane). */
+static void sv_zones_unoverlap(Script *s) {
+    for (int zi = 0; zi < s->nzones; zi++) {
+        const ScriptZone *z = &s->zone[zi];
+        for (int c = 0; c < s->cols; c++) {
+            ScriptAction *ev[256]; int n = 0;
+            for (int r = z->row0; r < z->row0 + z->rows && r < s->rows && n < 256; r++) {
+                ScriptAction *a = script_at(s, r, c);
+                if (a->type != ACT_NONE) ev[n++] = a;
+            }
+            int inst[256]; float len[256];
+            for (int i = 0; i < n; i++) { int k; len[i] = sv_event_len(s, zi, ev[i], &k); inst[i] = k == DUR_INSTANT; }
+            for (int i = 1; i < n; i++) /* by start, the instant ones first when equal */
+                for (int j = i; j > 0 && (ev[j]->start < ev[j - 1]->start - 1e-5f || (fabsf(ev[j]->start - ev[j - 1]->start) <= 1e-5f && inst[j] && !inst[j - 1])); j--) {
+                    ScriptAction *ta = ev[j]; ev[j] = ev[j - 1]; ev[j - 1] = ta;
+                    int ti = inst[j]; inst[j] = inst[j - 1]; inst[j - 1] = ti;
+                    float tl = len[j]; len[j] = len[j - 1]; len[j - 1] = tl;
+                }
+            for (int i = 1; i < n; i++) {
+                float min = (inst[i] && inst[i - 1]) ? ev[i - 1]->start + 0.05f : ev[i - 1]->start + (inst[i - 1] ? 0.0f : len[i - 1]);
+                if (ev[i]->start < min - 1e-4f) ev[i]->start = roundf(min * 1000.0f) / 1000.0f;
+            }
+        }
+    }
+}
 /* where the group is: -1 plain rows, else its timeline; -2 empty */
 static int sv_sel_kind(Script *s) {
     int r;
@@ -8121,6 +8181,15 @@ static int sv_zone_group_lanes(Script *s, int zi, int dc) {
     }
     return 1;
 }
+/* the group's starts: each one's when the drag began + dt */
+static void sv_group_shift(Script *s, float dt) {
+    for (int i = 0; i < g_sv_sel_n; i++) {
+        ScriptAction *b = script_find(s, g_sv_sel_ids[i], NULL, NULL);
+        if (!b) continue;
+        float t = roundf((g_sv_gt0[i] + dt) * 1000.0f) / 1000.0f;
+        if (fabsf(t - b->start) > 1e-4f) { b->start = t; g_sv_drag_moved = 1; }
+    }
+}
 /* dragging a timeline group: up / down = their starts (0.05 s steps, Shift: 0.01; none before 0), sideways = other lanes */
 static void sv_drag_move(int x, int y) {
     Script *s = sv_cur();
@@ -8134,18 +8203,28 @@ static void sv_drag_move(int x, int y) {
     float mn = 1e9f;
     for (int i = 0; i < g_sv_sel_n; i++) if (g_sv_gt0[i] < mn) mn = g_sv_gt0[i];
     if (mn + dt < 0.0f) dt = -mn;
-    for (int i = 0; i < g_sv_sel_n; i++) {
-        ScriptAction *b = script_find(s, g_sv_sel_ids[i], NULL, NULL);
-        if (!b) continue;
-        float t = roundf((g_sv_gt0[i] + dt) * 1000.0f) / 1000.0f;
-        if (fabsf(t - b->start) > 1e-4f) { b->start = t; g_sv_drag_moved = 1; }
+    sv_group_shift(s, dt);
+    if (!g_sv_drag_free && sv_ids_collide(s, zi, g_sv_sel_ids, g_sv_sel_n)) { /* as far as it goes toward there without going into a neighbour */
+        float best = g_sv_last_dt, dir = dt > g_sv_last_dt ? step : -step;
+        for (float tt = g_sv_last_dt + dir; dir > 0 ? tt <= dt + 1e-4f : tt >= dt - 1e-4f; tt += dir) {
+            if (mn + tt < -1e-4f) break;
+            sv_group_shift(s, tt);
+            if (sv_ids_collide(s, zi, g_sv_sel_ids, g_sv_sel_n)) break;
+            best = tt;
+        }
+        dt = best;
+        sv_group_shift(s, dt);
     }
+    g_sv_last_dt = dt;
     int cw = (g_sv_grid_rc.right - g_sv_grid_rc.left - SV_ROWHDR_W) / s->cols;
     c = (x - g_sv_grid_rc.left - SV_ROWHDR_W) / cw;
     if (c < 0) c = 0;
     if (c >= s->cols) c = s->cols - 1;
     int dc = c - g_sv_drag_c0;
-    if (dc != g_sv_gdc && sv_zone_group_lanes(s, zi, dc)) { g_sv_gdc = dc; g_sv_drag_moved = 1; }
+    if (dc != g_sv_gdc && sv_zone_group_lanes(s, zi, dc)) {
+        if (!g_sv_drag_free && sv_ids_collide(s, zi, g_sv_sel_ids, g_sv_sel_n)) sv_zone_group_lanes(s, zi, g_sv_gdc); /* no room there: back */
+        else { g_sv_gdc = dc; g_sv_drag_moved = 1; }
+    }
     if (script_find(s, g_sv_drag_id, &r, &c)) { g_sv_row = r; g_sv_col = c; g_sv_anchor = r; }
 }
 /* a rectangle drawn from an empty spot: the actions it touches (of plain rows, or of that timeline) */
@@ -8202,6 +8281,7 @@ static int sv_event_edge_at(int x, int y, int *row, int *col) {
     return 0;
 }
 /* an edge dragged: the time under the mouse becomes its start (top) or its end (bottom) */
+static void sv_resize_apply(ScriptAction *a, float t);
 static void sv_resize_move(int y) {
     Script *s = sv_cur();
     ScriptAction *a = sv_cell(0);
@@ -8211,6 +8291,22 @@ static void sv_resize_move(int y) {
     float t = (float)(y - sv_zone_y(&s->zone[zi])) * s->zone[zi].sec_per_row / SV_ROW_H;
     t = roundf(t / step) * step;
     if (t < 0.0f) t = 0.0f;
+    sv_resize_apply(a, t);
+    if (!g_sv_drag_free && sv_ids_collide(s, zi, &a->id, 1)) { /* up to the neighbour, not into it */
+        float best = g_sv_rsz_last, dir = t > g_sv_rsz_last ? step : -step;
+        for (float tt = g_sv_rsz_last + dir; dir > 0 ? tt <= t + 1e-4f : tt >= t - 1e-4f; tt += dir) {
+            sv_resize_apply(a, tt);
+            if (sv_ids_collide(s, zi, &a->id, 1)) break;
+            best = tt;
+        }
+        t = best;
+        sv_resize_apply(a, t);
+    }
+    g_sv_rsz_last = t;
+    g_sv_drag_moved = 1;
+}
+/* the edge being dragged at time t: the action's start (top) or end (bottom) there */
+static void sv_resize_apply(ScriptAction *a, float t) {
     float full, end = g_sv_rsz_start + g_sv_rsz_len;
     int media = action_media_length(a, &full);
     if (g_sv_rsz == 2) { /* its end */
@@ -8234,7 +8330,6 @@ static void sv_resize_move(int y) {
             a->seconds = end - t;
         }
     }
-    g_sv_drag_moved = 1;
 }
 
 /* the bottom edge of a timeline under (x, y): its index, else -1 */
@@ -8479,6 +8574,12 @@ static int sv_actor_list(Script *s, int *ids, int *rows, int max) {
     return k;
 }
 
+/* an action of a timeline, just changed: does it now go into another one of its lane? */
+static int sv_changed_would_overlap(Script *s, ScriptAction *a) {
+    int r, zi;
+    if (!s || !script_find(s, a->id, &r, NULL) || (zi = script_zone_at(s, r)) < 0) return 0;
+    return sv_ids_collide(s, zi, &a->id, 1);
+}
 static void sv_action(HWND hwnd, int id) {
     Script *s = sv_cur();
     ScriptAction *a = sv_cell(0);
@@ -8605,18 +8706,28 @@ static void sv_action(HWND hwnd, int id) {
             float *v = (id == B_SV_TRIM_IN_M || id == B_SV_TRIM_IN_P) ? &a->trim_in : &a->trim_out;
             float d = (id == B_SV_TRIM_IN_P || id == B_SV_TRIM_OUT_P) ? 0.05f : -0.05f;
             float other = v == &a->trim_in ? a->trim_out : a->trim_in;
+            float old = *v;
             *v += d;
             if (*v < 0.0f) *v = 0.0f;
             if (*v > full - other - 0.05f) *v = full - other - 0.05f;
             *v = roundf(*v * 100.0f) / 100.0f;
-            break;
+            if (d > 0.0f || !sv_changed_would_overlap(s, a)) break;
+            *v = old; /* longer: it would go into the next action of its lane */
+            snprintf(g_status, sizeof(g_status), "no room: it would go into another action of its lane");
+            return;
         }
         case B_SV_TRIM_RESET: a->trim_in = a->trim_out = 0.0f; break;
         case B_SV_T_M1: case B_SV_T_M01: case B_SV_T_P01: case B_SV_T_P1: {
             static const float d[4] = { -0.1f, -0.01f, 0.01f, 0.1f };
+            float old = a->start;
             a->start += d[id - B_SV_T_M1];
             if (a->start < 0.0f) a->start = 0.0f;
             a->start = roundf(a->start * 100.0f) / 100.0f;
+            if (sv_changed_would_overlap(s, a)) {
+                a->start = old;
+                snprintf(g_status, sizeof(g_status), "no room: it would go into another action of its lane");
+                return;
+            }
             break;
         }
         case B_SV_FADE_M: case B_SV_FADE_P:
@@ -9685,6 +9796,8 @@ static void sv_mouse_down(HWND hwnd, int x, int y, int dbl) {
             g_sv_rsz = e; g_sv_drag_moved = 0;
             g_sv_rsz_start = a->start; g_sv_rsz_in = a->trim_in; g_sv_rsz_out = a->trim_out; g_sv_rsz_sec = a->seconds;
             g_sv_rsz_len = sv_event_len(s, script_zone_at(s, er), a, &k);
+            g_sv_rsz_last = e == 1 ? a->start : a->start + g_sv_rsz_len;
+            g_sv_drag_free = sv_ids_collide(s, script_zone_at(s, er), &a->id, 1);
             SetCapture(hwnd);
             return;
         }
@@ -9702,12 +9815,13 @@ static void sv_mouse_down(HWND hwnd, int x, int y, int dbl) {
             if (ctrl || shift) { sv_sel_toggle(s, r, c); return; }
             ScriptAction *a = script_at(s, r, c);
             if (!sv_sel_has(a->id)) sv_sel_one(s, r, c);
-            g_sv_drag = 1; g_sv_drag_y0 = y; g_sv_drag_moved = 0; g_sv_drag_id = a->id; g_sv_drag_c0 = c; g_sv_gdc = 0;
+            g_sv_drag = 1; g_sv_drag_y0 = y; g_sv_drag_moved = 0; g_sv_drag_id = a->id; g_sv_drag_c0 = c; g_sv_gdc = 0; g_sv_last_dt = 0.0f;
             for (int i = 0; i < g_sv_sel_n; i++) {
                 int rr, cc;
                 ScriptAction *b = script_find(s, g_sv_sel_ids[i], &rr, &cc);
                 g_sv_gt0[i] = b ? b->start : 0.0f; g_sv_glane0[i] = cc;
             }
+            g_sv_drag_free = sv_ids_collide(s, zi, g_sv_sel_ids, g_sv_sel_n);
             SetCapture(hwnd);
             return;
         }
