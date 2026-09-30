@@ -340,6 +340,8 @@ typedef struct {
     int play_ended;            /* ...and it's over: held on its last frame until the script goes on (no idle in between) */
     int play_freeze;           /* ...held until its row is over ("Freeze on the last frame") */
     int hold_step;             /* the script step (g_run.step) it belongs to */
+    int play_token;            /* +1 at every new clip started: a script action knows its own by it (its pool may change the clip) */
+    int pool_clips[SCRIPT_POOL_MAX + 1], pool_n; /* a script animation's random pool: a new one of them at every loop */
     CuePlayer cue;             /* the attack's sounds playing */
     /* combat */
     int side;                  /* SIDE_ALLY (David's side) / SIDE_ENEMY: blows only land on the other side */
@@ -1552,6 +1554,11 @@ static int advance_character(float dt) {
         else if (a->play_t >= d) {
             if (a->play_left > 0 && --a->play_left == 0) {
                 if (a->play_script || a->hold_last) { a->play_ended = 1; a->play_t = d - 0.001f; } else actor_play_end(a);
+            }
+            else if (a->pool_n > 1) { /* a pool: another one of it, at random (not the same twice when it can) */
+                int k = rand() % a->pool_n;
+                if (a->pool_clips[k] == a->play_clip) k = (k + 1 + rand() % (a->pool_n - 1)) % a->pool_n;
+                a->play_clip = a->pool_clips[k]; a->play_t = 0.0f;
             }
             else a->play_t = fmodf(a->play_t, d);
         }
@@ -5652,6 +5659,7 @@ static void actor_play_once(Actor *a, int clip, float step) {
     a->play_clip = clip; a->play_t = 0.0f; a->play_left = 1; a->play_attack = 0; a->play_next = -1; a->trail = 0; a->play_hold = 0; a->play_speed = 0.0f;
     a->play_script = 0; a->play_ended = 0; a->play_freeze = 0;
     a->blow = 0; a->dodging = 0; a->hold_last = 0; a->play_rev = 0; a->cast_pending = 0;
+    a->play_token++; a->pool_n = 0;
     a->play_turn = clip_turn(a, clip);
     actor_plan_step(a, step);
 }
@@ -7893,6 +7901,7 @@ typedef struct {
     Actor *actor;       /* MOVE / ANIM / SPEAK */
     int door, room_gen; /* MOVE through a connector */
     int clip;           /* ANIM */
+    int token;          /* ANIM: the actor's play_token of its animation (its pool changes the clip, not this) */
     int row_long;       /* ANIM "until the rest of the row is over" */
     int portrait;       /* SPEAK: shown until the line is over */
     int pend_weapon, pend_shield; /* CHAR: its weapon / shield change still to come (one after the other) */
@@ -8054,6 +8063,13 @@ static void run_start_anim(const ScriptAction *a, CellRun *c) {
     ac->play_hold = a->anim_mode == ANIM_LOOP;
     ac->play_script = 1; ac->play_ended = 0; ac->hold_step = g_run.step;
     ac->play_freeze = a->freeze && a->anim_mode == ANIM_TIMES;
+    ac->play_token++; c->token = ac->play_token;
+    ac->pool_n = 0; /* its pool (the ones that fit): another of them at every loop */
+    for (int i = -1; i < a->npool && ac->pool_n < SCRIPT_POOL_MAX + 1; i++) {
+        int pc = anim_lib_find_ref(i < 0 ? a->file : a->pool[i]);
+        if (pc >= 0 && anim_lib_fits(pc, ac->model->node_count)) ac->pool_clips[ac->pool_n++] = pc;
+    }
+    if (ac->pool_n < 2) ac->pool_n = 0;
     if (a->anim_mode == ANIM_LOOP) return; /* the row goes on at once */
     c->actor = ac; c->clip = clip;
     c->row_long = a->anim_mode == ANIM_ROW;
@@ -8152,7 +8168,7 @@ static int run_cell_done(const ScriptAction *a, CellRun *c, float dt) {
             break;
         case ACT_ANIM:
             if (c->row_long) return 0; /* decided by the rest of the row (script_tick) */
-            c->done = !c->actor->used || c->actor->play_clip != c->clip || c->actor->play_ended;
+            c->done = !c->actor->used || !(c->actor->play_clip >= 0 && c->actor->play_token == c->token) || c->actor->play_ended;
             break;
         case ACT_MOVE: {
             Actor *ac = c->actor;
@@ -8229,7 +8245,7 @@ static void run_zone_skip(void) {
             continue;
         }
         if (a->type == ACT_SPEAK && !cr->done) audio_stop(cr->voice); /* the line is cut */
-        if (a->type == ACT_ANIM && !cr->done && cr->actor && cr->actor->play_clip == cr->clip) cr->actor->play_clip = -1;
+        if (a->type == ACT_ANIM && !cr->done && cr->actor && (cr->actor->play_clip >= 0 && cr->actor->play_token == cr->token)) cr->actor->play_clip = -1;
         cr->done = 1; cr->timer = 0.0f; cr->row_long = 0;
     }
 }
@@ -8246,7 +8262,7 @@ static void script_skip_row(void) {
         CellRun *cr = &g_run.cell[c];
         const ScriptAction *a = c < g_run.s.cols ? script_at(&g_run.s, g_run.row, c) : NULL;
         if (a && a->type == ACT_SPEAK && !cr->done) audio_stop(cr->voice); /* the line is cut */
-        if (a && a->type == ACT_ANIM && !cr->done && cr->actor && cr->actor->play_clip == cr->clip) cr->actor->play_clip = -1;
+        if (a && a->type == ACT_ANIM && !cr->done && cr->actor && (cr->actor->play_clip >= 0 && cr->actor->play_token == cr->token)) cr->actor->play_clip = -1;
         cr->done = 1; cr->timer = 0.0f;
     }
     if (!g_run.row_started) { g_run.row++; }
@@ -8281,7 +8297,7 @@ static void zone_trim_start(const ScriptAction *a, CellRun *c) {
         if (a->type == ACT_SOUND) { int *slot = run_voice_slot(a->id); if (slot) *slot = c->voice; }
         if (!c->voice) c->done = 1;
     }
-    if (a->type == ACT_ANIM && c->actor && c->actor->play_clip == c->clip) {
+    if (a->type == ACT_ANIM && c->actor && (c->actor->play_clip >= 0 && c->actor->play_token == c->token)) {
         Actor *ac = c->actor;
         float d = anim_lib_duration(c->clip), sp = a->speed > 0.0f ? a->speed : g_david_anim_speed;
         float t = a->trim_in * sp;
@@ -8292,7 +8308,7 @@ static void zone_trim_start(const ScriptAction *a, CellRun *c) {
 /* ...and its trimmed end reached */
 static void zone_trim_cut(const ScriptAction *a, CellRun *c) {
     if ((a->type == ACT_SOUND || a->type == ACT_SPEAK) && c->voice) audio_fade(c->voice, 0.03f);
-    if (a->type == ACT_ANIM && c->actor && c->actor->play_clip == c->clip) c->actor->play_ended = 1; /* held on that frame */
+    if (a->type == ACT_ANIM && c->actor && (c->actor->play_clip >= 0 && c->actor->play_token == c->token)) c->actor->play_ended = 1; /* held on that frame */
     c->done = 1;
 }
 
@@ -8336,7 +8352,7 @@ static int run_zone_tick(Script *s, int zi, float dt) {
     for (int k = 0; k < g_run.zone_n; k++) { /* the "until the others are over" animations end */
         CellRun *c = &g_run.zcell[k];
         if (!c->row_long || c->done) continue;
-        if (c->actor && c->actor->play_clip == c->clip) c->actor->play_clip = -1;
+        if (c->actor && (c->actor->play_clip >= 0 && c->actor->play_token == c->token)) c->actor->play_clip = -1;
         const ScriptAction *a = script_at(s, g_run.zev_row[k], g_run.zev_col[k]);
         run_measure(s->name, a->id, g_run.zone_t - g_run.zev_t0[k]);
         c->done = 1;
@@ -8389,7 +8405,7 @@ static void script_tick(HWND hwnd, float dt) {
         for (int c = 0; c < s->cols; c++) {
             CellRun *cr = &g_run.cell[c];
             if (!cr->row_long || cr->done) continue;
-            if (cr->actor && cr->actor->play_clip == cr->clip) cr->actor->play_clip = -1;
+            if (cr->actor && (cr->actor->play_clip >= 0 && cr->actor->play_token == cr->token)) cr->actor->play_clip = -1;
             cr->done = 1;
         }
         g_run.row++; g_run.row_started = 0; g_run.step++;
@@ -10132,10 +10148,10 @@ static int sv_actor_buttons(Script *s, ScriptAction *a, int ix, int iy, int iw, 
 }
 /* ANIM / SOUND: its random pool */
 static int sv_pool_buttons(ScriptAction *a, int ix, int iy, int iw, int rh, int anim) {
-    svl(ix, iy, iw, 16, 1, SVL_SECTION, SV_ONE, "RANDOM POOL (ONE OF THEM, EACH TIME)");
+    svl(ix, iy, iw, 16, 1, SVL_SECTION, SV_ONE, anim ? "RANDOM POOL (ANOTHER ONE AT EVERY LOOP)" : "RANDOM POOL (ONE OF THEM, EACH TIME)");
     iy += 20;
     if (a->npool == 0) {
-        svl(ix, iy, iw, 34, 0, SVL_DIM, DT_LEFT | DT_WORDBREAK, anim ? "Only the animation above. Add others: one of them is picked at random each time it plays."
+        svl(ix, iy, iw, 34, 0, SVL_DIM, DT_LEFT | DT_WORDBREAK, anim ? "Only the animation above. Add others: at every loop (every time it plays again), one of them is picked at random."
                                                                    : "Only the sound above. Add others: one of them is picked at random each time it plays.");
         iy += 38;
     }
@@ -10145,7 +10161,7 @@ static int sv_pool_buttons(ScriptAction *a, int ix, int iy, int iw, int rh, int 
         iy += rh + 4;
     }
     ui_add(B_SV_POOL_ADD, ix, iy, iw, rh, anim ? "+ Add another animation..." : "+ Add another sound...", "",
-           "One more for the pool: each time the action plays, one of them (the first above included) is picked at random.", 0, a->npool < SCRIPT_POOL_MAX && a->file[0], 0);
+           "One more for the pool: an animation picks one of them (the first above included) at random at every loop; a sound, each time the action plays.", 0, a->npool < SCRIPT_POOL_MAX && a->file[0], 0);
     return iy + rh + 14;
 }
 /* "FADE OUT": - 2.0 s + (MUSIC, STOP) */

@@ -95,8 +95,9 @@ No file of the original game is needed.
   - **Character settings**: a character becomes an ally / an enemy, its
     AI on / off, takes out a weapon / shield (or puts it away) as with the
     radial menu. "Place character" chooses its side and AI too;
-  - "Animate character" and "Sound" can have a random pool: one of them
-    is picked each time;
+  - "Animate character" and "Sound" can have a random pool: an animation
+    takes another one of it at random at every loop (a number of times,
+    while the row lasts, until replaced), a sound one each time it plays;
   - **Overlays** can come from another room too ("Import from another
     room...": one of its overlays or all of them; their frames stay in that
     room's folder, their place is set here; an imported one can be taken
