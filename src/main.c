@@ -201,7 +201,7 @@ static RoomCamera g_char_cam; /* roll-free variant of g_room_cam, David's mesh p
 enum { MC_RUN90A, MC_RUN90C, MC_RUN180A, MC_RUN180C, MC_TOWALKA, MC_TOWALKC, MC_TOWALK, MC_TORUN, MC_TO180A, MC_TO180C,
        MC_STAND, MC_WALK, MC_RUN,
        /* reactions: a blow taken, a dodge, dying (an enemy), knocked down and getting up again (an ally) */
-       MC_HIT, MC_DODGE, MC_DEATH, MC_DOWN, MC_GETUP,
+       MC_HIT, MC_DODGE, MC_DEATH, MC_DOWN, MC_DOWNLOOP, MC_GETUP,
        /* combat (attack mode, Ctrl held): a click = one of the 3 attacks at random, a held swing = the other 5 */
        MC_ATK1, MC_ATK2, MC_ATK3, MC_SW_UP, MC_SW_LEFT, MC_SW_RIGHT, MC_SW_BACKL, MC_SW_BACKR, MC_COUNT };
 #define MC_FIRST_COMBAT MC_ATK1
@@ -1926,10 +1926,38 @@ static void shadow_alpha_init(void) {
         shadow_tex_alpha[y][x] = d >= 1.0f ? 0 : (uint8_t)(150.0f * (t * t * (3 - 2 * t)));
     }
 }
+/* a model's rest footprint: its height and its widest reach from its axis (cached) */
+static void model_extent(const CharModel *m, float *height, float *reach) {
+    static const CharModel *ms[64]; static float hs[64], rs[64]; static int n = 0;
+    for (int i = 0; i < n; i++) if (ms[i] == m) { *height = hs[i]; *reach = rs[i]; return; }
+    float h = 0.0f, r2 = 0.0f;
+    for (int v = 0; v < m->vertex_count; v++) {
+        const float *p = m->positions[v];
+        if (p[1] > h) h = p[1];
+        float d = p[0] * p[0] + p[2] * p[2];
+        if (d > r2) r2 = d;
+    }
+    *height = h > 0.0f ? h : 1.8f; *reach = r2 > 0.0f ? sqrtf(r2) : 0.4f;
+    if (n < 64) { ms[n] = m; hs[n] = *height; rs[n] = *reach; n++; }
+}
 static void draw_character_shadow(void) {
     shadow_alpha_init();
-    if (!g_has_3d_character || g_room_mesh_tri_count <= 0 || !g_loaded) return;
-    float origin[3] = { g_char_pos[0], g_char_pos[1] + 6.0f, g_char_pos[2] };
+    if (!g_has_3d_character || g_room_mesh_tri_count <= 0 || !g_loaded || !g_act->model) return;
+    /* its size: David's (the setting) scaled by how wide this one is next to him */
+    float mh, reach, dh, dreach, radius = g_david_shadow_radius;
+    model_extent(g_act->model, &mh, &reach);
+    if (g_act != DAVID_ACTOR && DAVID_ACTOR->model) {
+        model_extent(DAVID_ACTOR->model, &dh, &dreach);
+        float k = dreach > 1e-3f ? reach / dreach : 1.0f;
+        if (k < 0.4f) k = 0.4f;
+        if (k > 4.0f) k = 4.0f;
+        radius *= k;
+    }
+    /* the floor under it, looked for from its own height (not from far above: a floor overhead would catch it) */
+    float up = mh * 0.6f;
+    if (up < 1.0f) up = 1.0f;
+    if (up > 6.0f) up = 6.0f;
+    float origin[3] = { g_char_pos[0], g_char_pos[1] + up, g_char_pos[2] };
     float down[3] = { 0.0f, -1.0f, 0.0f };
     float hit[3], normal[3];
     if (!raycast_room_mesh(origin, down, g_room_mesh_tris, g_room_mesh_tri_count, 1, 0.55f, hit, normal)) return;
@@ -1943,7 +1971,7 @@ static void draw_character_shadow(void) {
     int w_img = (int)g_hdr.width, h_img = (int)g_hdr.height;
     float px, py, depth;
     if (!camera_world_to_pixel_z(&g_room_cam, hit, w_img, h_img, &px, &py, &depth)) return;
-    float edge_world[3] = { hit[0] + g_david_shadow_radius, hit[1], hit[2] };
+    float edge_world[3] = { hit[0] + radius, hit[1], hit[2] };
     float epx, epy, edepth;
     if (!camera_world_to_pixel_z(&g_room_cam, edge_world, w_img, h_img, &epx, &epy, &edepth)) return;
     float screen_radius = fabsf(epx - px);
@@ -3149,13 +3177,13 @@ static const char *MOVE_SLOT_KEY[MC_COUNT] = {
     "run_turn_left", "run_turn_right", "run_back_left", "run_back_right",
     "walk_turn_left", "walk_turn_right", "start_walk", "start_run", "walk_back_left", "walk_back_right",
     "stand", "walk", "run",
-    "hit", "dodge", "death", "down", "get_up",
+    "hit", "dodge", "death", "down", "down_loop", "get_up",
     "attack_1", "attack_2", "attack_3", "swing_up", "swing_left", "swing_right", "swing_back_left", "swing_back_right" };
 static const char *MOVE_SLOT_LABEL[MC_COUNT] = {
     "Run: turn left", "Run: turn right", "Run: back via left", "Run: back via right",
     "Walk: turn left", "Walk: turn right", "Start walking", "Start running", "Walk: back via left", "Walk: back via right",
     "Stand", "Walk", "Run",
-    "Hit", "Dodge", "Death", "Knocked down", "Getting up",
+    "Hit", "Dodge", "Death", "Knocked down", "Lying down", "Getting up",
     "Attack 1", "Attack 2", "Attack 3", "Swing up", "Swing left", "Swing right", "Swing down, via left", "Swing down, via right" };
 static const char *MOVE_SLOT_DESC[MC_COUNT] = {
     "Running, the new direction is 45-135 degrees to its left: played while it turns, then the run cycle.",
@@ -3173,6 +3201,7 @@ static const char *MOVE_SLOT_DESC[MC_COUNT] = {
     "It avoids a blow (its AI's dodge chance; David: attack mode, right click).",
     "An ENEMY's health is gone: it dies (held on the last frame).",
     "An ALLY's health is gone: it's knocked down, until the enemies of the scene are beaten.",
+    "Then, as long as it's down on the field (loops).",
     "The ally knocked down gets up again (its health back)." ,
     "Attack mode, a simple click: one of the three attacks, at random.", "Attack mode, a simple click: one of the three attacks, at random.",
     "Attack mode, a simple click: one of the three attacks, at random.",
@@ -3325,10 +3354,10 @@ static void presets_load(void) {
     memset(p, 0, sizeof(*p)); snprintf(p->name, sizeof(p->name), "Human"); p->builtin = 1; p->group = PG_WALK;
     for (int k = 0; k < MC_FIRST_REACT; k++) snprintf(p->clip[k], sizeof(p->clip[k]), "%s", human[k]);
     for (int f = 0; f < 2; f++) { /* reactions: a human's; fuge dies his own way */
-        static const char *react[5] = { "hitface", "dodgeb", "dieback", "unc_fall", "unc_up" };
+        static const char *react[6] = { "hitface", "dodgeb", "dieback", "unc_fall", "unc_pant", "unc_up" };
         p = &g_presets[g_preset_n++];
         memset(p, 0, sizeof(*p)); snprintf(p->name, sizeof(p->name), f ? "Fuge" : "Human"); p->group = PG_REACT; p->builtin = 1;
-        for (int k = 0; k < 5; k++) snprintf(p->clip[MC_FIRST_REACT + k], 100, "%s", react[k]);
+        for (int k = 0; k < 6; k++) snprintf(p->clip[MC_FIRST_REACT + k], 100, "%s", react[k]);
         if (f) snprintf(p->clip[MC_DEATH], 100, "fuge/fugedie");
     }
     p = &g_presets[g_preset_n++]; /* fuge and his two blades: closes in, strikes, sometimes dodges */
@@ -5755,9 +5784,14 @@ static const Moveset *actor_moveset(const Actor *a) { return moveset_get(a->mode
 /* health gone: an enemy dies, an ally goes down (both held on their clip's last frame) */
 static void actor_fall(Actor *b) {
     actor_resolve_clips(b);
-    int enemy = b->side == SIDE_ENEMY, c = b->clips[enemy ? MC_DEATH : MC_DOWN];
+    int enemy = b->side == SIDE_ENEMY, c = b->clips[enemy ? MC_DEATH : MC_DOWN], loop = enemy ? -1 : b->clips[MC_DOWNLOOP];
     b->guard = 0; b->cue.on = 0; b->play_next = -1;
-    if (c >= 0) { actor_play_once(b, c, 0.0f); b->hold_last = 1; }
+    if (c >= 0) {
+        actor_play_once(b, c, 0.0f);
+        if (loop >= 0) { b->play_next = loop; b->play_next_loop = 1; } /* down, then lying there */
+        else b->hold_last = 1;
+    }
+    else if (loop >= 0) { actor_play_once(b, loop, 0.0f); b->play_left = -1; }
     else { b->moving = 0; b->waypoint_count = 0; b->play_clip = -1; }
     if (enemy) b->dead = 1; else { b->down = 1; b->down_t = 0.0f; }
     if (b == DAVID_ACTOR) g_click_marker_active = 0;
@@ -7272,7 +7306,7 @@ static void run_stop_anims(void) {
     for (int k = 0; k < MAX_ACTORS; k++) {
         Actor *a = &g_actors[k];
         if (a->play_hold && a->play_clip >= 0) continue;
-        if (a->hold_last) continue; /* dead / down */
+        if (a->hold_last || a->dead || a->down) continue; /* dead / down */
         a->play_script = 0; a->play_ended = 0; a->play_freeze = 0;
         if (a->play_event) actor_play_end(a); /* an equipment change isn't lost */
         a->play_clip = -1; a->play_attack = 0; a->play_turn = 0.0f; a->stepping = 0; a->trail = 0; a->play_next = -1;
@@ -7610,7 +7644,7 @@ static void run_release_holds(void) {
         if (!a->play_ended) continue;
         if (a->play_clip < 0) { a->play_ended = a->play_script = a->play_freeze = 0; continue; }
         if (a->play_freeze && g_run.active && a->hold_step == g_run.step) continue;
-        if (a->hold_last) continue; /* dead / down: not a script's */
+        if (a->hold_last || a->dead || a->down) continue; /* dead / down: not a script's */
         actor_play_end(a);
     }
 }
@@ -11227,7 +11261,7 @@ static void ms_layout(HWND hwnd) {
     }
     if (g_ms_tab == PG_REACT) { /* a blow -> hit / dodge; health gone -> death (enemy) or down, then up (ally) */
         MS_NODE(MC_HIT, 0.30f, 0.18f); MS_NODE(MC_DODGE, 0.30f, 0.36f);
-        MS_NODE(MC_DEATH, 0.72f, 0.18f); MS_NODE(MC_DOWN, 0.50f, 0.66f); MS_NODE(MC_GETUP, 0.84f, 0.66f);
+        MS_NODE(MC_DEATH, 0.72f, 0.18f); MS_NODE(MC_DOWN, 0.16f, 0.66f); MS_NODE(MC_DOWNLOOP, 0.50f, 0.66f); MS_NODE(MC_GETUP, 0.84f, 0.66f);
         return;
     }
     if (g_ms_tab == PG_COMBAT) { /* combat: attack mode -> a click / a held swing */
@@ -11357,7 +11391,8 @@ static void ms_paint(HWND hwnd, HDC hdc) {
         ui_text(hdc, n[MC_HIT].left, n[MC_HIT].top - 20, 400, 16, "A BLOW AIMED AT IT", RGB(90, 110, 140), DT_LEFT | DT_SINGLELINE);
         ui_text(hdc, n[MC_DEATH].left, n[MC_DEATH].top - 20, 400, 16, "HEALTH GONE, AN ENEMY", RGB(90, 110, 140), DT_LEFT | DT_SINGLELINE);
         ui_text(hdc, n[MC_DOWN].left, n[MC_DOWN].top - 20, 600, 16, "HEALTH GONE, AN ALLY: DOWN UNTIL THE ENEMIES ARE BEATEN, THEN UP", RGB(90, 110, 140), DT_LEFT | DT_SINGLELINE);
-        ms_arrow(hdc, n[MC_DOWN].right, CY(MC_DOWN), n[MC_GETUP].left, CY(MC_GETUP), ac, 0);
+        ms_arrow(hdc, n[MC_DOWN].right, CY(MC_DOWN), n[MC_DOWNLOOP].left, CY(MC_DOWNLOOP), ac, 0);
+        ms_arrow(hdc, n[MC_DOWNLOOP].right, CY(MC_DOWNLOOP), n[MC_GETUP].left, CY(MC_GETUP), ac, 0);
     } else if (g_ms_tab == PG_COMBAT && g_ms_cues) {
         const CueList *cl = ms_cues_now(ms, g_ms_slot);
         int sclip = moveset_clip(ms, g_ms_slot, NULL);

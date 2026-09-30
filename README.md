@@ -217,9 +217,11 @@ No file of the original game is needed.
   it, as tall as its model), once per blow: the attacker's damage, its
   hit sound, the target's grunt and "Hit" reaction. A raised shield blocks.
 - Health gone: an enemy plays "Death" and stays down for good; an ally
-  (David too) is "Knocked down" until no enemy is left, then "Gets up"
-  with its health back (David at most 10 s later).
-- Reactions tab: Hit, Dodge, Death, Knocked down, Getting up (presets
+  (David too) is "Knocked down", then "Lying down" (looped) until no enemy
+  is left, then "Gets up" with its health back (David at most 10 s later).
+- Every character has its floor shadow, sized to its build (David's is
+  the "Shadow size" setting; the others scale with their width).
+- Reactions tab: Hit, Dodge, Death, Knocked down, Lying down, Getting up (presets
   Human, Fuge -- fuge dies with his own fugedie).
 - AI tab (presets; built in: "Fuge - dual blades"): close in to the
   nearest opponent, strike from a distance, walk or run, a pause between
