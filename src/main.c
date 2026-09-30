@@ -3070,14 +3070,27 @@ static void sound_catalog_scan(void) {
         } while (FindNextFileA(h, &fd));
         FindClose(h);
     }
-    for (int r = 0; r < g_map_room_count; r++) {
-        char level[64], room[64];
-        split_label(g_map_rooms[r].label, level, sizeof(level), room, sizeof(room));
-        root_path(pat, sizeof(pat), "assets/levels/%s/%s/*.ogg", level, room);
-        h = FindFirstFileA(pat, &fd);
-        if (h == INVALID_HANDLE_VALUE) continue;
-        do { snprintf(nm, sizeof(nm), "levels/%s/%s/%s", level, room, fd.cFileName); SND_ADD(nm, SND_OTHER_LINES); } while (FindNextFileA(h, &fd));
-        FindClose(h);
+    /* the lines: every folder of every level (not only the rooms that can be played: global/global, palace/happy... have lines too) */
+    WIN32_FIND_DATAA lv, rm;
+    root_path(pat, sizeof(pat), "assets/levels/*");
+    HANDLE hl = FindFirstFileA(pat, &lv);
+    if (hl != INVALID_HANDLE_VALUE) {
+        do {
+            if (!(lv.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || lv.cFileName[0] == '.') continue;
+            root_path(pat, sizeof(pat), "assets/levels/%s/*", lv.cFileName);
+            HANDLE hr = FindFirstFileA(pat, &rm);
+            if (hr == INVALID_HANDLE_VALUE) continue;
+            do {
+                if (!(rm.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || rm.cFileName[0] == '.') continue;
+                root_path(pat, sizeof(pat), "assets/levels/%s/%s/*.ogg", lv.cFileName, rm.cFileName);
+                h = FindFirstFileA(pat, &fd);
+                if (h == INVALID_HANDLE_VALUE) continue;
+                do { snprintf(nm, sizeof(nm), "levels/%s/%s/%s", lv.cFileName, rm.cFileName, fd.cFileName); SND_ADD(nm, SND_OTHER_LINES); } while (FindNextFileA(h, &fd));
+                FindClose(h);
+            } while (FindNextFileA(hr, &rm));
+            FindClose(hr);
+        } while (FindNextFileA(hl, &lv));
+        FindClose(hl);
     }
     #undef SND_ADD
     qsort(g_snd, g_snd_n, sizeof(SoundFile), sound_file_cmp);
@@ -3332,8 +3345,10 @@ static void presets_load(void) {
     p = &g_presets[g_preset_n++]; /* David's sounds: his sword's swings and hits, his grunts */
     memset(p, 0, sizeof(*p)); snprintf(p->name, sizeof(p->name), "David"); p->group = PG_SOUND; p->builtin = 1;
     pool_add(&p->snd, POOL_SWING, "swrdatt1.ogg"); pool_add(&p->snd, POOL_SWING, "swrdatt2.ogg"); pool_add(&p->snd, POOL_SWING, "swrdatt3.ogg");
-    pool_add(&p->snd, POOL_HIT, "swrdhit1.ogg"); pool_add(&p->snd, POOL_HIT, "swrdhit2.ogg"); pool_add(&p->snd, POOL_HIT, "swrdhit3.ogg");
+    pool_add(&p->snd, POOL_HIT, "swrdhit.ogg"); pool_add(&p->snd, POOL_HIT, "swrdhit1.ogg"); pool_add(&p->snd, POOL_HIT, "swrdhit2.ogg"); pool_add(&p->snd, POOL_HIT, "swrdhit3.ogg");
     for (int i = 1; i <= 5; i++) { char f[32]; snprintf(f, sizeof(f), "davehit%d.ogg", i); pool_add(&p->snd, POOL_GRUNT, f); }
+    pool_add(&p->snd, POOL_GRUNT, "dvdgrnt1.ogg");
+    for (int i = 1; i <= 3; i++) { char f[32]; snprintf(f, sizeof(f), "dvduh%d.ogg", i); pool_add(&p->snd, POOL_GRUNT, f); }
     p->snd.grunt_chance = 60;
     char pat[1024]; root_path(pat, sizeof(pat), "data/presets/*.cfg");
     WIN32_FIND_DATAA fd;
@@ -6481,10 +6496,10 @@ static void anim_view_filter(void) {
     int keep = anim_current_clip();
     const CharModel *m = g_view_model;
     g_anim_filtered_count = 0;
-    for (int pass = 0; pass < 2; pass++)
+    for (int pass = 0; pass < 3; pass++)
         for (int i = 0; i < anim_lib_count() && g_anim_filtered_count < 4096; i++) {
             const char *src = anim_lib_source(i);
-            if (pass == 0 ? strcmp(src, m->name) != 0 : strcmp(src, "anims") != 0) continue;
+            if (pass == 0 ? strcmp(src, m->name) != 0 : pass == 1 ? strcmp(src, "anims") != 0 : (!strcmp(src, m->name) || !strcmp(src, "anims"))) continue;
             if (g_anim_filter[0] && !ci_strstr(anim_lib_name(i), g_anim_filter)) continue;
             if (anim_lib_fits(i, m->node_count)) g_anim_filtered[g_anim_filtered_count++] = i;
         }
@@ -7965,10 +7980,10 @@ static void ch_build(void) {
         const CharModel *m = g_ch_model;
         if (!m) return;
         char ref[160];
-        for (int pass = 0; pass < 2; pass++) /* its own clips first, then the shared ones */
+        for (int pass = 0; pass < 3; pass++) /* its own clips first, then the shared ones */
             for (int i = 0; i < anim_lib_count(); i++) {
                 const char *src = anim_lib_source(i);
-                if (pass == 0 ? strcmp(src, m->name) != 0 : strcmp(src, "anims") != 0) continue;
+                if (pass == 0 ? strcmp(src, m->name) != 0 : pass == 1 ? strcmp(src, "anims") != 0 : (!strcmp(src, m->name) || !strcmp(src, "anims"))) continue;
                 if (!anim_lib_fits(i, m->node_count)) continue;
                 snprintf(ref, sizeof(ref), "%s/%s", src, anim_lib_name(i));
                 ch_add(ref, &cap);
@@ -10517,10 +10532,10 @@ static void ms_filter(void) {
         g_ms_scroll = 0;
         return;
     }
-    for (int pass = 0; pass < 2; pass++)
+    for (int pass = 0; pass < 3; pass++)
         for (int i = 0; i < anim_lib_count() && g_ms_n < 4096; i++) {
             const char *src = anim_lib_source(i);
-            if (pass == 0 ? strcmp(src, m->name) != 0 : strcmp(src, "anims") != 0) continue;
+            if (pass == 0 ? strcmp(src, m->name) != 0 : pass == 1 ? strcmp(src, "anims") != 0 : (!strcmp(src, m->name) || !strcmp(src, "anims"))) continue;
             if (g_ms_filter[0] && !ci_strstr(anim_lib_name(i), g_ms_filter)) continue;
             if (anim_lib_fits(i, m->node_count)) g_ms_list[g_ms_n++] = i;
         }

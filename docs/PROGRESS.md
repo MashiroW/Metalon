@@ -1616,3 +1616,7 @@ Validation, before removing the old data:
   random pause; dodge rolls when a foe starts a blow.
 - Boss health bar. Scripts: PLACE side / AI, Character settings action,
   random pools for Animate and Sound (`pool <id> <file>`).
+- Resource rules loosened: the sound catalog scans every level / room
+  folder (global/global, palace/happy have lines but aren't playable
+  rooms); the animation lists add other characters' clips that fit the
+  skeleton; David's grunts: davehit1-5, dvdgrnt1, dvduh1-3.
