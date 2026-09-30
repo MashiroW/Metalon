@@ -162,8 +162,10 @@ void action_summary(const Script *s, const ScriptAction *a, char *out, int n) {
             break;
         case ACT_ANIM:
             script_actor_name(s, a->actor, t, sizeof(t));
+            if (a->anim_mode == ANIM_NORMAL) { snprintf(out, n, "%s: back to normal", t); break; }
             if (!a->file[0]) { snprintf(out, n, "%s -- no animation yet", t); break; }
-            if (a->anim_mode == 1) snprintf(out, n, "%s: %s (while the row)", t, base_name(a->file));
+            if (a->anim_mode == ANIM_ROW) snprintf(out, n, "%s: %s (while the row)", t, base_name(a->file));
+            else if (a->anim_mode == ANIM_LOOP) snprintf(out, n, "%s: %s (looped until replaced)", t, base_name(a->file));
             else snprintf(out, n, "%s: %s", t, base_name(a->file));
             if (a->anim_mode == 0 && a->repeat > 1) { size_t l = strlen(out); snprintf(out + l, n - l, "  x%d", a->repeat); }
             break;

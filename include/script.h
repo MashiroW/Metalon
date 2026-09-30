@@ -19,7 +19,7 @@ enum {
     ACT_STOP,       /* stop a sound / ambience of this script, all of them, or the music */
     ACT_PLACE,      /* a character (`model`) appears at `pos`, facing `facing` */
     ACT_MOVE,       /* a character walks / runs to `pos`, or through connector `door` */
-    ACT_ANIM,       /* a character plays clip `file` `repeat` times, or (anim_mode 1) until the rest of the row is over */
+    ACT_ANIM,       /* a character plays clip `file` (anim_mode: ANIM_*) */
     ACT_SPEAK,      /* a character says `file` (a sound): its portrait is shown until the line is over */
     ACT_OVERLAY,    /* the room's overlays (environmental animations): each one looped, played once, frozen, hidden... */
     ACT_ROOM,       /* go to room `file` (as through a connector): David appears at its connector `door`, then `script` plays */
@@ -32,6 +32,15 @@ enum { OVM_KEEP, OVM_LOOP, OVM_ONCE, OVM_ONCE_HIDE, OVM_FREEZE, OVM_HIDE, OVM_CO
 enum { STOP_ACTION, STOP_ALL_SOUNDS, STOP_MUSIC };
 enum { CAM_KEEP, CAM_POINT, CAM_DAVID };
 
+/* ANIM: how long the animation plays */
+enum {
+    ANIM_TIMES,     /* `repeat` times; the row waits for it */
+    ANIM_ROW,       /* over and over until the rest of the row is over */
+    ANIM_LOOP,      /* over and over, kept after the row (and the script), until another animation replaces it,
+                       an ANIM_NORMAL, or the character is told to move */
+    ANIM_NORMAL     /* no clip: the character goes back to its own behaviour (ends a loop) */
+};
+
 typedef struct {
     int type, id;                      /* id: unique in its script, never reused */
     float seconds;                     /* WAIT */
@@ -41,7 +50,7 @@ typedef struct {
     char track[AUDIO_MAX_TRACKS][64];
     int track_loop[AUDIO_MAX_TRACKS];
     int repeat, wait_end;              /* SOUND (ANIM: repeat = times played) */
-    int anim_mode;                     /* ANIM: 0 = `repeat` times, 1 = until the rest of the row is over */
+    int anim_mode;                     /* ANIM: ANIM_TIMES, ANIM_ROW, ANIM_LOOP, ANIM_NORMAL */
     int loop;                          /* AMBIENCE */
     int stop_kind, stop_ref;           /* STOP: STOP_*; STOP_ACTION: id of the SOUND / AMBIENCE action */
     char model[48];                    /* PLACE: folder name in assets/chars */

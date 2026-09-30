@@ -234,6 +234,7 @@ typedef struct {
     float play_t;
     int play_left;             /* times still to play (this one included), -1 = until the script stops it */
     int play_attack;           /* the clip playing is an attack (attack mode) */
+    int play_hold;             /* a script loop (ANIM_LOOP): kept after its script, until replaced or a move order */
     float play_turn;           /* facing change once it ends (the swings that turn the body) */
     char weapon[48];           /* what it holds (starts as its moveset's right_hand; the radial menu changes it) */
     char shield[48];           /* its shield, "" = none */
@@ -1091,6 +1092,7 @@ static void david_turn_after_clip(void) {
 
 static void set_character_target(float wx, float wy, float wz, int run) {
     if (g_act->play_attack) { g_act->play_clip = -1; g_act->play_attack = 0; g_act->play_turn = 0.0f; g_act->stepping = 0; g_act->trail = 0; } /* a move order ends an attack */
+    if (g_act->play_hold) { g_act->play_clip = -1; g_act->play_hold = 0; } /* ...and a looped script animation */
     float dx = wx - g_char_pos[0], dz = wz - g_char_pos[2];
     if (dx * dx + dz * dz < 1e-6f) return; /* already there */
     g_char_target[0] = wx;
@@ -1399,7 +1401,7 @@ static void actor_play_end(Actor *a) {
     if (a->stepping) { memcpy(a->pos, a->step_to, sizeof(float) * 2); a->pos[2] = a->step_to[2]; a->stepping = 0; }
     if (a->play_event) actor_apply_event(a);
     a->trail = 0;
-    a->play_clip = -1;
+    a->play_clip = -1; a->play_hold = 0;
     if (a->play_next >= 0) { /* chained (shield: raised, then held) */
         a->play_clip = a->play_next; a->play_t = 0.0f; a->play_left = a->play_next_loop ? -1 : 1;
         a->play_next = -1;
@@ -5194,7 +5196,7 @@ static void actor_play_once(Actor *a, int clip, float step) {
     if (a->turn_clip >= 0) { a->facing = a->turn_to; a->turn_clip = -1; } /* it stops where it stands */
     a->moving = 0; a->walk_mode = 0; a->waypoint_count = 0; a->pending_door = -1;
     if (a == DAVID_ACTOR) g_click_marker_active = 0;
-    a->play_clip = clip; a->play_t = 0.0f; a->play_left = 1; a->play_attack = 0; a->play_next = -1; a->trail = 0;
+    a->play_clip = clip; a->play_t = 0.0f; a->play_left = 1; a->play_attack = 0; a->play_next = -1; a->trail = 0; a->play_hold = 0;
     a->play_turn = clip_turn(a, clip);
     actor_plan_step(a, step);
 }
@@ -6728,10 +6730,11 @@ static struct {
 
 static int script_playing(void) { return g_run.active; }
 
-/* the script animations stop (the characters go back to their own pose) */
+/* the script animations stop (the characters go back to their own pose) -- not the looped ones (ANIM_LOOP) */
 static void run_stop_anims(void) {
     for (int k = 0; k < MAX_ACTORS; k++) {
         Actor *a = &g_actors[k];
+        if (a->play_hold && a->play_clip >= 0) continue;
         if (a->play_event) actor_play_end(a); /* an equipment change isn't lost */
         a->play_clip = -1; a->play_attack = 0; a->play_turn = 0.0f; a->stepping = 0; a->trail = 0; a->play_next = -1;
     }
@@ -6814,11 +6817,18 @@ static void run_start_anim(const ScriptAction *a, CellRun *c) {
     char who[96];
     script_actor_name(&g_run.s, a->actor, who, sizeof(who));
     if (!ac) { snprintf(g_status, sizeof(g_status), "script: %s isn't in the room", who); return; }
+    if (a->anim_mode == ANIM_NORMAL) { /* back to its own behaviour */
+        if (ac->play_clip >= 0 && !ac->play_attack) { ac->play_clip = -1; ac->play_next = -1; }
+        ac->play_hold = 0;
+        return;
+    }
     if (clip < 0 || !anim_lib_fits(clip, ac->model->node_count)) { snprintf(g_status, sizeof(g_status), "script: %s can't play '%s'", who, a->file); return; }
-    ac->play_clip = clip; ac->play_t = 0.0f;
-    ac->play_left = a->anim_mode == 1 ? -1 : (a->repeat < 1 ? 1 : a->repeat);
+    ac->play_clip = clip; ac->play_t = 0.0f; ac->play_next = -1;
+    ac->play_left = (a->anim_mode == ANIM_ROW || a->anim_mode == ANIM_LOOP) ? -1 : (a->repeat < 1 ? 1 : a->repeat);
+    ac->play_hold = a->anim_mode == ANIM_LOOP;
+    if (a->anim_mode == ANIM_LOOP) return; /* the row goes on at once */
     c->actor = ac; c->clip = clip;
-    c->row_long = a->anim_mode == 1;
+    c->row_long = a->anim_mode == ANIM_ROW;
     c->done = 0;
 }
 static void run_start(const ScriptAction *a, CellRun *c) {
@@ -7062,7 +7072,7 @@ static const char *script_step_text(char *buf, size_t n, const char **sub) {
    Right: the selected cell's action and its settings.
    ===================================================================== */
 enum {
-    B_SV_AN_TIMES = 280, B_SV_AN_ROW, B_SV_AN_CLIP, B_SV_PORTRAIT, /* (below B_SV_FIRST_ID: routed like the others) */
+    B_SV_AN_TIMES = 280, B_SV_AN_ROW, B_SV_AN_CLIP, B_SV_PORTRAIT, B_SV_AN_LOOP, B_SV_AN_NORMAL, /* (below B_SV_FIRST_ID: routed like the others) */
     B_SV_FIRST = 300,
     B_SV_NEW = B_SV_FIRST, B_SV_RENAME, B_SV_DUP, B_SV_DELETE, B_SV_AUTO, B_SV_CLOSE,
     B_SV_PLAY, B_SV_PLAY_ROW, B_SV_ROW_INS, B_SV_ROW_DEL, B_SV_COL_ADD, B_SV_COL_DEL, B_SV_COPY, B_SV_PASTE, B_SV_CLEAR,
@@ -7703,7 +7713,9 @@ static void sv_action(HWND hwnd, int id) {
         case B_SV_FILE: ch_open(CH_SOUND, a->file); return;
         case B_SV_LISTEN: if (audio_preview_playing()) audio_preview(NULL); else audio_preview(a->file); return;
         case B_SV_REP_M: if (a->repeat > (a->type == ACT_ANIM ? 1 : 0)) a->repeat--; break;
-        case B_SV_AN_TIMES: a->anim_mode = 0; if (a->repeat < 1) a->repeat = 1; break;
+        case B_SV_AN_TIMES: a->anim_mode = ANIM_TIMES; if (a->repeat < 1) a->repeat = 1; break;
+        case B_SV_AN_LOOP: a->anim_mode = ANIM_LOOP; break;
+        case B_SV_AN_NORMAL: a->anim_mode = ANIM_NORMAL; break;
         case B_SV_RM_ROOM: ch_open(CH_ROOM, a->file); return;
         case B_SV_CAM_KEEP: a->cam_target = CAM_KEEP; break;
         case B_SV_CAM_DAVID: a->cam_target = CAM_DAVID; break;
@@ -7739,7 +7751,7 @@ static void sv_action(HWND hwnd, int id) {
             overlays_save();
             return;
         }
-        case B_SV_AN_ROW: a->anim_mode = 1; break;
+        case B_SV_AN_ROW: a->anim_mode = ANIM_ROW; break;
         case B_SV_AN_CLIP: g_ch_model = run_actor_model(s, a->actor); if (g_ch_model) ch_open(CH_CLIP, a->file); return;
         case B_SV_PORTRAIT: g_ch_model = run_actor_model(s, a->actor); if (g_ch_model) ch_open(CH_PORTRAIT, NULL); return;
         case B_SV_REP_P: if (a->repeat < 99) a->repeat++; break;
@@ -8256,24 +8268,33 @@ static void sv_layout_main(HWND hwnd) {
             iy = sv_actor_buttons(s, a, ix, iy, iw, rh);
             CharModel *m = run_actor_model(s, a->actor);
             if (type == ACT_ANIM) {
-                svl(ix, iy, iw, 16, 1, SVL_SECTION, SV_ONE, "ANIMATION");
-                iy += 20;
-                svl(ix, iy, iw, 20, 0, a->file[0] ? SVL_VALUE : RGB(255, 150, 120), SV_ONE, "%s", a->file[0] ? a->file : "not chosen yet");
-                iy += 26;
-                ui_add(B_SV_AN_CLIP, ix, iy, iw, rh, "Choose animation...", "", "Pick one of the animations made for this character's skeleton (it plays in a preview).", 0, m != NULL, 0);
-                iy += rh + 14;
                 svl(ix, iy, iw, 16, 1, SVL_SECTION, SV_ONE, "HOW LONG");
                 iy += 20;
-                ui_add(B_SV_AN_TIMES, ix, iy, half, rh, "A number of times", "", "It plays the animation that many times; the row waits for it.", a->anim_mode == 0, 1, 3);
-                ui_add(B_SV_AN_ROW, ix + half + 6, iy, half, rh, "While the row lasts", "", "It plays the animation over and over until the other actions of the row are over (e.g. a line being said), then stops.", a->anim_mode == 1, 1, 3);
+                ui_add(B_SV_AN_TIMES, ix, iy, half, rh, "A number of times", "", "It plays the animation that many times; the row waits for it.", a->anim_mode == ANIM_TIMES, 1, 3);
+                ui_add(B_SV_AN_ROW, ix + half + 6, iy, half, rh, "While the row lasts", "", "It plays the animation over and over until the other actions of the row are over (e.g. a line being said), then stops.", a->anim_mode == ANIM_ROW, 1, 3);
+                iy += rh + 6;
+                ui_add(B_SV_AN_LOOP, ix, iy, half, rh, "Loop until replaced", "", "It plays the animation over and over -- after this row and this script too -- until another animation replaces it, a 'Back to normal', or the character is told to move. The row goes on at once.", a->anim_mode == ANIM_LOOP, 1, 3);
+                ui_add(B_SV_AN_NORMAL, ix + half + 6, iy, half, rh, "Back to normal", "", "No animation: the character stops the one it plays (e.g. a loop) and goes back to its own behaviour.", a->anim_mode == ANIM_NORMAL, 1, 3);
                 iy += rh + 8;
-                if (a->anim_mode == 0) {
+                if (a->anim_mode != ANIM_NORMAL) {
+                    iy += 6;
+                    svl(ix, iy, iw, 16, 1, SVL_SECTION, SV_ONE, "ANIMATION");
+                    iy += 20;
+                    svl(ix, iy, iw, 20, 0, a->file[0] ? SVL_VALUE : RGB(255, 150, 120), SV_ONE, "%s", a->file[0] ? a->file : "not chosen yet");
+                    iy += 26;
+                    ui_add(B_SV_AN_CLIP, ix, iy, iw, rh, "Choose animation...", "", "Pick one of the animations made for this character's skeleton (it plays in a preview).", 0, m != NULL, 0);
+                    iy += rh + 12;
+                }
+                if (a->anim_mode == ANIM_TIMES) {
                     ui_add(B_SV_REP_M, ix, iy, 34, rh, "-", "", "Once less.", 0, a->repeat > 1, 0);
                     svl(ix + 42, iy, iw - 84, rh, 0, SVL_VALUE, SV_ONE | DT_CENTER, "%d time%s", a->repeat, a->repeat > 1 ? "s" : "");
                     ui_add(B_SV_REP_P, ix + iw - 34, iy, 34, rh, "+", "", "Once more.", 0, a->repeat < 99, 0);
                     iy += rh + 12;
                 }
-                svl(ix, iy, iw, 60, 0, SVL_DIM, DT_LEFT | DT_WORDBREAK, "It then goes back to its own pose. The animation wins over its walk while both play.");
+                svl(ix, iy, iw, 60, 0, SVL_DIM, DT_LEFT | DT_WORDBREAK,
+                    a->anim_mode == ANIM_LOOP ? "It keeps looping after the script ends. Another 'Animate character' replaces it; 'Back to normal' or a move order ends it." :
+                    a->anim_mode == ANIM_NORMAL ? "Ends a looped animation (or any this character plays): it goes back to standing, walking... as usual." :
+                    "It then goes back to its own pose. The animation wins over its walk while both play.");
             } else {
                 svl(ix, iy, iw, 16, 1, SVL_SECTION, SV_ONE, "LINE (a sound)");
                 iy += 20;

@@ -84,7 +84,9 @@ No file of the original game is needed.
     he is in the other room);
   - **Animate character**: a character plays any animation made for its
     skeleton (chosen with a live preview), a number of times or over and
-    over while the rest of the row lasts -- e.g. talking during a line;
+    over while the rest of the row lasts -- e.g. talking during a line --,
+    or looped until replaced (kept after the script, until another
+    animation, a "Back to normal", or a move order);
   - **Speak**: a character says a line (a sound -- the room's own lines
     are listed first) with its portrait shown until the line is over. Each
     character's portrait (sprites `bigports.1-71`) is chosen the first time
