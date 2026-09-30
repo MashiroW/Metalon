@@ -173,6 +173,25 @@ No file of the original game is needed.
   blades.
 - The other items are there for later (no effect yet).
 
+**Magic** (radial menu: Orbs, Magical, Backpack > Potions)
+- Orbs (Fire, Ice, Health, Earth, Acid, Lightning, Time, Light): taken out
+  with `magkup` (hands raised, the element's burst of `equipfx`, orbup),
+  held up (`magkbob`), the orb's sprite spinning in the hand; the same orb
+  again: put away (magkup backward). Combat preset **Orb Magic**: magkaim,
+  mgkair, mgk90a/c, mgk180a/c. The spell leaves at the cast gesture,
+  toward a foe in front: a glow (`star`) with its trail (`twinkle`) and
+  blast (`xplode` / `equipfx`), a 3D bolt for acid (`acidbolt`) and ice
+  (`iceshard`), a rolling rock for earth. Health heals, Time slows the foes
+  around, ice slows its target.
+- Wands and staves (Ice wand, Lightning Staff; also firewand, wandbolt...):
+  held like weapons, combat preset **Wand Magic** (fcast, conjure,
+  cast90a/c, cast180a/c) casting their element. The fire sword burns.
+- Potions: drunk (`drink`, the bottle in the left hand) -- health, strength
+  (double damage 20 s), enchanted armour (half damage 30 s), absolute
+  protection (10 s), chaos (one of them, or slowed); thrown (`throw`, an
+  arc) -- exploding vials (a fire blast), gas cloud vials (poison).
+- AI preset "Caster - keeps its distance".
+
 **Attack mode** (Ctrl held)
 - A click: one of the three attacks of the moveset, at random, toward the
   point clicked.

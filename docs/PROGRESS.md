@@ -1620,3 +1620,19 @@ Validation, before removing the old data:
   folder (global/global, palace/happy have lines but aren't playable
   rooms); the animation lists add other characters' clips that fit the
   skeleton; David's grunts: davehit1-5, dvdgrnt1, dvduh1-3.
+
+## 2026-09-30 -- Magic: orbs, wands, potions
+
+- Clips identified by forward kinematics of their hands (fk.py, scratch):
+  magkup raises both hands above the head and ends in the orb stance
+  (hands at chest, -0.10 m under the head) that magkbob loops and every
+  mgk*/magkaim/mgkair cast starts and ends in; fcast / conjure / cast90*
+  flick the right hand from the normal stance (wands); drink brings the
+  left hand to the mouth; throw swings the right arm.
+- Sprites: <element>orb (16 frames, spinning), star 16-23 (the elements'
+  glows), twinkle (sparkles by colour), xplode (fire 0-7, ice 19-26,
+  lightning flash 13-14, dust 29-58), equipfx (one 8-frame burst per
+  element). Sounds per element (<el>a cast, <el>h / hit, explode...).
+- Weapon "orb:<element>" for an orb (no model), wands as items; combat
+  presets Orb Magic / Wand Magic follow them; projectiles (spells, vials)
+  with trails and blasts; buffs, poison, slow.

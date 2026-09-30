@@ -282,6 +282,14 @@ typedef struct {
     int dodging;               /* its dodge is playing: blows miss it */
     float blade[2][2][3], blade_prev[2][2][3]; /* its blades in the world (base, tip) in the last two poses drawn */
     int blade_ok[2], blade_prev_ok[2];
+    /* magic */
+    int play_rev;              /* the clip plays backward (an orb put away: magkup the other way) */
+    int cast_pending, cast_clip, cast_elem; /* a spell leaves its hands at cast_at s into cast_clip */
+    float cast_at;
+    float slow_t, str_t, armour_t, invuln_t, poison_t, poison_tick, buff_fx_t; /* slowed (time / ice), stronger, armoured, untouchable, poisoned */
+    CharModel *potion_m;       /* a potion in its hand (drinking: left, throwing: right) */
+    int pot_right, pot_pending, pot_clip, pot_kind;
+    float pot_at;
 } Actor;
 enum { SIDE_ALLY, SIDE_ENEMY };
 static int g_atk_queued = -1;  /* attack mode: the next attack, asked for while one plays */
@@ -289,6 +297,8 @@ static void david_attack(int slot);
 enum { EV_NONE, EV_WEAPON, EV_SHIELD };
 static void actor_play_end(Actor *a);
 static void trail_sample(Actor *a);
+static int weapon_is_orb(const char *w); /* MAGIC */
+static void orb_glow_draw(Actor *a, uint32_t *px, int W, int H, float sc);
 static int grip_node(const CharModel *m, int left); /* MOVESETS */
 static int shield_node(const CharModel *m);
 static double perf_now_ms(void);
@@ -1418,10 +1428,12 @@ static float cycle_start_after(int clip) {
 
 /* The equipment change of the clip playing (sheathing, taking a shield):
    a weapon taken out or changed rings (swrdeqp1 / swrdeqp2). */
+static void orb_equip_fx(Actor *a);
 static void actor_apply_event(Actor *a) {
     if (a->play_event == EV_WEAPON) {
         snprintf(a->weapon, sizeof(a->weapon), "%s", a->event_arg);
-        if (a->weapon[0]) audio_play(rand() % 2 ? "swrdeqp1.ogg" : "swrdeqp2.ogg", AUDIO_SOUND, 0, 0);
+        if (weapon_is_orb(a->weapon)) { audio_play("orbup.ogg", AUDIO_SOUND, 0, 0); orb_equip_fx(a); }
+        else if (a->weapon[0]) audio_play(rand() % 2 ? "swrdeqp1.ogg" : "swrdeqp2.ogg", AUDIO_SOUND, 0, 0);
     } else snprintf(a->shield, sizeof(a->shield), "%s", a->event_arg);
     a->play_event = EV_NONE; a->clips_gen = 0;
 }
@@ -1612,7 +1624,7 @@ static void actor_pose(Actor *a, NodeOverride *overrides) {
     actor_resolve_clips(a);
     int clip = a->turn_clip;
     float t = a->turn_t;
-    if (a->play_clip >= 0) { clip = a->play_clip; t = a->play_t; } /* a script animation wins */
+    if (a->play_clip >= 0) { clip = a->play_clip; t = a->play_t; if (a->play_rev) { float d = anim_lib_duration(clip); t = d > 0.001f ? d - 0.001f - fminf(t, d - 0.001f) : 0.0f; } } /* a script animation wins */
     if (clip < 0) { clip = a->clips[a->walk_mode == 2 ? MC_RUN : a->walk_mode == 1 ? MC_WALK : MC_STAND]; t = a->anim_t; }
     if (clip >= 0 && anim_lib_fits(clip, a->model->node_count)) anim_lib_sample_for(clip, t, a->model, overrides);
     else memset(overrides, 0, sizeof(NodeOverride) * DAVID_MAX_NODES);
@@ -1625,8 +1637,8 @@ static void actor_project(Actor *a, float *px_buf, float *py_buf, float *z_buf, 
     actor_pose(a, overrides);
     static Mat4 skin_mats[DAVID_MAX_JOINTS];
     skeleton_skin_matrices_for(m, overrides, skin_mats);
-    a->hand_ok = a->item && skeleton_node_global(grip_node(m, 0), &a->hand);
-    a->hand_l_ok = a->item_l && skeleton_node_global(grip_node(m, 1), &a->hand_l);
+    a->hand_ok = (a->item || weapon_is_orb(a->weapon) || (a->potion_m && a->pot_right)) && skeleton_node_global(grip_node(m, 0), &a->hand);
+    a->hand_l_ok = (a->item_l || (a->potion_m && !a->pot_right)) && skeleton_node_global(grip_node(m, 1), &a->hand_l);
     a->hand_s_ok = a->shield_m && skeleton_node_global(shield_node(m), &a->hand_s);
 
     /* facing = direction it's heading (atan2(dx, dz)); the models face -Z
@@ -1651,10 +1663,12 @@ static void actor_project(Actor *a, float *px_buf, float *py_buf, float *z_buf, 
 /* The item in a character's right (left) hand, projected like its body
    (after actor_project, which found the hands). 0 if it holds nothing. */
 static int actor_project_item(Actor *a, int left, float *px_buf, float *py_buf, float *z_buf, int *visible) {
-    /* left: 0 right hand, 1 left hand, 2 the shield */
-    const CharModel *it = left == 2 ? a->shield_m : left ? a->item_l : a->item;
-    if (!it || !(left == 2 ? a->hand_s_ok : left ? a->hand_l_ok : a->hand_ok)) return 0;
-    const Mat4 *hand = left == 2 ? &a->hand_s : left ? &a->hand_l : &a->hand;
+    /* left: 0 right hand, 1 left hand, 2 the shield, 3 a potion (in the hand it's in) */
+    const CharModel *it = left == 3 ? a->potion_m : left == 2 ? a->shield_m : left ? a->item_l : a->item;
+    int hand_r = left == 0 || (left == 3 && a->pot_right);
+    if (left == 0 && a->potion_m && a->pot_right) return 0; /* throwing: the potion instead of the weapon */
+    if (!it || !(left == 2 ? a->hand_s_ok : hand_r ? a->hand_ok : a->hand_l_ok)) return 0;
+    const Mat4 *hand = left == 2 ? &a->hand_s : hand_r ? &a->hand : &a->hand_l;
     float cf = cosf(a->facing + 3.14159265f), sf = sinf(a->facing + 3.14159265f);
     for (int vi = 0; vi < it->vertex_count; vi++) {
         float h[3];
@@ -3267,7 +3281,19 @@ static MovePreset g_presets[MOVE_PRESET_MAX];
 static int g_preset_n = -1;
 static int slot_group(int slot) { return slot >= MC_FIRST_COMBAT ? PG_COMBAT : slot >= MC_FIRST_REACT ? PG_REACT : PG_WALK; }
 static int group_has_slots(int g) { return g == PG_WALK || g == PG_REACT || g == PG_COMBAT; }
-static const char *weapon_preset(const char *weapon) { return (weapon && !strcmp(weapon, "dualswrd")) ? "Double Swords" : "Single Swords"; }
+/* MAGIC WEAPONS: an orb is held as the weapon "orb:<element>" (no model: its sprite glows in the hand);
+   the wands and staves are items held like weapons that cast their element */
+static int weapon_is_orb(const char *w) { return w && !strncmp(w, "orb:", 4); }
+static int weapon_is_wand(const char *w) {
+    static const char *wands[] = { "icewand", "firewand", "lstaff", "wandbolt", "silvstaf", "moonstik", "cagstaff" };
+    for (size_t i = 0; w && i < sizeof(wands) / sizeof(wands[0]); i++) if (!strcmp(w, wands[i])) return 1;
+    return 0;
+}
+static const char *weapon_preset(const char *weapon) {
+    if (weapon_is_orb(weapon)) return "Orb Magic";
+    if (weapon_is_wand(weapon)) return "Wand Magic";
+    return (weapon && !strcmp(weapon, "dualswrd")) ? "Double Swords" : "Single Swords";
+}
 static void preset_file(char *out, size_t n, const char *name) {
     char safe[64]; int k = 0;
     for (const char *c = name; *c && k < 60; c++) safe[k++] = ((*c >= 'a' && *c <= 'z') || (*c >= 'A' && *c <= 'Z') || (*c >= '0' && *c <= '9') || *c == '-') ? *c : '_';
@@ -3363,6 +3389,9 @@ static void presets_load(void) {
     p = &g_presets[g_preset_n++]; /* fuge and his two blades: closes in, strikes, sometimes dodges */
     memset(p, 0, sizeof(*p)); snprintf(p->name, sizeof(p->name), "Fuge - dual blades"); p->group = PG_AI; p->builtin = 1;
     p->ai.kind = AI_MELEE; p->ai.range = 1.6f; p->ai.run = 1; p->ai.pause_min = 0.6f; p->ai.pause_max = 1.4f; p->ai.dodge = 35;
+    p = &g_presets[g_preset_n++]; /* a caster (an orb or a wand): casts from afar */
+    memset(p, 0, sizeof(*p)); snprintf(p->name, sizeof(p->name), "Caster - keeps its distance"); p->group = PG_AI; p->builtin = 1;
+    p->ai.kind = AI_MELEE; p->ai.range = 7.0f; p->ai.run = 0; p->ai.pause_min = 1.5f; p->ai.pause_max = 3.0f; p->ai.dodge = 15;
     p = &g_presets[g_preset_n++];
     memset(p, 0, sizeof(*p)); snprintf(p->name, sizeof(p->name), "Human"); p->group = PG_STATS; p->builtin = 1;
     p->st = STATS_DEFAULT;
@@ -3370,6 +3399,13 @@ static void presets_load(void) {
         p = &g_presets[g_preset_n++];
         memset(p, 0, sizeof(*p)); snprintf(p->name, sizeof(p->name), w ? "Double Swords" : "Single Swords"); p->group = PG_COMBAT; p->builtin = 1;
         for (int k = 0; k < 8; k++) { snprintf(p->clip[MC_FIRST_COMBAT + k], 100, "%s", w ? twin[k] : single[k]); p->step[MC_FIRST_COMBAT + k] = steps[k]; }
+    }
+    for (int w = 0; w < 2; w++) { /* magic: an orb in both hands (magkup / magkbob / magkaim...), a wand in the right hand (fcast...) */
+        static const char *orbc[8] = { "magkaim", "magkaim", "mgkair", "mgkair", "mgk90a", "mgk90c", "mgk180a", "mgk180c" };
+        static const char *wandc[8] = { "fcast", "conjure", "fcast", "fcast", "cast90a", "cast90c", "cast180a", "cast180c" };
+        p = &g_presets[g_preset_n++];
+        memset(p, 0, sizeof(*p)); snprintf(p->name, sizeof(p->name), w ? "Wand Magic" : "Orb Magic"); p->group = PG_COMBAT; p->builtin = 1;
+        for (int k = 0; k < 8; k++) { snprintf(p->clip[MC_FIRST_COMBAT + k], 100, "%s", w ? wandc[k] : orbc[k]); p->cues[k].set = 1; } /* no swing whoosh: the spell has its sounds */
     }
     p = &g_presets[g_preset_n++]; /* David's sounds: his sword's swings and hits, his grunts */
     memset(p, 0, sizeof(*p)); snprintf(p->name, sizeof(p->name), "David"); p->group = PG_SOUND; p->builtin = 1;
@@ -3851,7 +3887,8 @@ static void actor_resolve_clips(Actor *a) {
         int c = moveset_clip_w(ms, k, NULL, a->weapon);
         a->clips[k] = (c >= 0 && anim_lib_fits(c, a->model->node_count)) ? c : -1;
     }
-    a->item = grip_node(a->model, 0) >= 0 ? item_held(a->weapon, 0) : NULL;
+    if (weapon_is_orb(a->weapon)) { int c = anim_lib_find("magkbob"); if (c >= 0 && anim_lib_fits(c, a->model->node_count)) a->clips[MC_STAND] = c; } /* holding its orb up */
+    a->item = grip_node(a->model, 0) >= 0 && !weapon_is_orb(a->weapon) ? item_held(a->weapon, 0) : NULL;
     a->item_l = grip_node(a->model, 1) >= 0 && !a->shield[0] ? item_held(a->weapon, 1) : NULL;
     a->shield_m = shield_node(a->model) >= 0 && a->shield[0] ? item_model(a->shield) : NULL;
 }
@@ -5476,7 +5513,7 @@ static void actor_play_once(Actor *a, int clip, float step) {
     if (a == DAVID_ACTOR) g_click_marker_active = 0;
     a->play_clip = clip; a->play_t = 0.0f; a->play_left = 1; a->play_attack = 0; a->play_next = -1; a->trail = 0; a->play_hold = 0; a->play_speed = 0.0f;
     a->play_script = 0; a->play_ended = 0; a->play_freeze = 0;
-    a->blow = 0; a->dodging = 0; a->hold_last = 0;
+    a->blow = 0; a->dodging = 0; a->hold_last = 0; a->play_rev = 0; a->cast_pending = 0;
     a->play_turn = clip_turn(a, clip);
     actor_plan_step(a, step);
 }
@@ -5489,6 +5526,8 @@ static int actor_busy(const Actor *a) { return a->play_clip >= 0 || a->guard; }
 
 static void actor_dodge_rolls(Actor *a);
 static int actor_attack(Actor *a, int slot);
+static int weapon_element(const char *w);
+static float cast_moment(const char *clip);
 static void david_attack(int slot) {
     if (DAVID_ACTOR->down || DAVID_ACTOR->dead) return;
     actor_attack(DAVID_ACTOR, slot);
@@ -5510,6 +5549,11 @@ static int actor_attack(Actor *a, int slot) {
     actor_play_once(a, clip, moveset_step_w(ms, slot, a->weapon));
     a->play_attack = 1;
     a->blow = 1; a->hit_mask = 0;
+    if (weapon_element(a->weapon)) { /* magic: no blade, a spell at the cast gesture */
+        a->blow = 0;
+        a->cast_pending = 1; a->cast_clip = clip; a->cast_elem = weapon_element(a->weapon);
+        a->cast_at = anim_lib_duration(clip) * cast_moment(anim_lib_name(clip));
+    }
     cue_start(&a->cue, moveset_cues_w(ms, slot, a->weapon)); /* its sounds (the ones at 0 s: now) */
     cue_run(&a->cue, 0.0f, moveset_sounds(ms));
     actor_dodge_rolls(a);
@@ -5758,6 +5802,7 @@ static float model_height(const CharModel *m) {
     if (n < 64) { ms[n] = m; hs[n] = h; n++; }
     return h;
 }
+static void magic_tick(float dt);
 static int actor_alive(const Actor *a) { return a->used && !a->dead && !a->down; }
 static int actor_in_hitbox(const Actor *b, const float p[3]) {
     float r = g_nav.body_radius * 1.25f, dx = p[0] - b->pos[0], dz = p[2] - b->pos[2];
@@ -5783,6 +5828,7 @@ static int blade_touches(const Actor *a, const Actor *b) {
 static const Moveset *actor_moveset(const Actor *a) { return moveset_get(a->model && a->model->name[0] ? a->model->name : "david"); }
 /* health gone: an enemy dies, an ally goes down (both held on their clip's last frame) */
 static void actor_fall(Actor *b) {
+    b->potion_m = NULL; b->pot_pending = 0; b->cast_pending = 0;
     actor_resolve_clips(b);
     int enemy = b->side == SIDE_ENEMY, c = b->clips[enemy ? MC_DEATH : MC_DOWN], loop = enemy ? -1 : b->clips[MC_DOWNLOOP];
     b->guard = 0; b->cue.on = 0; b->play_next = -1;
@@ -5803,15 +5849,21 @@ static void actor_get_up(Actor *b) {
     if (b->clips[MC_GETUP] >= 0) actor_play_once(b, b->clips[MC_GETUP], 0.0f);
 }
 /* a's blow lands on b */
+static void actor_take_damage(Actor *b, int dmg);
+static void fx_spawn(const char *sheet, int first, int n, const float pos[3], float dur, float size, int add, const float *vel);
 static void actor_take_blow(Actor *a, Actor *b) {
     if (b->guard) { audio_play("swrdblk1.ogg", AUDIO_SOUND, 0, 0); return; } /* on its shield */
     const char *hs = pool_pick(moveset_sounds(actor_moveset(a)), POOL_HIT);
     if (hs) audio_play(hs, AUDIO_SOUND, 0, 0);
-    b->hp -= moveset_stats(actor_moveset(a))->damage;
-    actor_hit(b); /* its grunt, maybe */
-    if (b->hp <= 0) { b->hp = 0; actor_fall(b); return; }
-    actor_resolve_clips(b);
-    if (b->clips[MC_HIT] >= 0) { actor_play_once(b, b->clips[MC_HIT], 0.0f); b->cue.on = 0; }
+    int dmg = moveset_stats(actor_moveset(a))->damage;
+    if (a->str_t > 0.0f) dmg *= 2;
+    if (!strcmp(a->weapon, "fireswrd")) { /* the fire sword burns */
+        float c[3] = { b->pos[0], b->pos[1] + model_height(b->model) * 0.6f, b->pos[2] };
+        fx_spawn("xplode", 0, 8, c, 0.45f, 1.0f, 0, NULL);
+        audio_play("firehit.ogg", AUDIO_SOUND, 0, 0);
+        dmg = dmg * 3 / 2;
+    }
+    actor_take_damage(b, dmg);
 }
 /* a starts a blow: the AI characters of the other side close to it may dodge it (their chance) */
 static void actor_dodge_rolls(Actor *a) {
@@ -5829,6 +5881,428 @@ static void actor_dodge_rolls(Actor *a) {
         actor_play_once(b, c, -2.5f);
         b->dodging = 1;
     }
+}
+/* =====================================================================
+   MAGIC. Elements (the orbs of the radial menu, the wands): their sprites
+   (assets/sprites: <element>orb spinning in the hand, star.N the
+   projectile's glow, twinkle / xplode / equipfx its trail, its blast, its
+   burst when the orb comes out), a 3D projectile for some (acidbolt,
+   iceshard), their sounds (assets/sound). A spell leaves the hands at the
+   cast gesture of the clip (cast_moment), toward a foe in front if any.
+   Health heals the caster, Time slows every foe around; ice slows the one
+   it hits. Potions: drunk (drink, left hand) or thrown (throw: an arc,
+   then a blast / a gas cloud).
+   ===================================================================== */
+enum { EL_NONE, EL_FIRE, EL_ICE, EL_HEALTH, EL_EARTH, EL_ACID, EL_LIGHTNING, EL_TIME, EL_LIGHT, EL_COUNT };
+typedef struct {
+    const char *name, *orb;               /* "orb:<name>", its spinning sprite */
+    int star;                             /* star.N glow of the projectile, -1: none */
+    const char *psheet; int pfirst, pn;   /* or an animated projectile sprite */
+    const char *model;                    /* a 3D projectile, or NULL */
+    const char *tsheet; int tfirst, tn, tadd; /* its trail */
+    const char *bsheet; int bfirst, bn, badd; float bsize; /* its blast */
+    int efirst, en;                       /* equipfx: the burst when the orb comes out */
+    const char *snd_cast, *snd_hit;
+    float speed, dmg, size;               /* units / s, x the caster's damage, the glow's size (units) */
+} Element;
+static const Element ELEM[EL_COUNT] = {
+    [EL_FIRE] = { "fire", "fireorb", 17, NULL, 0, 0, NULL, "twinkle", 72, 8, 1, "xplode", 0, 8, 0, 1.3f, 0, 8, "fireball.ogg", "fireexp.ogg", 9.0f, 1.5f, 0.55f },
+    [EL_ICE] = { "ice", "iceorb", 20, NULL, 0, 0, "iceshard", "twinkle", 16, 8, 1, "xplode", 19, 8, 0, 1.1f, 8, 8, "icea1.ogg", "iceplode.ogg", 10.0f, 1.1f, 0.45f },
+    [EL_HEALTH] = { "health", "lifeorb", 23, NULL, 0, 0, NULL, "twinkle", 8, 8, 1, "twinkle", 80, 8, 1, 0.8f, 56, 4, "lifeheal.ogg", "lifeheal.ogg", 0.0f, 0.0f, 0.5f },
+    [EL_EARTH] = { "earth", "earthorb", -1, "equipfx", 16, 8, NULL, "xplode", 29, 14, 0, "xplode", 29, 30, 0, 1.5f, 16, 8, "eartha1.ogg", "earthh1.ogg", 7.0f, 2.0f, 0.6f },
+    [EL_ACID] = { "acid", "acidorb", 22, NULL, 0, 0, "acidbolt", "twinkle", 80, 4, 1, "equipfx", 60, 4, 0, 1.0f, 60, 4, "acida2.ogg", "acidhit1.ogg", 9.0f, 1.3f, 0.4f },
+    [EL_LIGHTNING] = { "lightning", "lningorb", 18, NULL, 0, 0, NULL, "twinkle", 16, 8, 1, "xplode", 13, 2, 1, 1.2f, 32, 8, "lcast.ogg", "lighthit.ogg", 18.0f, 1.4f, 0.5f },
+    [EL_TIME] = { "time", "timeorb", 19, NULL, 0, 0, NULL, "twinkle", 24, 8, 1, "twinkle", 24, 8, 1, 0.8f, 40, 8, "telemag.ogg", "telemag.ogg", 0.0f, 0.0f, 0.5f },
+    [EL_LIGHT] = { "light", "lightorb", 16, NULL, 0, 0, NULL, "twinkle", 0, 8, 1, "equipfx", 48, 8, 1, 1.0f, 48, 8, "lightbeam.ogg", "lighthit.ogg", 14.0f, 1.2f, 0.5f },
+};
+static int weapon_element(const char *w) {
+    if (!w || !w[0]) return EL_NONE;
+    if (weapon_is_orb(w)) { for (int e = 1; e < EL_COUNT; e++) if (!strcmp(w + 4, ELEM[e].name)) return e; return EL_NONE; }
+    if (!strcmp(w, "icewand")) return EL_ICE;
+    if (!strcmp(w, "firewand")) return EL_FIRE;
+    if (!strcmp(w, "lstaff") || !strcmp(w, "wandbolt")) return EL_LIGHTNING;
+    if (!strcmp(w, "silvstaf") || !strcmp(w, "moonstik") || !strcmp(w, "cagstaff")) return EL_LIGHT;
+    return EL_NONE;
+}
+/* when a clip's gesture sends the spell (from the hands' paths, measured: forward / up the most) */
+static float cast_moment(const char *clip) {
+    if (!strcmp(clip, "magkaim")) return 0.45f;
+    if (!strcmp(clip, "mgkair")) return 0.5f;
+    if (!strncmp(clip, "mgk", 3)) return 0.55f;
+    if (!strcmp(clip, "fcast")) return 0.33f;
+    if (!strcmp(clip, "conjure")) return 0.4f;
+    if (!strncmp(clip, "cast", 4)) return 0.4f;
+    return 0.45f;
+}
+
+/* ---- effects: sprites of assets/sprites in the world (a sheet's frames over their time) ---- */
+#define FX_MAX 256
+typedef struct { int used; const char *sheet; int first, n, add; float pos[3], vel[3], age, dur, size; } Fx;
+static Fx g_fx[FX_MAX];
+static void fx_spawn(const char *sheet, int first, int n, const float pos[3], float dur, float size, int add, const float *vel) {
+    if (!sheet || n <= 0) return;
+    Fx *f = NULL;
+    for (int i = 0; i < FX_MAX && !f; i++) if (!g_fx[i].used) f = &g_fx[i];
+    if (!f) { f = &g_fx[rand() % FX_MAX]; }
+    memset(f, 0, sizeof(*f));
+    f->used = 1; f->sheet = sheet; f->first = first; f->n = n; f->add = add; f->dur = dur; f->size = size;
+    memcpy(f->pos, pos, sizeof(f->pos));
+    if (vel) memcpy(f->vel, vel, sizeof(f->vel));
+}
+/* a few sprites around a point (heals, buffs...) */
+static void fx_sparkle(const char *sheet, int first, int n, const float c[3], float r, int count, int add) {
+    for (int i = 0; i < count; i++) {
+        float p[3] = { c[0] + r * ((rand() % 200) / 100.0f - 1.0f), c[1] + r * ((rand() % 200) / 100.0f - 0.5f), c[2] + r * ((rand() % 200) / 100.0f - 1.0f) };
+        float v[3] = { 0.0f, 0.6f, 0.0f };
+        fx_spawn(sheet, first, n, p, 0.5f + (rand() % 40) / 100.0f, 0.3f, add, v);
+    }
+}
+/* a sprite blended by adding its light (the glows: their dark parts vanish) */
+static void blend_sprite_add(uint32_t *px, int W, int H, const uint32_t *spr, int sw, int sh, int x0, int y0, float sc, int alpha) {
+    int dw = (int)(sw * sc), dh = (int)(sh * sc);
+    for (int y = 0; y < dh; y++) {
+        int yy = y0 + y;
+        if (yy < 0 || yy >= H) continue;
+        const uint32_t *srow = spr + (size_t)(int)(y / sc) * sw;
+        for (int x = 0; x < dw; x++) {
+            int xx = x0 + x;
+            if (xx < 0 || xx >= W) continue;
+            uint32_t c = srow[(int)(x / sc)];
+            uint32_t a = ((c >> 24) * (uint32_t)alpha) / 255;
+            if (!a) continue;
+            uint32_t *d = &px[(size_t)yy * W + xx];
+            uint32_t r = ((*d >> 16) & 255) + (((c >> 16) & 255) * a) / 255, g = ((*d >> 8) & 255) + (((c >> 8) & 255) * a) / 255, b = (*d & 255) + ((c & 255) * a) / 255;
+            *d = ((r > 255 ? 255 : r) << 16) | ((g > 255 ? 255 : g) << 8) | (b > 255 ? 255 : b);
+        }
+    }
+}
+static const uint32_t *sprite_px(const char *name, int *w, int *h);
+/* a sprite at a world point, `size` units tall */
+static void sprite_at(const char *sheet, int frame, const float pos[3], float size, int add, int alpha, uint32_t *px, int W, int H, float sc) {
+    char nm[48]; snprintf(nm, sizeof(nm), "%s.%d", sheet, frame);
+    int sw, sh;
+    const uint32_t *spr = sprite_px(nm, &sw, &sh);
+    if (!spr || sw <= 0 || sh <= 0) return;
+    float x0, y0, z0, x1, y1, z1, top[3] = { pos[0], pos[1] + size, pos[2] };
+    if (!char_project(pos, pos, &x0, &y0, &z0) || !char_project(pos, top, &x1, &y1, &z1)) return;
+    float hpx = fabsf(y1 - y0) * sc, k = hpx / (float)sh;
+    if (k < 0.2f) k = 0.2f;
+    int cx = (int)((x0 - g_cam_x) * sc), cy = (int)((y0 - g_cam_y) * sc);
+    int x = cx - (int)(sw * k / 2), y = cy - (int)(sh * k / 2);
+    if (add) blend_sprite_add(px, W, H, spr, sw, sh, x, y, k, alpha);
+    else blend_sprite(px, W, H, spr, sw, sh, x, y, k);
+}
+static void fx_tick(float dt) {
+    for (int i = 0; i < FX_MAX; i++) {
+        Fx *f = &g_fx[i];
+        if (!f->used) continue;
+        f->age += dt;
+        for (int k = 0; k < 3; k++) f->pos[k] += f->vel[k] * dt;
+        if (f->age >= f->dur) f->used = 0;
+    }
+}
+
+/* ---- projectiles ---- */
+#define PROJ_MAX 48
+typedef struct {
+    int used, el, side, owner, potion; /* potion: 0 a spell, 1 exploding vial, 2 gas cloud vial */
+    float pos[3], vel[3], age, life, grav, spin, trail_t;
+    int dmg;
+    CharModel *model;
+} Proj;
+static Proj g_proj[PROJ_MAX];
+static int g_any_proj = 0;
+static float actor_dir_now(const Actor *a) { /* where it faces now, in the middle of a clip that turns it */
+    float d = a->play_clip >= 0 ? anim_lib_duration(a->play_clip) : 0.0f;
+    float k = d > 0.0f ? fminf(1.0f, a->play_t / d) : 0.0f;
+    return a->facing + a->play_turn * k;
+}
+static Actor *actor_nearest_foe(const Actor *a);
+/* a foe within ~40 degrees in front of it (NULL: none): the spell goes to it */
+static Actor *foe_in_front(const Actor *a, float dir) {
+    Actor *best = NULL; float bd = 1e30f;
+    for (int k = 0; k < MAX_ACTORS; k++) {
+        Actor *b = &g_actors[k];
+        if (b == a || !b->used || b->dead || b->down || b->side == a->side) continue;
+        float dx = b->pos[0] - a->pos[0], dz = b->pos[2] - a->pos[2], d = dx * dx + dz * dz;
+        if (d > 900.0f || fabsf(wrap_angle(atan2f(dx, dz) - dir)) > 0.7f) continue;
+        if (d < bd) { bd = d; best = b; }
+    }
+    return best;
+}
+static float model_height(const CharModel *m);
+static const Moveset *actor_moveset(const Actor *a);
+static int actor_damage_of(const Actor *a) { int d = moveset_stats(actor_moveset(a))->damage; return a->str_t > 0.0f ? d * 2 : d; }
+static Proj *proj_new(void) {
+    for (int i = 0; i < PROJ_MAX; i++) if (!g_proj[i].used) { memset(&g_proj[i], 0, sizeof(g_proj[i])); g_proj[i].used = 1; g_any_proj = 1; return &g_proj[i]; }
+    return NULL;
+}
+/* a's spell now */
+static void spell_cast(Actor *a, int el) {
+    const Element *E = &ELEM[el];
+    float h = model_height(a->model), dir = actor_dir_now(a);
+    float chest[3] = { a->pos[0], a->pos[1] + h * 0.62f, a->pos[2] };
+    audio_play(E->snd_cast, AUDIO_SOUND, 0, 0);
+    if (el == EL_HEALTH) { /* the caster heals */
+        a->hp += a->hp_max * 3 / 10; if (a->hp > a->hp_max) a->hp = a->hp_max;
+        fx_sparkle("twinkle", 8, 8, chest, 0.5f, 10, 1);
+        return;
+    }
+    if (el == EL_TIME) { /* every foe around goes slow */
+        for (int k = 0; k < MAX_ACTORS; k++) {
+            Actor *b = &g_actors[k];
+            if (b == a || !b->used || b->dead || b->side == a->side) continue;
+            float dx = b->pos[0] - a->pos[0], dz = b->pos[2] - a->pos[2];
+            if (dx * dx + dz * dz > 100.0f) continue;
+            b->slow_t = 6.0f;
+            float c[3] = { b->pos[0], b->pos[1] + model_height(b->model) * 0.6f, b->pos[2] };
+            fx_sparkle("twinkle", 24, 8, c, 0.5f, 8, 1);
+        }
+        fx_sparkle("twinkle", 24, 8, chest, 0.8f, 12, 1);
+        return;
+    }
+    Actor *t = foe_in_front(a, dir);
+    float dx = sinf(dir), dy = 0.0f, dz = cosf(dir);
+    if (t) {
+        float tc[3] = { t->pos[0], t->pos[1] + model_height(t->model) * 0.55f, t->pos[2] };
+        float vx = tc[0] - chest[0], vy = tc[1] - chest[1], vz = tc[2] - chest[2], l = sqrtf(vx * vx + vy * vy + vz * vz);
+        if (l > 1e-3f) { dx = vx / l; dy = vy / l; dz = vz / l; }
+    }
+    Proj *p = proj_new();
+    if (!p) return;
+    p->el = el; p->side = a->side; p->owner = (int)(a - g_actors);
+    p->pos[0] = chest[0] + dx * 0.6f; p->pos[1] = chest[1]; p->pos[2] = chest[2] + dz * 0.6f;
+    p->vel[0] = dx * E->speed; p->vel[1] = dy * E->speed; p->vel[2] = dz * E->speed;
+    p->life = 3.0f;
+    p->dmg = (int)(actor_damage_of(a) * E->dmg + 0.5f);
+    p->model = E->model ? item_model(E->model) : NULL;
+}
+/* blows, spells and vials all come to this: health taken, reactions */
+static void actor_fall(Actor *b);
+static void actor_hit(Actor *a);
+static void actor_take_damage(Actor *b, int dmg) {
+    if (!b->used || b->dead || b->down) return;
+    if (b->invuln_t > 0.0f) { float c[3] = { b->pos[0], b->pos[1] + model_height(b->model) * 0.6f, b->pos[2] }; fx_sparkle("twinkle", 24, 8, c, 0.4f, 4, 1); return; }
+    if (b->armour_t > 0.0f) dmg = (dmg + 1) / 2;
+    b->hp -= dmg;
+    actor_hit(b); /* its grunt, maybe */
+    if (b->hp <= 0) { b->hp = 0; actor_fall(b); return; }
+    actor_resolve_clips(b);
+    if (b->clips[MC_HIT] >= 0 && !b->guard) { actor_play_once(b, b->clips[MC_HIT], 0.0f); b->cue.on = 0; }
+}
+/* a projectile arrives (on b, or on the scenery: b NULL) */
+static void proj_impact(Proj *p, Actor *b) {
+    const Element *E = &ELEM[p->el];
+    p->used = 0;
+    if (p->potion == 1) { /* an exploding vial: a fire blast, everyone of the other side around */
+        audio_play("explode.ogg", AUDIO_SOUND, 0, 0); audio_play("potbreak.ogg", AUDIO_SOUND, 0, 0);
+        fx_spawn("xplode", 0, 8, p->pos, 0.6f, 2.2f, 0, NULL);
+        for (int k = 0; k < MAX_ACTORS; k++) {
+            Actor *a = &g_actors[k];
+            if (!a->used || a->side == p->side) continue;
+            float dx = a->pos[0] - p->pos[0], dz = a->pos[2] - p->pos[2];
+            if (dx * dx + dz * dz < 6.0f) actor_take_damage(a, 25);
+        }
+        return;
+    }
+    if (p->potion == 2) { /* a gas cloud: poisons the ones of the other side around */
+        audio_play("potbreak.ogg", AUDIO_SOUND, 0, 0); audio_play("acidpop.ogg", AUDIO_SOUND, 0, 0);
+        for (int i = 0; i < 6; i++) {
+            float c[3] = { p->pos[0] + ((rand() % 200) / 100.0f - 1.0f), p->pos[1] + 0.3f, p->pos[2] + ((rand() % 200) / 100.0f - 1.0f) };
+            fx_spawn("xplode", 31, 28, c, 2.5f, 1.6f, 0, NULL);
+            fx_spawn("twinkle", 56, 8, c, 1.5f, 0.6f, 1, NULL);
+        }
+        for (int k = 0; k < MAX_ACTORS; k++) {
+            Actor *a = &g_actors[k];
+            if (!a->used || a->side == p->side) continue;
+            float dx = a->pos[0] - p->pos[0], dz = a->pos[2] - p->pos[2];
+            if (dx * dx + dz * dz < 9.0f) a->poison_t = 5.0f;
+        }
+        return;
+    }
+    fx_spawn(E->bsheet, E->bfirst, E->bn, p->pos, 0.5f, E->bsize, E->badd, NULL);
+    audio_play(b ? E->snd_hit : E->snd_hit, AUDIO_SOUND, 0, 0);
+    if (!b) return;
+    if (p->el == EL_ICE) b->slow_t = 3.0f; /* frozen a while */
+    actor_take_damage(b, p->dmg);
+}
+static void proj_tick(float dt) {
+    if (!g_any_proj) return;
+    int any = 0;
+    for (int i = 0; i < PROJ_MAX; i++) {
+        Proj *p = &g_proj[i];
+        if (!p->used) continue;
+        any = 1;
+        const Element *E = &ELEM[p->el];
+        float prev[3] = { p->pos[0], p->pos[1], p->pos[2] };
+        p->vel[1] -= p->grav * dt;
+        for (int k = 0; k < 3; k++) p->pos[k] += p->vel[k] * dt;
+        p->age += dt; p->spin += dt * 9.0f;
+        p->trail_t += dt;
+        if (p->trail_t > 0.035f && !p->potion) { p->trail_t = 0.0f; fx_spawn(E->tsheet, E->tfirst, E->tn, prev, 0.35f, E->size * 0.6f, E->tadd, NULL); }
+        for (int k = 0; k < MAX_ACTORS && p->used; k++) { /* a character of the other side */
+            Actor *b = &g_actors[k];
+            if (!b->used || b->dead || b->down || b->side == p->side || b->dodging) continue;
+            float r = g_nav.body_radius * 1.25f, dx = p->pos[0] - b->pos[0], dz = p->pos[2] - b->pos[2];
+            if (dx * dx + dz * dz < r * r && p->pos[1] >= b->pos[1] - 0.2f && p->pos[1] <= b->pos[1] + model_height(b->model) * 1.05f) proj_impact(p, b);
+        }
+        if (!p->used) continue;
+        float step[3] = { p->pos[0] - prev[0], p->pos[1] - prev[1], p->pos[2] - prev[2] };
+        float l = sqrtf(step[0] * step[0] + step[1] * step[1] + step[2] * step[2]), hit[3], nrm[3];
+        if (l > 1e-4f && g_room_mesh_tri_count > 0) { /* the scenery */
+            float dir[3] = { step[0] / l, step[1] / l, step[2] / l };
+            if (raycast_room_mesh(prev, dir, g_room_mesh_tris, g_room_mesh_tri_count, 0, 0.0f, hit, nrm)) {
+                float hx = hit[0] - prev[0], hy = hit[1] - prev[1], hz = hit[2] - prev[2];
+                if (hx * hx + hy * hy + hz * hz <= l * l) { memcpy(p->pos, hit, sizeof(p->pos)); proj_impact(p, NULL); continue; }
+            }
+        }
+        if (p->age > p->life || p->pos[1] < g_room_floor_y - 20.0f) p->used = 0;
+    }
+    g_any_proj = any;
+}
+static void proj_models_draw(uint32_t *px, int W, int H, float sc, float *zb, uint32_t *zst, uint32_t stamp) {
+    static float vx[DAVID_MAX_VERTS], vy[DAVID_MAX_VERTS], vz[DAVID_MAX_VERTS];
+    static int vis[DAVID_MAX_VERTS];
+    for (int i = 0; i < PROJ_MAX; i++) {
+        Proj *p = &g_proj[i];
+        if (!p->used || !p->model) continue;
+        CharModel *m = p->model;
+        float yaw = atan2f(p->vel[0], p->vel[2]), cf = cosf(yaw + 3.14159265f), sf = sinf(yaw + 3.14159265f);
+        float cs = cosf(p->spin), sn = sinf(p->spin);
+        for (int v = 0; v < m->vertex_count && v < DAVID_MAX_VERTS; v++) {
+            float q[3] = { m->positions[v][0], m->positions[v][1], m->positions[v][2] };
+            if (p->potion) { float y = q[1] * cs - q[2] * sn, z = q[1] * sn + q[2] * cs; q[1] = y; q[2] = z; } /* a vial tumbles */
+            else { float x = q[0] * cs - q[1] * sn, y = q[0] * sn + q[1] * cs; q[0] = x; q[1] = y; } /* a bolt spins on itself */
+            float w[3] = { q[0] * cf + q[2] * sf + p->pos[0], q[1] + p->pos[1], -q[0] * sf + q[2] * cf + p->pos[2] };
+            vis[v] = char_project(p->pos, w, &vx[v], &vy[v], &vz[v]);
+        }
+        render_mesh_hires(m, vx, vy, vz, vis, px, W, H, sc, zb, zst, stamp);
+    }
+}
+static void fx_draw(uint32_t *px, int W, int H, float sc) {
+    for (int i = 0; i < FX_MAX; i++) {
+        Fx *f = &g_fx[i];
+        if (!f->used) continue;
+        int fr = f->first + (int)(f->age / f->dur * f->n);
+        if (fr >= f->first + f->n) fr = f->first + f->n - 1;
+        sprite_at(f->sheet, fr, f->pos, f->size, f->add, f->add ? (int)(255.0f * (1.0f - 0.5f * f->age / f->dur)) : 255, px, W, H, sc);
+    }
+    int frame = (int)(perf_now_ms() / 70.0);
+    for (int i = 0; i < PROJ_MAX; i++) { /* the spells' glows */
+        Proj *p = &g_proj[i];
+        if (!p->used || p->potion) continue;
+        const Element *E = &ELEM[p->el];
+        if (E->star >= 0) sprite_at("star", E->star, p->pos, E->size, 1, 255, px, W, H, sc);
+        if (E->psheet) sprite_at(E->psheet, E->pfirst + frame % E->pn, p->pos, E->size, 0, 255, px, W, H, sc);
+    }
+}
+/* its orb, spinning in its hand */
+static void orb_glow_draw(Actor *a, uint32_t *px, int W, int H, float sc) {
+    int el = weapon_is_orb(a->weapon) ? weapon_element(a->weapon) : EL_NONE;
+    if (!el || !a->hand_ok) return;
+    float cf = cosf(a->facing + 3.14159265f), sf = sinf(a->facing + 3.14159265f), h[3] = { a->hand.m[12], a->hand.m[13], a->hand.m[14] };
+    float w[3] = { h[0] * cf + h[2] * sf + a->pos[0], h[1] + a->pos[1], -h[0] * sf + h[2] * cf + a->pos[2] };
+    sprite_at(ELEM[el].orb, (int)(perf_now_ms() / 80.0) % 16, w, 0.32f, 0, 255, px, W, H, sc);
+}
+static void orb_equip_fx(Actor *a) {
+    int el = weapon_element(a->weapon);
+    if (!el) return;
+    float c[3] = { a->pos[0], a->pos[1] + model_height(a->model) * 0.75f, a->pos[2] };
+    fx_spawn("equipfx", ELEM[el].efirst, ELEM[el].en, c, 0.6f, 1.2f, el == EL_LIGHTNING || el == EL_LIGHT, NULL);
+}
+/* an orb taken out (magkup: its hands go up, the orb appears), or put away (magkup backward) */
+static void actor_equip_orb(Actor *a, const char *orb) {
+    if (actor_busy(a) || a->down || a->dead) { snprintf(g_status, sizeof(g_status), "busy"); return; }
+    int away = !strcmp(a->weapon, orb), c = actor_clip(a, "magkup");
+    audio_play("magicup.ogg", AUDIO_SOUND, 0, 0);
+    if (c < 0) { snprintf(a->weapon, sizeof(a->weapon), "%s", away ? "" : orb); a->clips_gen = 0; return; }
+    actor_play_once(a, c, 0.0f);
+    float d = anim_lib_duration(c);
+    a->play_event = EV_WEAPON; snprintf(a->event_arg, sizeof(a->event_arg), "%s", away ? "" : orb);
+    if (away) { a->play_rev = 1; a->play_event_at = d * 0.6f; } /* the hands go up, the orb goes */
+    else a->play_event_at = d * 0.45f;                           /* the hands up: it's there */
+    if (!away && a->shield[0]) { a->shield[0] = 0; a->clips_gen = 0; } /* both hands on the orb */
+    snprintf(g_status, sizeof(g_status), away ? "orb put away" : "%s orb", orb + 4);
+}
+/* ---- potions: drunk, or thrown ---- */
+enum { POT_HEALTH, POT_MAGIC, POT_STRENGTH, POT_ARMOUR, POT_EXPLODE, POT_GAS, POT_CHAOS, POT_PROTECT, POT_COUNT };
+static const struct { const char *arg, *model; } POTION[POT_COUNT] = {
+    { "health", "potred" }, { "magic", "potblue" }, { "strength", "potorang" }, { "armour", "potwhite" },
+    { "explode", "potionr" }, { "gas", "potgreen" }, { "chaos", "potpurpl" }, { "protect", "potblack" } };
+static void potion_effect(Actor *a, int kind) {
+    float c[3] = { a->pos[0], a->pos[1] + model_height(a->model) * 0.6f, a->pos[2] };
+    if (kind == POT_CHAOS) { static const int any[5] = { POT_HEALTH, POT_STRENGTH, POT_ARMOUR, POT_PROTECT, -1 }; kind = any[rand() % 5]; }
+    switch (kind) {
+        case POT_HEALTH: a->hp += a->hp_max / 2; if (a->hp > a->hp_max) a->hp = a->hp_max; fx_sparkle("twinkle", 8, 8, c, 0.5f, 12, 1); audio_play("lifeheal.ogg", AUDIO_SOUND, 0, 0); snprintf(g_status, sizeof(g_status), "health restored"); break;
+        case POT_STRENGTH: a->str_t = 20.0f; fx_sparkle("twinkle", 32, 8, c, 0.5f, 12, 1); audio_play("pmagic.ogg", AUDIO_SOUND, 0, 0); snprintf(g_status, sizeof(g_status), "strength: double damage for 20 s"); break;
+        case POT_ARMOUR: a->armour_t = 30.0f; fx_sparkle("twinkle", 0, 8, c, 0.5f, 12, 1); audio_play("pmagic.ogg", AUDIO_SOUND, 0, 0); snprintf(g_status, sizeof(g_status), "enchanted armour: half the damage for 30 s"); break;
+        case POT_PROTECT: a->invuln_t = 10.0f; fx_sparkle("twinkle", 24, 8, c, 0.6f, 16, 1); audio_play("magicup.ogg", AUDIO_SOUND, 0, 0); snprintf(g_status, sizeof(g_status), "absolute protection for 10 s"); break;
+        case POT_MAGIC: fx_sparkle("twinkle", 16, 8, c, 0.5f, 12, 1); audio_play("pmagic.ogg", AUDIO_SOUND, 0, 0); snprintf(g_status, sizeof(g_status), "magic potion: no magic meter yet"); break;
+        default: a->slow_t = 5.0f; fx_sparkle("twinkle", 66, 1, c, 0.5f, 8, 1); snprintf(g_status, sizeof(g_status), "chaos: slowed down!"); break;
+    }
+}
+static void actor_use_potion(Actor *a, const char *arg) {
+    int kind = -1;
+    for (int i = 0; i < POT_COUNT; i++) if (!strcmp(arg, POTION[i].arg)) kind = i;
+    if (kind < 0) return;
+    if (actor_busy(a) || a->down || a->dead) { snprintf(g_status, sizeof(g_status), "busy"); return; }
+    int thrown = kind == POT_EXPLODE || kind == POT_GAS;
+    int c = actor_clip(a, thrown ? "throw" : "drink");
+    a->potion_m = item_model(POTION[kind].model);
+    a->pot_right = thrown; a->pot_kind = kind;
+    if (c < 0) { a->potion_m = NULL; if (!thrown) potion_effect(a, kind); return; }
+    actor_play_once(a, c, 0.0f);
+    a->pot_pending = 1; a->pot_clip = c; a->pot_at = anim_lib_duration(c) * (thrown ? 0.45f : 0.55f);
+    if (thrown) { a->play_attack = 1; Actor *t = foe_in_front(a, a->facing); if (t) a->facing = atan2f(t->pos[0] - a->pos[0], t->pos[2] - a->pos[2]); }
+}
+static void potion_tick(Actor *a) {
+    if (a->potion_m && a->play_clip != a->pot_clip) { a->potion_m = NULL; a->pot_pending = 0; } /* the clip is over: the vial is gone */
+    if (!a->pot_pending || a->play_clip != a->pot_clip || a->play_t < a->pot_at) return;
+    a->pot_pending = 0;
+    if (!a->pot_right) { audio_play("drink1.ogg", AUDIO_SOUND, 0, 0); potion_effect(a, a->pot_kind); return; }
+    Proj *p = proj_new(); /* thrown: an arc */
+    CharModel *m = a->potion_m;
+    a->potion_m = NULL;
+    if (!p) return;
+    float h = model_height(a->model), dir = a->facing;
+    p->potion = a->pot_kind == POT_EXPLODE ? 1 : 2;
+    p->side = a->side; p->owner = (int)(a - g_actors);
+    p->pos[0] = a->pos[0] + sinf(dir) * 0.5f; p->pos[1] = a->pos[1] + h * 0.8f; p->pos[2] = a->pos[2] + cosf(dir) * 0.5f;
+    Actor *t = foe_in_front(a, dir);
+    float dist = t ? sqrtf((t->pos[0] - a->pos[0]) * (t->pos[0] - a->pos[0]) + (t->pos[2] - a->pos[2]) * (t->pos[2] - a->pos[2])) : 6.0f;
+    if (dist > 12.0f) dist = 12.0f;
+    float flight = 0.8f, speed = dist / flight;
+    p->vel[0] = sinf(dir) * speed; p->vel[2] = cosf(dir) * speed; p->vel[1] = 4.9f * flight; p->grav = 9.8f;
+    p->life = 3.0f; p->model = m;
+}
+/* buffs, poison, the spells on their way -- every step */
+static void magic_tick(float dt) {
+    for (int k = 0; k < MAX_ACTORS; k++) {
+        Actor *a = &g_actors[k];
+        if (!a->used) continue;
+        if (a->cast_pending) {
+            if (a->play_clip != a->cast_clip) a->cast_pending = 0;
+            else if (a->play_t >= a->cast_at) { a->cast_pending = 0; spell_cast(a, a->cast_elem); }
+        }
+        potion_tick(a);
+        if (a->slow_t > 0.0f) a->slow_t -= dt;
+        if (a->str_t > 0.0f) a->str_t -= dt;
+        if (a->armour_t > 0.0f) a->armour_t -= dt;
+        if (a->invuln_t > 0.0f) a->invuln_t -= dt;
+        if (a->poison_t > 0.0f) {
+            a->poison_t -= dt; a->poison_tick += dt;
+            if (a->poison_tick >= 1.0f) { a->poison_tick = 0.0f; actor_take_damage(a, 3); }
+        }
+        a->buff_fx_t += dt;
+        if (a->buff_fx_t > 0.35f && (a->str_t > 0.0f || a->armour_t > 0.0f || a->invuln_t > 0.0f || a->slow_t > 0.0f || a->poison_t > 0.0f)) {
+            a->buff_fx_t = 0.0f;
+            float c[3] = { a->pos[0], a->pos[1] + model_height(a->model) * 0.5f, a->pos[2] };
+            int first = a->invuln_t > 0.0f ? 24 : a->str_t > 0.0f ? 32 : a->armour_t > 0.0f ? 0 : a->poison_t > 0.0f ? 56 : 16;
+            fx_sparkle("twinkle", first, 8, c, 0.4f, 1, 1);
+        }
+    }
+    proj_tick(dt);
+    fx_tick(dt);
 }
 /* the nearest character of the other side still standing (NULL: none) */
 static Actor *actor_nearest_foe(const Actor *a) {
@@ -5886,8 +6360,9 @@ static void combat_tick(float dt) {
                 if (b == a || !actor_alive(b) || b->side == a->side || b->dodging || (a->hit_mask & (1u << j))) continue;
                 if (blade_touches(a, b)) { a->hit_mask |= 1u << j; actor_take_blow(a, b); }
             }
-        if (a->ai_on && k != 0) actor_ai_tick(a, dt);
+        if (a->ai_on && k != 0) actor_ai_tick(a, a->slow_t > 0.0f ? dt * 0.35f : dt);
     }
+    magic_tick(dt);
 }
 /* a boss enemy alive: its name and health bar at the top of the picture */
 static void boss_bar_draw(HDC hdc) {
@@ -5986,7 +6461,7 @@ static void debris_draw(uint32_t *px, int W, int H, float sc, float *zb, uint32_
    is there for later (no effect yet). Right button / a click outside:
    closed. The view doesn't scroll while it's open.
    ===================================================================== */
-enum { RA_NONE, RA_SUB, RA_WEAPON, RA_SHIELD, RA_SPECIAL, RA_ITEM };
+enum { RA_NONE, RA_SUB, RA_WEAPON, RA_SHIELD, RA_SPECIAL, RA_ITEM, RA_ORB, RA_POTION };
 enum { RM_ROOT, RM_FOOD, RM_ORBS, RM_RANGED, RM_MAGIC, RM_BACKPACK, RM_POTIONS, RM_KEYS, RM_SHIELDS, RM_WEAPONS, RM_SPECIALS, RM_COUNT };
 typedef struct { const char *icon, *name; int action; const char *arg; int sub; } RadialItem;
 static const RadialItem RADIAL[RM_COUNT][8] = {
@@ -5997,20 +6472,20 @@ static const RadialItem RADIAL[RM_COUNT][8] = {
     [RM_FOOD] = { { "p_pack.16", "Apple", RA_ITEM }, { "p_pack.17", "Carrot", RA_ITEM }, { "p_pack.18", "Bread", RA_ITEM },
                   { "p_pack.19", "Cheese", RA_ITEM }, { "p_pack.20", "Cake", RA_ITEM }, { "p_pack.21", "Roast rat", RA_ITEM },
                   { "p_pack.22", "Pie", RA_ITEM }, { "p_pack.23", "Chicken", RA_ITEM } },
-    [RM_ORBS] = { { "p_main.8", "Fire", RA_ITEM }, { "p_main.9", "Ice", RA_ITEM }, { "p_main.10", "Health", RA_ITEM },
-                  { "p_main.11", "Earth", RA_ITEM }, { "p_main.12", "Acid", RA_ITEM }, { "p_main.13", "Lightning", RA_ITEM },
-                  { "p_main.14", "Time", RA_ITEM }, { "p_main.15", "Light", RA_ITEM } },
+    [RM_ORBS] = { { "p_main.8", "Fire", RA_ORB, "orb:fire" }, { "p_main.9", "Ice", RA_ORB, "orb:ice" }, { "p_main.10", "Health", RA_ORB, "orb:health" },
+                  { "p_main.11", "Earth", RA_ORB, "orb:earth" }, { "p_main.12", "Acid", RA_ORB, "orb:acid" }, { "p_main.13", "Lightning", RA_ORB, "orb:lightning" },
+                  { "p_main.14", "Time", RA_ORB, "orb:time" }, { "p_main.15", "Light", RA_ORB, "orb:light" } },
     [RM_RANGED] = { { "p_main.16", "Slingshot", RA_ITEM }, { "p_main.17", "Daggers", RA_ITEM }, { "p_main.18", "Bow", RA_ITEM },
                     { "p_main.19", "Large Bow", RA_ITEM }, { "p_main.20", "Axes", RA_ITEM }, { "p_main.21", "Bombs", RA_ITEM },
                     { "p_main.22", "Fire Bow", RA_ITEM }, { "p_main.23", "Shuriken", RA_ITEM } },
-    [RM_MAGIC] = { { "p_main.24", "Ice wand", RA_ITEM }, { "p_main.25", "Fire sword", RA_ITEM }, { "p_main.26", "Lightning Staff", RA_ITEM },
+    [RM_MAGIC] = { { "p_main.24", "Ice wand", RA_WEAPON, "icewand" }, { "p_main.25", "Fire sword", RA_WEAPON, "fireswrd" }, { "p_main.26", "Lightning Staff", RA_WEAPON, "lstaff" },
                    { "p_main.27", "Ring of Invisibility", RA_ITEM }, { "p_main.28", "Amulet of Seeing", RA_ITEM },
                    { "p_main.29", "Ring of Resist Magic", RA_ITEM }, { "p_misc.1", "Summon Golem", RA_ITEM }, { NULL } },
     [RM_BACKPACK] = { { "p_main.0", "Inventory", RA_ITEM }, { "p_pack.0", "Potions", RA_SUB, NULL, RM_POTIONS },
                       { "p_pack.5", "Keys", RA_SUB, NULL, RM_KEYS }, { NULL }, { NULL }, { NULL }, { NULL }, { NULL } },
-    [RM_POTIONS] = { { "p_pack.8", "Health Potion", RA_ITEM }, { "p_pack.9", "Magic Potion", RA_ITEM }, { "p_pack.10", "Strength Potion", RA_ITEM },
-                     { "p_pack.11", "Enchanted Armour", RA_ITEM }, { "p_pack.12", "Exploding Vials", RA_ITEM }, { "p_pack.13", "Gas Cloud Vials", RA_ITEM },
-                     { "p_pack.14", "Chaos Potion", RA_ITEM }, { "p_pack.15", "Absolute Protection", RA_ITEM } },
+    [RM_POTIONS] = { { "p_pack.8", "Health Potion", RA_POTION, "health" }, { "p_pack.9", "Magic Potion", RA_POTION, "magic" }, { "p_pack.10", "Strength Potion", RA_POTION, "strength" },
+                     { "p_pack.11", "Enchanted Armour", RA_POTION, "armour" }, { "p_pack.12", "Exploding Vials", RA_POTION, "explode" }, { "p_pack.13", "Gas Cloud Vials", RA_POTION, "gas" },
+                     { "p_pack.14", "Chaos Potion", RA_POTION, "chaos" }, { "p_pack.15", "Absolute Protection", RA_POTION, "protect" } },
     [RM_KEYS] = { { NULL } },
     /* the shields' models: guessed from their names (woodshld, woodrivs, ironrim, stelshld, dragshld, enchshld, diamshld);
        the crested one is David's own (daveshld) */
@@ -6037,10 +6512,10 @@ static void radial_sound(const char *f) { audio_play(f, AUDIO_SOUND, 0, 0); }
 
 /* a sprite of assets/sprites (kept once loaded) */
 static const uint32_t *sprite_px(const char *name, int *w, int *h) {
-    static struct { char name[32]; uint32_t *px; int w, h; } cache[160];
+    static struct { char name[32]; uint32_t *px; int w, h; } cache[1024];
     static int n = 0;
     for (int i = 0; i < n; i++) if (!strcmp(cache[i].name, name)) { *w = cache[i].w; *h = cache[i].h; return cache[i].px; }
-    if (n >= 160) return NULL;
+    if (n >= 1024) return NULL;
     char path[1024];
     root_path(path, sizeof(path), "assets/sprites/%s.png", name);
     snprintf(cache[n].name, sizeof(cache[n].name), "%s", name);
@@ -6094,8 +6569,8 @@ static const char *radial_icon(int menu, int i) {
     for (int k = 0; k < 8; k++) {
         const RadialItem *s = &RADIAL[sub][k];
         if (!s->icon) continue;
-        if ((s->action == RA_WEAPON && !strcmp(DAVID_ACTOR->weapon, s->arg)) || (s->action == RA_SHIELD && !strcmp(DAVID_ACTOR->shield, s->arg)) ||
-            (g_radial_equipped[sub] == k + 1)) return s->icon;
+        if (((s->action == RA_WEAPON || s->action == RA_ORB) && !strcmp(DAVID_ACTOR->weapon, s->arg)) || (s->action == RA_SHIELD && !strcmp(DAVID_ACTOR->shield, s->arg)) ||
+            (s->action == RA_ITEM && g_radial_equipped[sub] == k + 1)) return s->icon;
     }
     return it->icon;
 }
@@ -6112,8 +6587,8 @@ static int radial_equips(int menu) { return menu == RM_ORBS || menu == RM_RANGED
 static int radial_item_on(int menu, int k) {
     const RadialItem *it = &RADIAL[menu][k];
     Actor *a = DAVID_ACTOR;
-    return (it->action == RA_WEAPON && !strcmp(a->weapon, it->arg)) || (it->action == RA_SHIELD && !strcmp(a->shield, it->arg)) ||
-           (radial_equips(menu) && g_radial_equipped[menu] == k + 1);
+    return ((it->action == RA_WEAPON || it->action == RA_ORB) && !strcmp(a->weapon, it->arg)) || (it->action == RA_SHIELD && !strcmp(a->shield, it->arg)) ||
+           (it->action == RA_ITEM && radial_equips(menu) && g_radial_equipped[menu] == k + 1);
 }
 /* the mouse moved over the menu: a new slot hovered clicks */
 static void radial_hover(int x, int y) {
@@ -6132,8 +6607,11 @@ static void radial_click(int x, int y) {
     int menu = g_radial_menu;
     radial_sound("pieselct.ogg"); /* a final choice: chosen, and the menu closes */
     radial_close();
-    if (radial_equips(menu)) g_radial_equipped[menu] = k + 1;
+    if (radial_equips(menu) && it->action == RA_ITEM) g_radial_equipped[menu] = k + 1;
+    if (DAVID_ACTOR->down || DAVID_ACTOR->dead) return;
     switch (it->action) {
+        case RA_ORB: actor_equip_orb(DAVID_ACTOR, it->arg); return;
+        case RA_POTION: actor_use_potion(DAVID_ACTOR, it->arg); return;
         case RA_WEAPON: actor_equip_weapon(DAVID_ACTOR, it->arg); return;
         case RA_SHIELD: actor_equip_shield(DAVID_ACTOR, it->arg); return;
         case RA_SPECIAL: actor_special(DAVID_ACTOR, it->arg); return;
@@ -7355,7 +7833,9 @@ static void run_char_equip(const ScriptAction *a, CellRun *c) {
     if (!ac || !ac->used || actor_busy(ac) || ac->dead || ac->down) { if (ac && (ac->dead || ac->down)) c->pend_weapon = c->pend_shield = 0; return; }
     if (c->pend_weapon) {
         c->pend_weapon = 0;
-        if (a->item[0]) actor_equip_weapon(ac, a->item);
+        if (weapon_is_orb(a->item)) actor_equip_orb(ac, a->item);
+        else if (a->item[0]) actor_equip_weapon(ac, a->item);
+        else if (weapon_is_orb(ac->weapon)) actor_equip_orb(ac, ac->weapon);
         else if (ac->weapon[0]) actor_equip_weapon(ac, ac->weapon); /* the one it holds: put away */
         return;
     }
@@ -10497,12 +10977,14 @@ static int sv_item_menu(HWND hwnd, int shield, char *out, int n) {
     AppendMenuA(m, MF_STRING | MF_GRAYED, 0, shield ? "The shield it takes out:" : "The weapon it takes out:");
     AppendMenuA(m, MF_SEPARATOR, 0, NULL);
     AppendMenuA(m, MF_STRING, 1, shield ? "None (it puts its shield away)" : "None (it puts its weapon away)");
+    static const char *orbs[8] = { "orb:fire", "orb:ice", "orb:health", "orb:earth", "orb:acid", "orb:lightning", "orb:time", "orb:light" };
+    if (!shield) for (int i = 0; i < 8; i++) AppendMenuA(m, MF_STRING, 2 + i, orbs[i]);
     for (int i = 0; i < g_item_count; i++) AppendMenuA(m, MF_STRING | ((i % 30 == 0 && i) ? MF_MENUBARBREAK : 0), 10 + i, g_item_names[i]);
     POINT pt; GetCursorPos(&pt);
     int cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_NONOTIFY, pt.x, pt.y, 0, hwnd, NULL);
     DestroyMenu(m);
     if (cmd <= 0) return 0;
-    snprintf(out, n, "%s", cmd == 1 ? "" : g_item_names[cmd - 10]);
+    snprintf(out, n, "%s", cmd == 1 ? "" : cmd < 10 ? orbs[cmd - 2] : g_item_names[cmd - 10]);
     return 1;
 }
 static void items_scan(void) {
@@ -11886,6 +12368,8 @@ static void render_actor_hires(Actor *a, uint32_t *px, int W, int H, float sc, f
     if (actor_project_item(a, 0, vx, vy, vz, vis)) render_mesh_hires(a->item, vx, vy, vz, vis, px, W, H, sc, zb, zst, stamp);
     if (actor_project_item(a, 1, vx, vy, vz, vis)) render_mesh_hires(a->item_l, vx, vy, vz, vis, px, W, H, sc, zb, zst, stamp);
     if (actor_project_item(a, 2, vx, vy, vz, vis)) render_mesh_hires(a->shield_m, vx, vy, vz, vis, px, W, H, sc, zb, zst, stamp);
+    if (actor_project_item(a, 3, vx, vy, vz, vis)) render_mesh_hires(a->potion_m, vx, vy, vz, vis, px, W, H, sc, zb, zst, stamp);
+    orb_glow_draw(a, px, W, H, sc);
     blade_sample(a);
     if (a->trail) trail_sample(a);
 }
@@ -11894,6 +12378,9 @@ static void render_actor_hires(Actor *a, uint32_t *px, int W, int H, float sc, f
    (zst == stamp), so the characters hide each other correctly. */
 static void debris_draw(uint32_t *px, int W, int H, float sc, float *zb, uint32_t *zst, uint32_t stamp);
 static void trails_draw(uint32_t *px, int W, int H, float sc);
+static void proj_models_draw(uint32_t *px, int W, int H, float sc, float *zb, uint32_t *zst, uint32_t stamp);
+static void fx_draw(uint32_t *px, int W, int H, float sc);
+static void orb_glow_draw(Actor *a, uint32_t *px, int W, int H, float sc);
 static void render_david_hires(uint32_t *px, int W, int H, float sc) {
     if (!g_has_3d_character || !g_loaded || W <= 0 || H <= 0) return;
     static float *zb = NULL; static uint32_t *zst = NULL; static size_t zbn = 0; static uint32_t stamp = 0;
@@ -11907,6 +12394,8 @@ static void render_david_hires(uint32_t *px, int W, int H, float sc) {
     stamp++;
     for (int k = 0; k < MAX_ACTORS; k++) if (g_actors[k].used) render_actor_hires(&g_actors[k], px, W, H, sc, zb, zst, stamp);
     debris_draw(px, W, H, sc, zb, zst, stamp);
+    proj_models_draw(px, W, H, sc, zb, zst, stamp);
+    fx_draw(px, W, H, sc);
     trails_draw(px, W, H, sc);
 }
 
@@ -12041,7 +12530,7 @@ static void game_tick(HWND hwnd) {
         if (g_has_3d_character && !frozen) {
             for (int k = 0; k < MAX_ACTORS; k++) {
                 if (!g_actors[k].used) continue;
-                actor_begin(&g_actors[k]); need_repaint |= advance_character((float)dt); actor_end();
+                actor_begin(&g_actors[k]); need_repaint |= advance_character((float)dt * (g_actors[k].slow_t > 0.0f ? 0.35f : 1.0f)); actor_end();
                 actor_cue_tick(&g_actors[k], (float)dt);
             }
             combat_tick((float)dt);
