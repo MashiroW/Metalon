@@ -47,6 +47,8 @@ int audio_voices(AudioVoiceInfo *out, int max); /* sounds + ambiences playing */
 /* editor "Listen": one preview voice, a new preview replaces it;
    audio_preview(NULL) stops it */
 void audio_preview(const char *file);
+/* the volume of a kind of voice (AUDIO_*), 0..1 (the player's settings) */
+void audio_set_volume(int kind, float v);
 int audio_preview_playing(void);
 
 /* length of a file in seconds (-1 unreadable) */

@@ -4791,6 +4791,7 @@ enum {
     B_EDIT, B_T_SELECT, B_T_RECT, B_T_CIRCLE, B_T_POLY, B_UNDO, B_DELETE,
     B_R_RED, B_R_GREEN, B_R_FG, B_R_DOOR, B_R_REDO, B_R_RETARGET, B_R_SCRIPT, B_W_CANCEL, B_SETTINGS, B_SET_RESET, B_SCRIPTS,
     B_ANIMS, B_AV_MODEL, B_AV_MOVESET, B_AV_PREV, B_AV_PLAY, B_AV_NEXT, B_AV_STEPB, B_AV_STEPF, B_AV_SLOWER, B_AV_FASTER, B_AV_FOLLOW, B_AV_RESET, B_AV_CLOSE,
+    B_VOL_BASE = 60,  /* + 3*k: volume k (VOL_*) -, its name (mute), + */
     B_SET_BASE = 100, /* + 2*i (-), + 2*i+1 (+) */
     B_SV_FIRST_ID = 280, B_SV_LAST_ID = 1499 /* the scripts screen's (sv_action), but 900-999: the moveset screen's */
 };
@@ -4823,6 +4824,45 @@ static void anim_view_toggle(void);
 static void anim_view_action(int id);
 static int caps_on(void) { return (GetKeyState(VK_CAPITAL) & 1) != 0; }
 
+/* VOLUME (side panel, always there): master, music (80 % to begin with),
+   sounds & voices, ambiences -- in steps of 10 %; a click on its name
+   mutes it (again: back). Kept in data/audio.cfg. */
+enum { VOL_MASTER, VOL_MUSIC, VOL_SOUNDS, VOL_AMBIENCE, VOL_COUNT };
+static float g_vol[VOL_COUNT] = { 1.0f, 0.8f, 1.0f, 0.9f };
+static int g_vol_muted[VOL_COUNT];
+static const char *VOL_NAME[VOL_COUNT] = { "Master", "Music", "Sounds & voices", "Ambiences" };
+static void volumes_apply(void) {
+    float m = g_vol_muted[VOL_MASTER] ? 0.0f : g_vol[VOL_MASTER];
+    audio_set_volume(AUDIO_MUSIC, m * (g_vol_muted[VOL_MUSIC] ? 0.0f : g_vol[VOL_MUSIC]));
+    audio_set_volume(AUDIO_SOUND, m * (g_vol_muted[VOL_SOUNDS] ? 0.0f : g_vol[VOL_SOUNDS]));
+    audio_set_volume(AUDIO_AMBIENCE, m * (g_vol_muted[VOL_AMBIENCE] ? 0.0f : g_vol[VOL_AMBIENCE]));
+    audio_set_volume(AUDIO_PREVIEW, m); /* listening in the editors */
+}
+static void volumes_save(void) {
+    char path[1024];
+    root_path(path, sizeof(path), "data/audio.cfg");
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+    fprintf(f, "# Silver Remaster: the volumes (side panel), 0..1; muted 0 / 1\n");
+    static const char *key[VOL_COUNT] = { "master", "music", "sounds", "ambience" };
+    for (int k = 0; k < VOL_COUNT; k++) fprintf(f, "%s %.2f %d\n", key[k], g_vol[k], g_vol_muted[k]);
+    fclose(f);
+}
+static void volumes_load(void) {
+    char path[1024], line[128], key[32];
+    root_path(path, sizeof(path), "data/audio.cfg");
+    FILE *f = fopen(path, "r");
+    if (f) {
+        static const char *keys[VOL_COUNT] = { "master", "music", "sounds", "ambience" };
+        while (fgets(line, sizeof(line), f)) {
+            float v; int mu = 0;
+            if (sscanf(line, "%31s %f %d", key, &v, &mu) < 2) continue;
+            for (int k = 0; k < VOL_COUNT; k++) if (!strcmp(key, keys[k]) && v >= 0.0f && v <= 1.0f) { g_vol[k] = v; g_vol_muted[k] = mu != 0; }
+        }
+        fclose(f);
+    }
+    volumes_apply();
+}
 static void ui_add(int id, int x, int y, int w, int h, const char *label, const char *key, const char *desc, int on, int enabled, int kind) {
     if (g_btn_count >= UI_MAX_BTN) return;
     UiButton *b = &g_btn[g_btn_count++];
@@ -4884,6 +4924,16 @@ static void ui_layout(HWND hwnd) {
     ui_add(B_SCRIPTS, x, y, w, h, "Scripts...", "S", "This room's scripts (cutscenes): a grid of actions -- waits, music, sounds, ambiences, pictures, characters placed and moved. Play them from there.", 0, g_has_3d_character, 0);
     y += h + gap + 18;
     (void)vy;
+    for (int k = 0; k < VOL_COUNT; k++) { /* the volumes */
+        char lab[64];
+        snprintf(lab, sizeof(lab), g_vol_muted[k] ? "%s: muted" : "%s: %d %%", VOL_NAME[k], (int)(g_vol[k] * 100.0f + 0.5f));
+        ui_add(B_VOL_BASE + 3 * k, x, y, 30, h - 4, "-", "", "Lower (10 %).", 0, g_vol[k] > 0.001f, 0);
+        ui_addf(B_VOL_BASE + 3 * k + 1, x + 34, y, w - 68, h - 4, lab, "",
+                k == VOL_MASTER ? "Everything's volume. Click: mute / unmute." : "Its volume (times the master). Click: mute / unmute.", g_vol_muted[k], 1, 1);
+        ui_add(B_VOL_BASE + 3 * k + 2, x + w - 30, y, 30, h - 4, "+", "", "Louder (10 %).", 0, g_vol[k] < 0.999f, 0);
+        y += h;
+    }
+    y += 14;
     /* editor */
     ui_add(B_EDIT, x, y, w, h, g_edit_mode ? "Scene editor: ON" : "Scene editor", "E", "Draw shapes on the picture and give them roles (red/green zone, foreground, scene connector).", g_edit_mode, g_has_3d_character, 1);
     y += h + gap;
@@ -5008,6 +5058,19 @@ static void ui_action(HWND hwnd, int id) {
         case B_WALK: g_show_walkable = !g_show_walkable; break;
         case B_HITBOX: g_show_collision = !g_show_collision; break;
         case B_MESH: g_view_mode_3d = !g_view_mode_3d; break;
+        case B_VOL_BASE + 0: case B_VOL_BASE + 1: case B_VOL_BASE + 2: case B_VOL_BASE + 3: case B_VOL_BASE + 4: case B_VOL_BASE + 5:
+        case B_VOL_BASE + 6: case B_VOL_BASE + 7: case B_VOL_BASE + 8: case B_VOL_BASE + 9: case B_VOL_BASE + 10: case B_VOL_BASE + 11: {
+            int k = (id - B_VOL_BASE) / 3, op = (id - B_VOL_BASE) % 3;
+            if (op == 1) g_vol_muted[k] = !g_vol_muted[k];
+            else {
+                g_vol[k] = roundf((g_vol[k] + (op == 2 ? 0.1f : -0.1f)) * 10.0f) / 10.0f;
+                if (g_vol[k] < 0.0f) g_vol[k] = 0.0f;
+                if (g_vol[k] > 1.0f) g_vol[k] = 1.0f;
+                g_vol_muted[k] = 0;
+            }
+            volumes_apply(); volumes_save();
+            break;
+        }
         case B_FREECAM: if (fcam_allowed()) fcam_toggle(); break;
         case B_COLL: g_collision_enabled = !g_collision_enabled; break;
         case B_FULL: {
@@ -13451,6 +13514,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         char sdir[1024];
         root_path(sdir, sizeof(sdir), "assets/sound");
         audio_init(sdir); /* music, sounds, ambiences (scripts) */
+        volumes_load();
     }
     david_settings_load(); /* David's global speeds */
     g_nav_zone_at = shapes_world_zone; /* editor red/green zones -> navigation */

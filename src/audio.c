@@ -18,7 +18,8 @@
 #define FB_CAP 2048            /* decoded frames kept per voice */
 #define MAX_VOICES 32
 
-static const float KIND_GAIN[4] = { 0.8f, 1.0f, 0.9f, 1.0f }; /* music, sound, ambience, preview */
+static const float KIND_GAIN[4] = { 1.0f, 1.0f, 1.0f, 1.0f }; /* music, sound, ambience, preview (their volumes: g_kind_vol) */
+static volatile float g_kind_vol[4] = { 0.8f, 1.0f, 0.9f, 1.0f }; /* the player's volumes (audio_set_volume) */
 
 typedef struct {
     int used, id, kind;
@@ -126,7 +127,7 @@ static void mix(short *out, int frames) {
     for (int k = 0; k < MAX_VOICES; k++) {
         Voice *vc = &g_voice[k];
         if (!vc->used) continue;
-        float g = KIND_GAIN[vc->kind];
+        float g = KIND_GAIN[vc->kind] * g_kind_vol[vc->kind];
         for (int i = 0; i < frames; i++) {
             while (vc->used && vc->rpos + 1 >= vc->fb_n) {
                 if (voice_refill(vc)) continue;
@@ -329,6 +330,10 @@ int audio_voices(AudioVoiceInfo *out, int max) {
     return n;
 }
 
+void audio_set_volume(int kind, float v) {
+    if (kind < 0 || kind > 3) return;
+    g_kind_vol[kind] = v < 0.0f ? 0.0f : v > 1.0f ? 1.0f : v;
+}
 void audio_preview(const char *file) {
     audio_stop_kind(AUDIO_PREVIEW);
     if (file && file[0]) audio_play(file, AUDIO_PREVIEW, 0, 0);

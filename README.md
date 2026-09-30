@@ -300,6 +300,7 @@ Every tool is also a button in the side panel, with its shortcut shown.
 | S | scripts of the room (F5 play, F6 play from the row, Ins / Del rows and cells, right-click a cell) |
 | Left-click during a script | skip the current row (not while a character is moving) |
 | Right click | the radial menu (weapons, shields, specials...) |
+| Side panel: Master / Music / Sounds & voices / Ambiences | the volumes (- / +, 10 % steps; a click on the name mutes it); music at 80 % to begin with, kept in data/audio.cfg |
 | Ctrl held | attack mode: click = attack, button held + swing up / left / right / down = the other blows, right click = dodge, right button held = shield |
 | Ctrl+K | break the shield (test: nothing hits yet) |
 | Ctrl+H | David is hit: a grunt, by the moveset's chance (test) |
