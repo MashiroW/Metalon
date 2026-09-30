@@ -200,9 +200,12 @@ static RoomCamera g_char_cam; /* roll-free variant of g_room_cam, David's mesh p
    cycle's first pose. */
 enum { MC_RUN90A, MC_RUN90C, MC_RUN180A, MC_RUN180C, MC_TOWALKA, MC_TOWALKC, MC_TOWALK, MC_TORUN, MC_TO180A, MC_TO180C,
        MC_STAND, MC_WALK, MC_RUN,
+       /* reactions: a blow taken, a dodge, dying (an enemy), knocked down and getting up again (an ally) */
+       MC_HIT, MC_DODGE, MC_DEATH, MC_DOWN, MC_GETUP,
        /* combat (attack mode, Ctrl held): a click = one of the 3 attacks at random, a held swing = the other 5 */
        MC_ATK1, MC_ATK2, MC_ATK3, MC_SW_UP, MC_SW_LEFT, MC_SW_RIGHT, MC_SW_BACKL, MC_SW_BACKR, MC_COUNT };
 #define MC_FIRST_COMBAT MC_ATK1
+#define MC_FIRST_REACT MC_HIT
 /* The human skeleton's hands: the wrists 19 (right) and 23 (left), the
    grips in their palms 42 (right) and 40 (left) -- 41, on the back of the
    left hand, is most likely a shield's. Not every model has the grips
@@ -3117,11 +3120,13 @@ static const char *MOVE_SLOT_KEY[MC_COUNT] = {
     "run_turn_left", "run_turn_right", "run_back_left", "run_back_right",
     "walk_turn_left", "walk_turn_right", "start_walk", "start_run", "walk_back_left", "walk_back_right",
     "stand", "walk", "run",
+    "hit", "dodge", "death", "down", "get_up",
     "attack_1", "attack_2", "attack_3", "swing_up", "swing_left", "swing_right", "swing_back_left", "swing_back_right" };
 static const char *MOVE_SLOT_LABEL[MC_COUNT] = {
     "Run: turn left", "Run: turn right", "Run: back via left", "Run: back via right",
     "Walk: turn left", "Walk: turn right", "Start walking", "Start running", "Walk: back via left", "Walk: back via right",
     "Stand", "Walk", "Run",
+    "Hit", "Dodge", "Death", "Knocked down", "Getting up",
     "Attack 1", "Attack 2", "Attack 3", "Swing up", "Swing left", "Swing right", "Swing down, via left", "Swing down, via right" };
 static const char *MOVE_SLOT_DESC[MC_COUNT] = {
     "Running, the new direction is 45-135 degrees to its left: played while it turns, then the run cycle.",
@@ -3135,6 +3140,11 @@ static const char *MOVE_SLOT_DESC[MC_COUNT] = {
     "Walking, the new direction is behind it: turns around via its left.",
     "Walking, the new direction is behind it: turns around via its right.",
     "Standing still (loops).", "The walk cycle (loops).", "The run cycle (loops).",
+    "A blow lands on it (it isn't dead yet): played over what it was doing.",
+    "It avoids a blow (its AI's dodge chance; David: attack mode, right click).",
+    "An ENEMY's health is gone: it dies (held on the last frame).",
+    "An ALLY's health is gone: it's knocked down, until the enemies of the scene are beaten.",
+    "The ally knocked down gets up again (its health back)." ,
     "Attack mode, a simple click: one of the three attacks, at random.", "Attack mode, a simple click: one of the three attacks, at random.",
     "Attack mode, a simple click: one of the three attacks, at random.",
     "Attack mode, button held and the mouse swung UP: a thrust ahead.",
@@ -3159,8 +3169,21 @@ static const char *MOVE_SLOT_DESC[MC_COUNT] = {
      weapon|shield <item>|-                   (model)
    A character's combat preset can follow the weapon it holds: DOUBLE
    SWORDS for dualswrd, SINGLE SWORDS for any other. */
-enum { PG_WALK, PG_COMBAT, PG_SOUND, PG_MODEL, PG_COUNT };
-static const char *PG_NAME[PG_COUNT] = { "walking", "combat", "sounds", "model" };
+enum { PG_WALK, PG_COMBAT, PG_SOUND, PG_REACT, PG_AI, PG_STATS, PG_MODEL, PG_COUNT };
+static const char *PG_NAME[PG_COUNT] = { "walking", "combat", "sounds", "reactions", "ai", "stats", "model" };
+/* AI: what a character does on its own. MELEE: gets close enough to the
+   nearest opponent to strike, strikes, pauses, strikes again; may dodge a blow. */
+enum { AI_NONE, AI_MELEE };
+typedef struct {
+    int kind;                    /* AI_* */
+    float range;                 /* it strikes from this far (hitbox diameters) */
+    int run;                     /* it runs to its target (else walks) */
+    float pause_min, pause_max;  /* between two attacks, seconds */
+    int dodge;                   /* % of the blows aimed at it that it dodges */
+} AiSettings;
+/* STATS: its health, the damage of its blows, a boss (its health bar on the screen) */
+typedef struct { int hp, damage, boss; } StatSettings;
+static const StatSettings STATS_DEFAULT = { 100, 10, 0 };
 enum { POOL_SWING, POOL_HIT, POOL_GRUNT, POOL_COUNT };
 #define POOL_MAX 12
 typedef struct {
@@ -3177,11 +3200,15 @@ typedef struct {
     float step[MC_COUNT];        /* combat: hitbox diameters, forward (< 0 backward) */
     SoundPools snd;              /* sounds */
     CueList cues[COMBAT_SLOTS];  /* combat: each blow's sounds (not set: a swing of the pool) */
+    AiSettings ai;               /* ai */
+    StatSettings st;             /* stats */
     char walk[48], combat[48], sound[48], weapon[48], shield[48]; /* model ("combat" "" = from the weapon) */
+    char react[48], aip[48], stats[48];                            /* model */
 } MovePreset;
 static MovePreset g_presets[MOVE_PRESET_MAX];
 static int g_preset_n = -1;
-static int slot_group(int slot) { return slot >= MC_FIRST_COMBAT; }
+static int slot_group(int slot) { return slot >= MC_FIRST_COMBAT ? PG_COMBAT : slot >= MC_FIRST_REACT ? PG_REACT : PG_WALK; }
+static int group_has_slots(int g) { return g == PG_WALK || g == PG_REACT || g == PG_COMBAT; }
 static const char *weapon_preset(const char *weapon) { return (weapon && !strcmp(weapon, "dualswrd")) ? "Double Swords" : "Single Swords"; }
 static void preset_file(char *out, size_t n, const char *name) {
     char safe[64]; int k = 0;
@@ -3258,8 +3285,8 @@ static void cue_run(CuePlayer *p, float dt, const SoundPools *sp) {
 static void presets_load(void) {
     if (g_preset_n >= 0) return;
     g_preset_n = 0;
-    static const char *human[MC_FIRST_COMBAT] = { "run90a", "run90c", "run180a", "run180c", "towalka", "towalkc", "towalk", "torun", "to180a", "to180c",
-                                                  "stand", "walk", "run" };
+    static const char *human[MC_FIRST_REACT] = { "run90a", "run90c", "run180a", "run180c", "towalka", "towalkc", "towalk", "torun", "to180a", "to180c",
+                                                 "stand", "walk", "run" };
     /* attack 1-3, swing up, left, right, down via left, down via right. lslice2 (the double swords' right
        swing) isn't in the blockouts: hedchop2, their other side blow, stands in for it */
     static const char *single[8] = { "rchop", "rchopp", "rchoppp", "lstab", "headchop", "revslice", "rchp180a", "rchp180c" };
@@ -3267,7 +3294,20 @@ static void presets_load(void) {
     static const float steps[8] = { 1.0f, 1.0f, 1.0f, 4.0f, 1.25f, 1.5f, -1.5f, -1.5f };
     MovePreset *p = &g_presets[g_preset_n++];
     memset(p, 0, sizeof(*p)); snprintf(p->name, sizeof(p->name), "Human"); p->builtin = 1; p->group = PG_WALK;
-    for (int k = 0; k < MC_FIRST_COMBAT; k++) snprintf(p->clip[k], sizeof(p->clip[k]), "%s", human[k]);
+    for (int k = 0; k < MC_FIRST_REACT; k++) snprintf(p->clip[k], sizeof(p->clip[k]), "%s", human[k]);
+    for (int f = 0; f < 2; f++) { /* reactions: a human's; fuge dies his own way */
+        static const char *react[5] = { "hitface", "dodgeb", "dieback", "unc_fall", "unc_up" };
+        p = &g_presets[g_preset_n++];
+        memset(p, 0, sizeof(*p)); snprintf(p->name, sizeof(p->name), f ? "Fuge" : "Human"); p->group = PG_REACT; p->builtin = 1;
+        for (int k = 0; k < 5; k++) snprintf(p->clip[MC_FIRST_REACT + k], 100, "%s", react[k]);
+        if (f) snprintf(p->clip[MC_DEATH], 100, "fuge/fugedie");
+    }
+    p = &g_presets[g_preset_n++]; /* fuge and his two blades: closes in, strikes, sometimes dodges */
+    memset(p, 0, sizeof(*p)); snprintf(p->name, sizeof(p->name), "Fuge - dual blades"); p->group = PG_AI; p->builtin = 1;
+    p->ai.kind = AI_MELEE; p->ai.range = 1.6f; p->ai.run = 1; p->ai.pause_min = 0.6f; p->ai.pause_max = 1.4f; p->ai.dodge = 35;
+    p = &g_presets[g_preset_n++];
+    memset(p, 0, sizeof(*p)); snprintf(p->name, sizeof(p->name), "Human"); p->group = PG_STATS; p->builtin = 1;
+    p->st = STATS_DEFAULT;
     for (int w = 0; w < 2; w++) {
         p = &g_presets[g_preset_n++];
         memset(p, 0, sizeof(*p)); snprintf(p->name, sizeof(p->name), w ? "Double Swords" : "Single Swords"); p->group = PG_COMBAT; p->builtin = 1;
@@ -3303,6 +3343,17 @@ static void presets_load(void) {
             else if (!strcmp(key, "hit")) pool_add(&p->snd, POOL_HIT, val);
             else if (!strcmp(key, "grunt")) pool_add(&p->snd, POOL_GRUNT, val);
             else if (!strcmp(key, "grunt_chance")) p->snd.grunt_chance = atoi(val);
+            else if (!strcmp(key, "ai_kind")) p->ai.kind = !strcmp(val, "melee") ? AI_MELEE : AI_NONE;
+            else if (!strcmp(key, "ai_range")) p->ai.range = (float)atof(val);
+            else if (!strcmp(key, "ai_run")) p->ai.run = atoi(val);
+            else if (!strcmp(key, "ai_pause")) sscanf(rest, "%f %f", &p->ai.pause_min, &p->ai.pause_max);
+            else if (!strcmp(key, "ai_dodge")) p->ai.dodge = atoi(val);
+            else if (!strcmp(key, "hp")) p->st.hp = atoi(val);
+            else if (!strcmp(key, "damage")) p->st.damage = atoi(val);
+            else if (!strcmp(key, "boss")) p->st.boss = atoi(val);
+            else if (!strcmp(key, "reactions")) snprintf(p->react, sizeof(p->react), "%s", rest);
+            else if (!strcmp(key, "ai")) snprintf(p->aip, sizeof(p->aip), "%s", rest);
+            else if (!strcmp(key, "stats")) snprintf(p->stats, sizeof(p->stats), "%s", rest);
             else if (!strcmp(key, "walk")) snprintf(p->walk, sizeof(p->walk), "%s", rest);
             else if (!strcmp(key, "combat")) snprintf(p->combat, sizeof(p->combat), "%s", strcmp(rest, "auto") ? rest : "");
             else if (!strcmp(key, "sound")) snprintf(p->sound, sizeof(p->sound), "%s", rest);
@@ -3327,7 +3378,11 @@ static void preset_write(const MovePreset *p) {
     FILE *f = fopen(path, "w");
     if (!f) return;
     fprintf(f, "# Silver Remaster: a %s preset (moveset screen)\nname %s\ngroup %s\n", PG_NAME[p->group], p->name, PG_NAME[p->group]);
-    if (p->group == PG_WALK || p->group == PG_COMBAT)
+    if (p->group == PG_AI)
+        fprintf(f, "ai_kind %s\nai_range %.2f\nai_run %d\nai_pause %.2f %.2f\nai_dodge %d\n", p->ai.kind == AI_MELEE ? "melee" : "none",
+                p->ai.range, p->ai.run, p->ai.pause_min, p->ai.pause_max, p->ai.dodge);
+    if (p->group == PG_STATS) fprintf(f, "hp %d\ndamage %d\nboss %d\n", p->st.hp, p->st.damage, p->st.boss);
+    if (group_has_slots(p->group))
         for (int k = 0; k < MC_COUNT; k++) {
             if (slot_group(k) != p->group) continue;
             fprintf(f, "%s %s\n", MOVE_SLOT_KEY[k], p->clip[k][0] ? p->clip[k] : "-");
@@ -3340,8 +3395,9 @@ static void preset_write(const MovePreset *p) {
         fprintf(f, "grunt_chance %d\n", p->snd.grunt_chance);
     }
     if (p->group == PG_MODEL)
-        fprintf(f, "walk %s\ncombat %s\nsound %s\nweapon %s\nshield %s\n", p->walk[0] ? p->walk : "-", p->combat[0] ? p->combat : "auto",
-                p->sound[0] ? p->sound : "-", p->weapon[0] ? p->weapon : "-", p->shield[0] ? p->shield : "-");
+        fprintf(f, "walk %s\ncombat %s\nsound %s\nreactions %s\nai %s\nstats %s\nweapon %s\nshield %s\n", p->walk[0] ? p->walk : "-", p->combat[0] ? p->combat : "auto",
+                p->sound[0] ? p->sound : "-", p->react[0] ? p->react : "-", p->aip[0] ? p->aip : "-", p->stats[0] ? p->stats : "-",
+                p->weapon[0] ? p->weapon : "-", p->shield[0] ? p->shield : "-");
     fclose(f);
 }
 
@@ -3351,6 +3407,12 @@ typedef struct {
     char walk_preset[48];        /* "Human" by default; "-" = none */
     char combat_preset[48];      /* "" = the weapon's (Single / Double Swords); "-" = none; else a preset */
     char sound_preset[48];       /* "David" for David; "-" = none */
+    char react_preset[48];       /* "Human" ("Fuge" for fuge) */
+    char ai_preset[48];          /* "-" = none ("Fuge - dual blades" for fuge) */
+    char stats_preset[48];       /* "Human" */
+    int own_ai, own_stats;       /* its own AI / stats (changed from its presets') */
+    AiSettings ai;
+    StatSettings st;
     char right_hand[48];         /* equipped weapon to begin with, "" = nothing */
     char left_hand[48];          /* equipped shield to begin with, "" = nothing */
     char slot[MC_COUNT][100];    /* "" = the preset's, "-" = no animation, else "source/name" */
@@ -3368,6 +3430,16 @@ static const char *default_right_hand(const char *model) {
     return "";
 }
 static const char *default_sound_preset(const char *model) { return !strcmp(model, "david") ? "David" : "-"; }
+/* a character's preset of a group when nothing else is said */
+static const char *default_group_preset(const char *model, int group, const char *weapon) {
+    switch (group) {
+        case PG_COMBAT: return weapon_preset(weapon);
+        case PG_SOUND: return default_sound_preset(model);
+        case PG_REACT: return !strcmp(model, "fuge") ? "Fuge" : "Human";
+        case PG_AI: return !strcmp(model, "fuge") ? "Fuge - dual blades" : "-";
+        default: return "Human";
+    }
+}
 #define MAX_MOVESETS 64
 static Moveset g_movesets[MAX_MOVESETS];
 static int g_moveset_count = 0;
@@ -3383,6 +3455,9 @@ static Moveset *moveset_get(const char *model) {
     snprintf(ms->model, sizeof(ms->model), "%s", model);
     snprintf(ms->walk_preset, sizeof(ms->walk_preset), "Human");
     snprintf(ms->sound_preset, sizeof(ms->sound_preset), "%s", default_sound_preset(model));
+    snprintf(ms->react_preset, sizeof(ms->react_preset), "%s", default_group_preset(model, PG_REACT, ""));
+    snprintf(ms->ai_preset, sizeof(ms->ai_preset), "%s", default_group_preset(model, PG_AI, ""));
+    snprintf(ms->stats_preset, sizeof(ms->stats_preset), "%s", default_group_preset(model, PG_STATS, ""));
     snprintf(ms->right_hand, sizeof(ms->right_hand), "%s", default_right_hand(model));
     char path[1024], line[512], key[64], val[128];
     moveset_path(path, sizeof(path), model);
@@ -3396,6 +3471,17 @@ static Moveset *moveset_get(const char *model) {
             if (!strncmp(line, "combat_preset ", 14)) { snprintf(ms->combat_preset, sizeof(ms->combat_preset), "%s", strcmp(rest, "auto") ? rest : ""); continue; }
             if (!strncmp(line, "sound_preset ", 13)) { snprintf(ms->sound_preset, sizeof(ms->sound_preset), "%s", rest); continue; }
             if (!strncmp(line, "model_preset ", 13)) { snprintf(ms->model_preset, sizeof(ms->model_preset), "%s", rest); continue; }
+            if (!strncmp(line, "react_preset ", 13)) { snprintf(ms->react_preset, sizeof(ms->react_preset), "%s", rest); continue; }
+            if (!strncmp(line, "ai_preset ", 10)) { snprintf(ms->ai_preset, sizeof(ms->ai_preset), "%s", rest); continue; }
+            if (!strncmp(line, "stats_preset ", 13)) { snprintf(ms->stats_preset, sizeof(ms->stats_preset), "%s", rest); continue; }
+            if (!strncmp(line, "own_ai ", 7)) {
+                char kind[16] = "";
+                if (sscanf(rest, "%15s %f %d %f %f %d", kind, &ms->ai.range, &ms->ai.run, &ms->ai.pause_min, &ms->ai.pause_max, &ms->ai.dodge) >= 1) {
+                    ms->ai.kind = !strcmp(kind, "melee") ? AI_MELEE : AI_NONE; ms->own_ai = 1;
+                }
+                continue;
+            }
+            if (!strncmp(line, "own_stats ", 10)) { if (sscanf(rest, "%d %d %d", &ms->st.hp, &ms->st.damage, &ms->st.boss) >= 1) ms->own_stats = 1; continue; }
             if (!strncmp(line, "combat_changes_for ", 19)) { snprintf(ms->combat_ovr_for, sizeof(ms->combat_ovr_for), "%s", rest); continue; }
             if (cue_line(line, "own_", ms->cues, ms->has_cues)) continue;
             if (sscanf(line, "%63s %127s", key, val) != 2 || key[0] == '#') continue;
@@ -3417,7 +3503,7 @@ static Moveset *moveset_get(const char *model) {
             if (!strcmp(key, "own_grunt_chance")) { ms->own_sounds = 1; ms->snd.grunt_chance = atoi(val); continue; }
             for (int k = 0; k < MC_COUNT; k++) if (!strcmp(key, MOVE_SLOT_KEY[k])) {
                 snprintf(ms->slot[k], sizeof(ms->slot[k]), "%s", val);
-                if (slot_group(k)) legacy_combat = 1;
+                if (slot_group(k) == PG_COMBAT) legacy_combat = 1;
             }
         }
         fclose(f);
@@ -3432,7 +3518,9 @@ static void moveset_save(const Moveset *ms) {
     char path[1024];
     moveset_path(path, sizeof(path), ms->model);
     int custom = strcmp(ms->walk_preset, "Human") || ms->combat_preset[0] || strcmp(ms->sound_preset, default_sound_preset(ms->model)) ||
-                 strcmp(ms->right_hand, default_right_hand(ms->model)) || ms->left_hand[0] || ms->own_sounds || ms->model_preset[0];
+                 strcmp(ms->right_hand, default_right_hand(ms->model)) || ms->left_hand[0] || ms->own_sounds || ms->model_preset[0] ||
+                 strcmp(ms->react_preset, default_group_preset(ms->model, PG_REACT, "")) || strcmp(ms->ai_preset, default_group_preset(ms->model, PG_AI, "")) ||
+                 strcmp(ms->stats_preset, default_group_preset(ms->model, PG_STATS, "")) || ms->own_ai || ms->own_stats;
     for (int k = 0; k < MC_COUNT; k++) if (ms->slot[k][0] || ms->has_step[k]) custom = 1;
     for (int i = 0; i < COMBAT_SLOTS; i++) if (ms->has_cues[i]) custom = 1;
     g_moveset_gen++;
@@ -3445,6 +3533,10 @@ static void moveset_save(const Moveset *ms) {
     fprintf(f, "walk_preset %s\n", ms->walk_preset[0] ? ms->walk_preset : "-");
     fprintf(f, "combat_preset %s\n", ms->combat_preset[0] ? ms->combat_preset : "auto");
     fprintf(f, "sound_preset %s\n", ms->sound_preset[0] ? ms->sound_preset : "-");
+    fprintf(f, "react_preset %s\nai_preset %s\nstats_preset %s\n", ms->react_preset[0] ? ms->react_preset : "-", ms->ai_preset[0] ? ms->ai_preset : "-",
+            ms->stats_preset[0] ? ms->stats_preset : "-");
+    if (ms->own_ai) fprintf(f, "own_ai %s %.2f %d %.2f %.2f %d\n", ms->ai.kind == AI_MELEE ? "melee" : "none", ms->ai.range, ms->ai.run, ms->ai.pause_min, ms->ai.pause_max, ms->ai.dodge);
+    if (ms->own_stats) fprintf(f, "own_stats %d %d %d\n", ms->st.hp, ms->st.damage, ms->st.boss);
     fprintf(f, "right_hand %s\n", ms->right_hand[0] ? ms->right_hand : "-");
     fprintf(f, "left_hand %s\n", ms->left_hand[0] ? ms->left_hand : "-");
     if (ms->combat_ovr_for[0]) fprintf(f, "combat_changes_for %s\n", ms->combat_ovr_for);
@@ -3470,13 +3562,35 @@ static int anim_lib_find_ref(const char *ref) {
 
 /* The preset a tab of a moveset uses (NULL: none), for a character holding
    `weapon`. A preset that no longer exists (deleted): the default one. */
+/* the preset name a group of a moveset uses */
+static char *ms_group_name(Moveset *ms, int group) {
+    switch (group) {
+        case PG_COMBAT: return ms->combat_preset;
+        case PG_SOUND: return ms->sound_preset;
+        case PG_REACT: return ms->react_preset;
+        case PG_AI: return ms->ai_preset;
+        case PG_STATS: return ms->stats_preset;
+        default: return ms->walk_preset;
+    }
+}
 static const MovePreset *moveset_preset_w(const Moveset *ms, int group, const char *weapon) {
-    const char *n = group == PG_COMBAT ? ms->combat_preset : group == PG_SOUND ? ms->sound_preset : ms->walk_preset;
+    const char *n = ms_group_name((Moveset *)ms, group);
     if (!strcmp(n, "-")) return NULL;
     if (group == PG_COMBAT && !n[0]) n = weapon_preset(weapon);
     const MovePreset *p = preset_find(n, group);
-    if (!p) p = preset_find(group == PG_COMBAT ? weapon_preset(weapon) : group == PG_SOUND ? default_sound_preset(ms->model) : "Human", group);
+    if (!p) { const char *d = default_group_preset(ms->model, group, weapon); if (strcmp(d, "-")) p = preset_find(d, group); }
     return p;
+}
+/* its AI (NULL: none) and its stats: its own, else its preset's */
+static const AiSettings *moveset_ai(const Moveset *ms) {
+    if (ms->own_ai) return &ms->ai;
+    const MovePreset *p = moveset_preset_w(ms, PG_AI, ms->right_hand);
+    return p ? &p->ai : NULL;
+}
+static const StatSettings *moveset_stats(const Moveset *ms) {
+    if (ms->own_stats) return &ms->st;
+    const MovePreset *p = moveset_preset_w(ms, PG_STATS, ms->right_hand);
+    return p ? &p->st : &STATS_DEFAULT;
 }
 /* the name of the combat preset in use (for the changes made on it) */
 static const char *moveset_combat_name(const Moveset *ms, const char *weapon) {
@@ -3485,7 +3599,7 @@ static const char *moveset_combat_name(const Moveset *ms, const char *weapon) {
 }
 /* a slot's own change applies: always for walking; for combat only on the preset it was made on */
 static int moveset_change_on(const Moveset *ms, int slot, const char *weapon) {
-    return !slot_group(slot) || !ms->combat_ovr_for[0] || !_stricmp(ms->combat_ovr_for, moveset_combat_name(ms, weapon));
+    return slot_group(slot) != PG_COMBAT || !ms->combat_ovr_for[0] || !_stricmp(ms->combat_ovr_for, moveset_combat_name(ms, weapon));
 }
 /* The clip a slot plays (-1: none). *how: 0 preset, 1 custom, 2 no animation */
 static int moveset_clip_w(const Moveset *ms, int slot, int *how, const char *weapon) {
@@ -3541,6 +3655,9 @@ static void preset_delete(MovePreset *p) {
         if (group == PG_WALK && !_stricmp(ms->walk_preset, name)) { snprintf(ms->walk_preset, 48, "Human"); changed = 1; }
         if (group == PG_COMBAT && !_stricmp(ms->combat_preset, name)) { ms->combat_preset[0] = 0; changed = 1; }
         if (group == PG_SOUND && !_stricmp(ms->sound_preset, name)) { snprintf(ms->sound_preset, 48, "%s", default_sound_preset(ms->model)); changed = 1; }
+        if ((group == PG_REACT || group == PG_AI || group == PG_STATS) && !_stricmp(ms_group_name(ms, group), name)) {
+            snprintf(ms_group_name(ms, group), 48, "%s", default_group_preset(ms->model, group, ms->right_hand)); changed = 1;
+        }
         if (group == PG_MODEL && !_stricmp(ms->model_preset, name)) { ms->model_preset[0] = 0; changed = 1; }
         if (changed) moveset_save(ms);
     }
@@ -9935,13 +10052,17 @@ static void sv_wheel(int x, int y, int delta) {
    clip playing on the character, and the clips it can use instead.
    ===================================================================== */
 enum { B_MS_FIRST = 900, B_MS_CLOSE = B_MS_FIRST, B_MS_NONE, B_MS_PRESET, B_MS_USE, B_MS_TAB_WALK, B_MS_TAB_COMBAT, B_MS_TAB_SOUND,
+       B_MS_TAB_REACT, B_MS_TAB_AI, B_MS_TAB_STATS,
+       B_MS_AI_NONE, B_MS_AI_MELEE, B_MS_AI_RANGE_M, B_MS_AI_RANGE_P, B_MS_AI_WALK, B_MS_AI_RUN, B_MS_AI_PMIN_M, B_MS_AI_PMIN_P,
+       B_MS_AI_PMAX_M, B_MS_AI_PMAX_P, B_MS_AI_DODGE_M, B_MS_AI_DODGE_P, B_MS_AI_RESET,
+       B_MS_ST_HP_M10, B_MS_ST_HP_M1, B_MS_ST_HP_P1, B_MS_ST_HP_P10, B_MS_ST_DMG_M, B_MS_ST_DMG_P, B_MS_ST_BOSS, B_MS_ST_RESET,
        B_MS_TAB_PRESET, B_MS_MODEL_PRESET, B_MS_WEAPON, B_MS_SHIELD, B_MS_ITEM_NONE, B_MS_LIST_BACK, B_MS_STEP_M, B_MS_STEP_P, B_MS_STEP_PRESET,
        B_MS_CHANCE_M, B_MS_CHANCE_P, B_MS_SAVE_OK, B_MS_SAVE_CANCEL, B_MS_SAVE_DEFAULT, B_MS_SOUNDS_RESET,
        B_MS_CUES, B_MS_CUE_SOUND, B_MS_CUE_SWING, B_MS_CUE_WAIT, B_MS_CUE_PLAY, B_MS_CUE_RESET, B_MS_CUE_DONE,
        B_MS_POOL = 2000 /* + pool * 100: the pool (select); + 1 + i: listen to sound i; + 50 + i: remove it; + 99: add */,
        B_MS_CUE_ROW = 2400 /* + row * 10 + CUEOP_*: a step of the blow's sounds */,
        B_MS_LAST = 2999 };
-static int g_ms_tab = 0;          /* PG_WALK, PG_COMBAT, PG_SOUND */
+static int g_ms_tab = 0;          /* PG_WALK, PG_COMBAT, PG_SOUND, PG_REACT, PG_AI, PG_STATS */
 static int g_ms_items = 0;        /* the list shows the items: 1 for the weapon, 2 for the shield */
 static int g_ms_sounds = 0;       /* the list shows the sounds (the Sounds tab) */
 static int g_ms_pool = POOL_SWING;/* the pool a sound is added to */
@@ -10071,7 +10192,7 @@ static void ms_set_tab(int tab) {
     g_ms_tab = tab;
     g_ms_cues = 0; g_ms_cplay_t = -1.0f;
     ms_list_mode(0);
-    if (tab != PG_SOUND) ms_select_slot(tab == PG_COMBAT ? MC_ATK1 : MC_WALK);
+    if (group_has_slots(tab)) ms_select_slot(tab == PG_COMBAT ? MC_ATK1 : tab == PG_REACT ? MC_HIT : MC_WALK);
 }
 static void ms_open(CharModel *m) {
     if (!m) return;
@@ -10091,7 +10212,7 @@ static void ms_combat_change(Moveset *ms) {
 }
 static void ms_assign(int clip) {
     Moveset *ms = ms_cur();
-    if (slot_group(g_ms_slot)) ms_combat_change(ms);
+    if (slot_group(g_ms_slot) == PG_COMBAT) ms_combat_change(ms);
     if (clip < 0) snprintf(ms->slot[g_ms_slot], sizeof(ms->slot[0]), "-");
     else {
         char ref[100]; snprintf(ref, sizeof(ref), "%s/%s", anim_lib_source(clip), anim_lib_name(clip));
@@ -10115,6 +10236,8 @@ static SoundPools *ms_own_sounds(Moveset *ms) {
 /* does a tab (group) carry changes of its own, not in a preset yet? */
 static int ms_group_changed(const Moveset *ms, int group) {
     if (group == PG_SOUND) return ms->own_sounds;
+    if (group == PG_AI) return ms->own_ai;
+    if (group == PG_STATS) return ms->own_stats;
     for (int k = 0; k < MC_COUNT; k++) if (slot_group(k) == group && (ms->slot[k][0] || ms->has_step[k])) return 1;
     if (group == PG_COMBAT) for (int i = 0; i < COMBAT_SLOTS; i++) if (ms->has_cues[i]) return 1;
     return 0;
@@ -10132,6 +10255,8 @@ static int ms_save_group(Moveset *ms, int group, const char *name, int make_defa
     snprintf(np.name, sizeof(np.name), "%s", name);
     np.group = group;
     if (group == PG_SOUND) { const SoundPools *sp = moveset_sounds(ms); if (sp) np.snd = *sp; }
+    else if (group == PG_AI) { const AiSettings *ai = moveset_ai(ms); if (ai) np.ai = *ai; }
+    else if (group == PG_STATS) np.st = *moveset_stats(ms);
     else for (int k = 0; k < MC_COUNT; k++) {
         if (slot_group(k) != group) continue;
         int c = moveset_clip(ms, k, NULL);
@@ -10143,6 +10268,12 @@ static int ms_save_group(Moveset *ms, int group, const char *name, int make_defa
     preset_write(p);
     if (make_default) {
         if (group == PG_SOUND) { snprintf(ms->sound_preset, 48, "%s", name); ms->own_sounds = 0; }
+        else if (group == PG_AI) { snprintf(ms->ai_preset, 48, "%s", name); ms->own_ai = 0; }
+        else if (group == PG_STATS) { snprintf(ms->stats_preset, 48, "%s", name); ms->own_stats = 0; }
+        else if (group == PG_REACT) {
+            snprintf(ms->react_preset, 48, "%s", name);
+            for (int k = 0; k < MC_COUNT; k++) if (slot_group(k) == group) ms->slot[k][0] = 0;
+        }
         else {
             snprintf(group == PG_COMBAT ? ms->combat_preset : ms->walk_preset, 48, "%s", name);
             for (int k = 0; k < MC_COUNT; k++) if (slot_group(k) == group) { ms->slot[k][0] = 0; ms->has_step[k] = 0; }
@@ -10161,7 +10292,7 @@ static void ms_save_model(Moveset *ms, const char *name, int make_default) {
     MovePreset np; memset(&np, 0, sizeof(np));
     snprintf(np.name, sizeof(np.name), "%s", name);
     np.group = PG_MODEL;
-    for (int g = PG_WALK; g <= PG_SOUND; g++) {
+    for (int g = PG_WALK; g <= PG_STATS; g++) {
         char sub[48];
         if (ms_group_changed(ms, g)) {
             snprintf(sub, sizeof(sub), "%.30s - %s", name, PG_NAME[g]);
@@ -10173,6 +10304,9 @@ static void ms_save_model(Moveset *ms, const char *name, int make_default) {
     snprintf(np.sound, sizeof(np.sound), "%s", ms->sound_preset);
     snprintf(np.weapon, sizeof(np.weapon), "%s", ms->right_hand);
     snprintf(np.shield, sizeof(np.shield), "%s", ms->left_hand);
+    snprintf(np.react, sizeof(np.react), "%s", ms->react_preset);
+    snprintf(np.aip, sizeof(np.aip), "%s", ms->ai_preset);
+    snprintf(np.stats, sizeof(np.stats), "%s", ms->stats_preset);
     MovePreset *p = old;
     if (!p) { if (g_preset_n >= MOVE_PRESET_MAX) { snprintf(g_status, sizeof(g_status), "too many presets"); return; } p = &g_presets[g_preset_n++]; }
     *p = np;
@@ -10189,6 +10323,10 @@ static void ms_apply_model(Moveset *ms, const MovePreset *p) {
     snprintf(ms->right_hand, 48, "%s", p->weapon);
     snprintf(ms->left_hand, 48, "%s", p->shield);
     snprintf(ms->model_preset, 48, "%s", p->name);
+    snprintf(ms->react_preset, 48, "%s", p->react[0] ? p->react : default_group_preset(ms->model, PG_REACT, ""));
+    snprintf(ms->ai_preset, 48, "%s", p->aip[0] ? p->aip : "-");
+    snprintf(ms->stats_preset, 48, "%s", p->stats[0] ? p->stats : "Human");
+    ms->own_ai = ms->own_stats = 0;
     for (int k = 0; k < MC_COUNT; k++) { ms->slot[k][0] = 0; ms->has_step[k] = 0; }
     memset(ms->has_cues, 0, sizeof(ms->has_cues));
     ms->combat_ovr_for[0] = 0; ms->own_sounds = 0;
@@ -10304,8 +10442,21 @@ static void ms_cue_label(const SoundCue *c, char *out, int n) {
     else snprintf(out, n, "Sound: %s", sound_shown(c->file));
 }
 /* "Single Swords (weapon)", "Human", "none" */
+/* the character's own AI / stats, from its preset's the first time they change */
+static AiSettings *ms_own_ai(Moveset *ms) {
+    if (!ms->own_ai) {
+        const AiSettings *ai = moveset_ai(ms);
+        if (ai) ms->ai = *ai; else { memset(&ms->ai, 0, sizeof(ms->ai)); ms->ai.range = 1.5f; ms->ai.pause_min = 0.8f; ms->ai.pause_max = 1.6f; }
+        ms->own_ai = 1;
+    }
+    return &ms->ai;
+}
+static StatSettings *ms_own_stats(Moveset *ms) {
+    if (!ms->own_stats) { ms->st = *moveset_stats(ms); ms->own_stats = 1; }
+    return &ms->st;
+}
 static void ms_preset_label(const Moveset *ms, int group, char *out, int n) {
-    const char *v = group == PG_COMBAT ? ms->combat_preset : group == PG_SOUND ? ms->sound_preset : ms->walk_preset;
+    const char *v = ms_group_name((Moveset *)ms, group);
     if (!strcmp(v, "-")) snprintf(out, n, "none");
     else if (group == PG_COMBAT && !v[0]) snprintf(out, n, "%s (weapon)", weapon_preset(ms->right_hand));
     else snprintf(out, n, "%s", v);
@@ -10328,19 +10479,65 @@ static void ms_action(int id) {
         case B_MS_CUE_RESET: ms->has_cues[g_ms_slot - MC_FIRST_COMBAT] = 0; g_ms_cue_sel = -1; moveset_save(ms); return;
         case B_MS_TAB_COMBAT: ms_set_tab(PG_COMBAT); return;
         case B_MS_TAB_SOUND: ms_set_tab(PG_SOUND); return;
+        case B_MS_TAB_REACT: ms_set_tab(PG_REACT); return;
+        case B_MS_TAB_AI: ms_set_tab(PG_AI); return;
+        case B_MS_TAB_STATS: ms_set_tab(PG_STATS); return;
+        case B_MS_AI_NONE: case B_MS_AI_MELEE: case B_MS_AI_RANGE_M: case B_MS_AI_RANGE_P: case B_MS_AI_WALK: case B_MS_AI_RUN:
+        case B_MS_AI_PMIN_M: case B_MS_AI_PMIN_P: case B_MS_AI_PMAX_M: case B_MS_AI_PMAX_P: case B_MS_AI_DODGE_M: case B_MS_AI_DODGE_P: {
+            AiSettings *ai = ms_own_ai(ms);
+            switch (id) {
+                case B_MS_AI_NONE: ai->kind = AI_NONE; break;
+                case B_MS_AI_MELEE: ai->kind = AI_MELEE; break;
+                case B_MS_AI_RANGE_M: ai->range = fmaxf(0.5f, ai->range - 0.1f); break;
+                case B_MS_AI_RANGE_P: ai->range = fminf(6.0f, ai->range + 0.1f); break;
+                case B_MS_AI_WALK: ai->run = 0; break;
+                case B_MS_AI_RUN: ai->run = 1; break;
+                case B_MS_AI_PMIN_M: ai->pause_min = fmaxf(0.0f, ai->pause_min - 0.1f); break;
+                case B_MS_AI_PMIN_P: ai->pause_min = fminf(ai->pause_max, ai->pause_min + 0.1f); break;
+                case B_MS_AI_PMAX_M: ai->pause_max = fmaxf(ai->pause_min, ai->pause_max - 0.1f); break;
+                case B_MS_AI_PMAX_P: ai->pause_max = fminf(10.0f, ai->pause_max + 0.1f); break;
+                case B_MS_AI_DODGE_M: ai->dodge = ai->dodge >= 5 ? ai->dodge - 5 : 0; break;
+                case B_MS_AI_DODGE_P: ai->dodge = ai->dodge <= 95 ? ai->dodge + 5 : 100; break;
+            }
+            ai->range = roundf(ai->range * 10.0f) / 10.0f;
+            ai->pause_min = roundf(ai->pause_min * 10.0f) / 10.0f; ai->pause_max = roundf(ai->pause_max * 10.0f) / 10.0f;
+            moveset_save(ms);
+            return;
+        }
+        case B_MS_AI_RESET: ms->own_ai = 0; moveset_save(ms); return;
+        case B_MS_ST_HP_M10: case B_MS_ST_HP_M1: case B_MS_ST_HP_P1: case B_MS_ST_HP_P10: case B_MS_ST_DMG_M: case B_MS_ST_DMG_P: case B_MS_ST_BOSS: {
+            StatSettings *st = ms_own_stats(ms);
+            if (id == B_MS_ST_HP_M10) st->hp -= 10;
+            if (id == B_MS_ST_HP_M1) st->hp -= 1;
+            if (id == B_MS_ST_HP_P1) st->hp += 1;
+            if (id == B_MS_ST_HP_P10) st->hp += 10;
+            if (id == B_MS_ST_DMG_M) st->damage -= 1;
+            if (id == B_MS_ST_DMG_P) st->damage += 1;
+            if (id == B_MS_ST_BOSS) st->boss = !st->boss;
+            if (st->hp < 1) st->hp = 1;
+            if (st->hp > 9999) st->hp = 9999;
+            if (st->damage < 0) st->damage = 0;
+            if (st->damage > 999) st->damage = 999;
+            moveset_save(ms);
+            return;
+        }
+        case B_MS_ST_RESET: ms->own_stats = 0; moveset_save(ms); return;
         case B_MS_TAB_PRESET: { /* this tab's preset: choose, save, delete */
             presets_load();
             HMENU m = CreatePopupMenu();
-            static const char *head[3] = { "Walking preset (this tab's changes are forgotten):", "Combat preset (this tab's changes are forgotten):", "Sound preset (this tab's changes are forgotten):" };
+            static const char *head[PG_COUNT] = { "Walking preset (this tab's changes are forgotten):", "Combat preset (this tab's changes are forgotten):",
+                                                   "Sound preset (this tab's changes are forgotten):", "Reactions preset (this tab's changes are forgotten):",
+                                                   "AI preset (this tab's changes are forgotten):", "Stats preset (this tab's changes are forgotten):", "" };
             AppendMenuA(m, MF_STRING | MF_GRAYED, 0, head[g_ms_tab]);
             AppendMenuA(m, MF_SEPARATOR, 0, NULL);
-            const char *cur = g_ms_tab == PG_COMBAT ? ms->combat_preset : g_ms_tab == PG_SOUND ? ms->sound_preset : ms->walk_preset;
+            const char *cur = ms_group_name(ms, g_ms_tab);
             if (g_ms_tab == PG_COMBAT) AppendMenuA(m, MF_STRING | (!cur[0] ? MF_CHECKED : 0), 1, "From the equipped weapon (Double Swords for dualswrd, else Single Swords)");
             for (int i = 0; i < g_preset_n; i++) if (g_presets[i].group == g_ms_tab) {
                 char lab[80]; snprintf(lab, sizeof(lab), "%s%s", g_presets[i].name, g_presets[i].builtin ? "   (built in)" : "");
                 AppendMenuA(m, MF_STRING | (!_stricmp(cur, g_presets[i].name) ? MF_CHECKED : 0), 10 + i, lab);
             }
-            AppendMenuA(m, MF_STRING | (!strcmp(cur, "-") ? MF_CHECKED : 0), 2, g_ms_tab == PG_SOUND ? "No sounds" : "No preset (every slot empty until given a clip)");
+            if (g_ms_tab != PG_STATS)
+                AppendMenuA(m, MF_STRING | (!strcmp(cur, "-") ? MF_CHECKED : 0), 2, g_ms_tab == PG_SOUND ? "No sounds" : g_ms_tab == PG_AI ? "No AI (it does nothing on its own)" : "No preset (every slot empty until given a clip)");
             AppendMenuA(m, MF_SEPARATOR, 0, NULL);
             AppendMenuA(m, MF_STRING, 3, "Save this tab as a preset...");
             AppendMenuA(m, MF_STRING, 4, "Delete a preset...");
@@ -10350,9 +10547,11 @@ static void ms_action(int id) {
             if (cmd <= 0) return;
             if (cmd == 3) { g_ms_text = g_ms_tab + 1; g_ms_text_buf[0] = 0; g_ms_text_default = 1; return; }
             if (cmd == 4) { ms_delete_menu(g_ms_tab); return; }
-            char *dst = g_ms_tab == PG_COMBAT ? ms->combat_preset : g_ms_tab == PG_SOUND ? ms->sound_preset : ms->walk_preset;
+            char *dst = ms_group_name(ms, g_ms_tab);
             snprintf(dst, 48, "%s", cmd == 1 ? "" : cmd == 2 ? "-" : g_presets[cmd - 10].name);
             if (g_ms_tab == PG_SOUND) ms->own_sounds = 0;
+            else if (g_ms_tab == PG_AI) ms->own_ai = 0;
+            else if (g_ms_tab == PG_STATS) ms->own_stats = 0;
             else {
                 for (int k = 0; k < MC_COUNT; k++) if (slot_group(k) == g_ms_tab) { ms->slot[k][0] = 0; ms->has_step[k] = 0; }
                 if (g_ms_tab == PG_COMBAT) { ms->combat_ovr_for[0] = 0; memset(ms->has_cues, 0, sizeof(ms->has_cues)); }
@@ -10464,7 +10663,7 @@ static void ms_layout(HWND hwnd) {
     int gw = rc.right * 55 / 100;
     SetRect(&g_ms_graph_rc, 10, top, gw, rc.bottom - 10);
     int rx = gw + 14, rw = rc.right - 10 - rx;
-    int stage_h = (rc.bottom - top) * (g_ms_tab == PG_SOUND ? 34 : 45) / 100;
+    int stage_h = (rc.bottom - top) * (g_ms_tab == PG_SOUND ? 34 : (g_ms_tab == PG_AI || g_ms_tab == PG_STATS) ? 70 : 45) / 100;
     SetRect(&g_ms_stage_rc, rx, top, rc.right - 10, top + stage_h);
     /* header: model preset, close */
     snprintf(t, sizeof(t), "Model preset: %s", ms->model_preset[0] ? ms->model_preset : "none");
@@ -10472,12 +10671,15 @@ static void ms_layout(HWND hwnd) {
             "Everything of this character at once -- its walking, combat and sound presets and its equipment: apply one, save everything as one (with its changes), delete one.", ms->model_preset[0] != 0, 1, 1);
     ui_add(B_MS_CLOSE, rc.right - 106, 10, 96, 28, "Close", "Esc", "Back.", 0, 1, 0);
     /* tabs + the tab's preset (left); the equipment (right) */
-    ui_add(B_MS_TAB_WALK, 12, 66, 100, 28, "Walking", "", "Stand, walk, run, their starts and turns.", g_ms_tab == PG_WALK, 1, 3);
-    ui_add(B_MS_TAB_COMBAT, 118, 66, 100, 28, "Combat", "", "The attacks of attack mode (Ctrl held): a click, and the swings up / left / right / down.", g_ms_tab == PG_COMBAT, 1, 3);
-    ui_add(B_MS_TAB_SOUND, 224, 66, 100, 28, "Sounds", "", "Its sound pools: weapon swings, weapon hits, grunts when hit.", g_ms_tab == PG_SOUND, 1, 3);
+    ui_add(B_MS_TAB_WALK, 12, 66, 84, 28, "Walking", "", "Stand, walk, run, their starts and turns.", g_ms_tab == PG_WALK, 1, 3);
+    ui_add(B_MS_TAB_REACT, 100, 66, 90, 28, "Reactions", "", "A blow taken, a dodge, dying, knocked down and getting up.", g_ms_tab == PG_REACT, 1, 3);
+    ui_add(B_MS_TAB_COMBAT, 194, 66, 80, 28, "Combat", "", "The attacks of attack mode (Ctrl held): a click, and the swings up / left / right / down.", g_ms_tab == PG_COMBAT, 1, 3);
+    ui_add(B_MS_TAB_SOUND, 278, 66, 80, 28, "Sounds", "", "Its sound pools: weapon swings, weapon hits, grunts when hit.", g_ms_tab == PG_SOUND, 1, 3);
+    ui_add(B_MS_TAB_AI, 362, 66, 56, 28, "AI", "", "What it does on its own: close in and strike, dodge...", g_ms_tab == PG_AI, 1, 3);
+    ui_add(B_MS_TAB_STATS, 422, 66, 70, 28, "Stats", "", "Its health, the damage of its blows, a boss or not.", g_ms_tab == PG_STATS, 1, 3);
     ms_preset_label(ms, g_ms_tab, pn, sizeof(pn));
     snprintf(t, sizeof(t), "Preset: %s", pn);
-    ui_addf(B_MS_TAB_PRESET, 340, 66, 300, 28, t, "", "This tab's preset: choose one, save this tab as a preset, delete one. The presets themselves never change.", 0, 1, 1);
+    ui_addf(B_MS_TAB_PRESET, 504, 66, 260, 28, t, "", "This tab's preset: choose one, save this tab as a preset, delete one. The presets themselves never change.", 0, 1, 1);
     int ew = 230;
     snprintf(t, sizeof(t), "Equipped weapon: %s", ms->right_hand[0] ? ms->right_hand : "none");
     ui_addf(B_MS_WEAPON, rc.right - 10 - 2 * ew - 6, 66, ew, 28, t, "", "What it holds in its right hand to begin with (the radial menu changes it in the game). Click: choose in the list.",
@@ -10498,6 +10700,8 @@ static void ms_layout(HWND hwnd) {
                "The sound selected in the list below joins the blow's sounds (double-click does the same). Space: listen.", 0, g_ms_n > 0, 0);
         ui_add(B_MS_CUE_DONE, rx + 2 * (bw + 6), by, bw, 26, "Done", "Esc", "Back to the attacks.", 0, 1, 0);
         list_top = by + 40;
+    } else if (g_ms_tab == PG_AI || g_ms_tab == PG_STATS) {
+        list_top = rc.bottom; /* no list */
     } else if (g_ms_tab == PG_SOUND) {
         snprintf(t, sizeof(t), "Add to %s", g_ms_pool == POOL_SWING ? "swings" : g_ms_pool == POOL_HIT ? "hits" : "grunts");
         ui_addf(B_MS_USE, rx, by, bw * 2, 26, t, "Enter", "The sound selected in the list joins the chosen pool (double-click does the same). Space: listen.", 0, g_ms_n > 0, 0);
@@ -10594,6 +10798,47 @@ static void ms_layout(HWND hwnd) {
     int nw = gwid / 5, nh = 48;
     if (nw < 130) nw = 130;
     #define MS_NODE(k, fx, fy) SetRect(&g_ms_node_rc[k], gx + (int)(gwid * (fx)) - nw / 2, gy + (int)(gh * (fy)) - nh / 2, gx + (int)(gwid * (fx)) + nw / 2, gy + (int)(gh * (fy)) + nh / 2)
+    if (g_ms_tab == PG_AI) { /* the AI panel: rows of controls (their titles and values: ms_paint) */
+        const AiSettings *ai = moveset_ai(ms);
+        int x = gx + 20, w = gwid - 40, y0 = gy + 24;
+        #define MS_ROW(i) (y0 + (i) * 78 + 22)
+        ui_add(B_MS_AI_NONE, x, MS_ROW(0), 220, 28, "None: it does nothing on its own", "", "Only scripts move it.", !ai || ai->kind == AI_NONE, 1, 3);
+        ui_add(B_MS_AI_MELEE, x + 226, MS_ROW(0), 260, 28, "Close in and strike", "", "It goes to the nearest opponent until close enough to strike, strikes, pauses, strikes again.", ai && ai->kind == AI_MELEE, 1, 3);
+        int on = ai && ai->kind == AI_MELEE;
+        ui_add(B_MS_AI_RANGE_M, x, MS_ROW(1), 34, 28, "-", "", "It strikes from closer.", 0, on, 0);
+        ui_add(B_MS_AI_RANGE_P, x + 234, MS_ROW(1), 34, 28, "+", "", "It strikes from further.", 0, on, 0);
+        ui_add(B_MS_AI_WALK, x, MS_ROW(2), 130, 28, "Walking", "", "It walks to its target.", on && !ai->run, on, 3);
+        ui_add(B_MS_AI_RUN, x + 136, MS_ROW(2), 130, 28, "Running", "", "It runs to its target.", on && ai->run, on, 3);
+        ui_add(B_MS_AI_PMIN_M, x, MS_ROW(3), 34, 28, "-", "", "A shorter shortest pause.", 0, on, 0);
+        ui_add(B_MS_AI_PMIN_P, x + 150, MS_ROW(3), 34, 28, "+", "", "A longer shortest pause.", 0, on, 0);
+        ui_add(B_MS_AI_PMAX_M, x + 220, MS_ROW(3), 34, 28, "-", "", "A shorter longest pause.", 0, on, 0);
+        ui_add(B_MS_AI_PMAX_P, x + 370, MS_ROW(3), 34, 28, "+", "", "A longer longest pause.", 0, on, 0);
+        ui_add(B_MS_AI_DODGE_M, x, MS_ROW(4), 34, 28, "-", "", "It dodges less often.", 0, on, 0);
+        ui_add(B_MS_AI_DODGE_P, x + 234, MS_ROW(4), 34, 28, "+", "", "It dodges more often.", 0, on, 0);
+        ui_add(B_MS_AI_RESET, x, MS_ROW(5), 200, 28, "Back to preset", "", "Forget this character's changes to its AI: its AI preset's again.", 0, ms->own_ai, 0);
+        (void)w;
+        return;
+    }
+    if (g_ms_tab == PG_STATS) {
+        const StatSettings *st = moveset_stats(ms);
+        int x = gx + 20, y0 = gy + 24;
+        ui_add(B_MS_ST_HP_M10, x, MS_ROW(0), 44, 28, "-10", "", "Less health.", 0, st->hp > 1, 0);
+        ui_add(B_MS_ST_HP_M1, x + 48, MS_ROW(0), 44, 28, "-1", "", "Less health.", 0, st->hp > 1, 0);
+        ui_add(B_MS_ST_HP_P1, x + 216, MS_ROW(0), 44, 28, "+1", "", "More health.", 0, 1, 0);
+        ui_add(B_MS_ST_HP_P10, x + 264, MS_ROW(0), 44, 28, "+10", "", "More health.", 0, 1, 0);
+        ui_add(B_MS_ST_DMG_M, x, MS_ROW(1), 34, 28, "-", "", "Weaker blows.", 0, st->damage > 0, 0);
+        ui_add(B_MS_ST_DMG_P, x + 234, MS_ROW(1), 34, 28, "+", "", "Stronger blows.", 0, 1, 0);
+        ui_add(B_MS_ST_BOSS, x, MS_ROW(2), 420, 28, st->boss ? "[x]  Boss: its health bar on the screen" : "[  ]  Boss: its health bar on the screen", "",
+               "Ticked: while it's alive (and an enemy), its health bar shows at the top of the screen.", st->boss, 1, 3);
+        ui_add(B_MS_ST_RESET, x, MS_ROW(3), 200, 28, "Back to preset", "", "Forget this character's changes to its stats: its stats preset's again.", 0, ms->own_stats, 0);
+        #undef MS_ROW
+        return;
+    }
+    if (g_ms_tab == PG_REACT) { /* a blow -> hit / dodge; health gone -> death (enemy) or down, then up (ally) */
+        MS_NODE(MC_HIT, 0.30f, 0.18f); MS_NODE(MC_DODGE, 0.30f, 0.36f);
+        MS_NODE(MC_DEATH, 0.72f, 0.18f); MS_NODE(MC_DOWN, 0.50f, 0.66f); MS_NODE(MC_GETUP, 0.84f, 0.66f);
+        return;
+    }
     if (g_ms_tab == PG_COMBAT) { /* combat: attack mode -> a click / a held swing */
         MS_NODE(MC_ATK1, 0.50f, 0.10f); MS_NODE(MC_ATK2, 0.50f, 0.22f); MS_NODE(MC_ATK3, 0.50f, 0.34f);
         MS_NODE(MC_SW_UP, 0.83f, 0.52f); MS_NODE(MC_SW_LEFT, 0.83f, 0.64f); MS_NODE(MC_SW_RIGHT, 0.83f, 0.76f);
@@ -10649,9 +10894,12 @@ static void ms_paint(HWND hwnd, HDC hdc) {
     SelectObject(hdc, ui_font(14, 0));
     if (hb && hb->desc && hb->desc[0]) ui_text(hdc, 12, 42, rc.right - 24, 20, hb->desc, RGB(255, 230, 150), SV_ONE);
     else {
-        static const char *what[3] = { "How it walks: click a box to see its clip, then pick another one in the list on the right.",
+        static const char *what[PG_COUNT] = { "How it walks: click a box to see its clip, then pick another one in the list on the right.",
                                        "Its attacks in attack mode (Ctrl held): click a box to see its clip, then pick another one in the list on the right.",
-                                       "Its sounds: each pool plays one of its sounds at random. Pick a pool, then add sounds from the list on the right." };
+                                       "Its sounds: each pool plays one of its sounds at random. Pick a pool, then add sounds from the list on the right.",
+                                       "How it reacts: a blow taken, a dodge, dying (an enemy), knocked down and getting up (an ally). Click a box, pick a clip on the right.",
+                                       "What it does on its own. An enemy goes for David and his allies; an ally for the enemies.",
+                                       "Its health, the damage of its blows, and whether it's a boss (its health bar on the screen).", "" };
         ui_text(hdc, 12, 42, rc.right - 24, 20, what[g_ms_tab], RGB(200, 200, 205), SV_ONE);
     }
     /* left: the graph / the sound pools */
@@ -10678,6 +10926,47 @@ static void ms_paint(HWND hwnd, HDC hdc) {
                 ui_text(hdc, r->right - 150, r->bottom - 34, 100, 26, t, SVL_VALUE, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
             }
         }
+    } else if (g_ms_tab == PG_AI || g_ms_tab == PG_STATS) {
+        RECT *g = &g_ms_graph_rc;
+        int x = g->left + 20, y0 = g->top + 24;
+        #define MS_ROWT(i) (y0 + (i) * 78)
+        char v[80];
+        if (g_ms_tab == PG_AI) {
+            const AiSettings *ai = moveset_ai(ms);
+            static const char *titles[6] = { "BEHAVIOUR", "STRIKES FROM", "GOES TO ITS TARGET", "PAUSE BETWEEN ITS ATTACKS", "DODGES OUR BLOWS", "" };
+            for (int i = 0; i < 5; i++) { SelectObject(hdc, ui_font(12, 1)); ui_text(hdc, x, MS_ROWT(i), 500, 16, titles[i], SVL_SECTION, SV_ONE); }
+            SelectObject(hdc, ui_font(16, 1));
+            if (ai && ai->kind == AI_MELEE) {
+                snprintf(v, sizeof(v), "%.1f hitbox diameters", ai->range); ui_text(hdc, x + 40, MS_ROWT(1) + 22, 190, 28, v, SVL_VALUE, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                snprintf(v, sizeof(v), "min %.1f s", ai->pause_min); ui_text(hdc, x + 38, MS_ROWT(3) + 22, 110, 28, v, SVL_VALUE, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                snprintf(v, sizeof(v), "max %.1f s", ai->pause_max); ui_text(hdc, x + 258, MS_ROWT(3) + 22, 110, 28, v, SVL_VALUE, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                snprintf(v, sizeof(v), "%d %% of them", ai->dodge); ui_text(hdc, x + 40, MS_ROWT(4) + 22, 190, 28, v, SVL_VALUE, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            }
+            SelectObject(hdc, ui_font(13, 0));
+            ui_text(hdc, x, MS_ROWT(6), g->right - g->left - 40, 60,
+                    "The AI runs whenever the character is in the room, unless a script turns it off (Character settings). "
+                    "It targets the nearest character of the other side: an enemy goes for David and his allies, an ally for the enemies.",
+                    RGB(170, 170, 180), DT_LEFT | DT_WORDBREAK);
+        } else {
+            const StatSettings *st = moveset_stats(ms);
+            static const char *titles[3] = { "HEALTH", "DAMAGE OF ITS BLOWS", "BOSS" };
+            for (int i = 0; i < 3; i++) { SelectObject(hdc, ui_font(12, 1)); ui_text(hdc, x, MS_ROWT(i), 500, 16, titles[i], SVL_SECTION, SV_ONE); }
+            SelectObject(hdc, ui_font(16, 1));
+            snprintf(v, sizeof(v), "%d", st->hp); ui_text(hdc, x + 96, MS_ROWT(0) + 22, 116, 28, v, SVL_VALUE, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            snprintf(v, sizeof(v), "%d per blow", st->damage); ui_text(hdc, x + 40, MS_ROWT(1) + 22, 190, 28, v, SVL_VALUE, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            SelectObject(hdc, ui_font(13, 0));
+            ui_text(hdc, x, MS_ROWT(4), g->right - g->left - 40, 60,
+                    "A blow that lands takes the attacker's damage from the health. At 0 an enemy dies; an ally (David too) is knocked down "
+                    "and gets up again, its health back, once the enemies of the scene are beaten.",
+                    RGB(170, 170, 180), DT_LEFT | DT_WORDBREAK);
+        }
+        #undef MS_ROWT
+    } else if (g_ms_tab == PG_REACT) {
+        SelectObject(hdc, ui_font(12, 1));
+        ui_text(hdc, n[MC_HIT].left, n[MC_HIT].top - 20, 400, 16, "A BLOW AIMED AT IT", RGB(90, 110, 140), DT_LEFT | DT_SINGLELINE);
+        ui_text(hdc, n[MC_DEATH].left, n[MC_DEATH].top - 20, 400, 16, "HEALTH GONE, AN ENEMY", RGB(90, 110, 140), DT_LEFT | DT_SINGLELINE);
+        ui_text(hdc, n[MC_DOWN].left, n[MC_DOWN].top - 20, 600, 16, "HEALTH GONE, AN ALLY: DOWN UNTIL THE ENEMIES ARE BEATEN, THEN UP", RGB(90, 110, 140), DT_LEFT | DT_SINGLELINE);
+        ms_arrow(hdc, n[MC_DOWN].right, CY(MC_DOWN), n[MC_GETUP].left, CY(MC_GETUP), ac, 0);
     } else if (g_ms_tab == PG_COMBAT && g_ms_cues) {
         const CueList *cl = ms_cues_now(ms, g_ms_slot);
         int sclip = moveset_clip(ms, g_ms_slot, NULL);
@@ -10781,7 +11070,7 @@ static void ms_paint(HWND hwnd, HDC hdc) {
                 how == 2 ? RGB(150, 110, 110) : (clip < 0 || !fits) ? RGB(255, 110, 100) : how == 1 ? RGB(255, 210, 110) : RGB(150, 200, 255), SV_ONE);
     }
     /* stage: the slot's clip (or the list's) on the character, with its equipment (or the item tried) */
-    int how = 0, slot_clip = g_ms_tab == PG_SOUND ? moveset_clip(ms, MC_STAND, &how) : moveset_clip(ms, g_ms_slot, &how);
+    int how = 0, slot_clip = !group_has_slots(g_ms_tab) ? moveset_clip(ms, MC_STAND, &how) : moveset_clip(ms, g_ms_slot, &how);
     int clip = g_ms_preview && g_ms_n > 0 && !g_ms_items && !g_ms_sounds ? g_ms_list[g_ms_sel] : slot_clip;
     int W = g_ms_stage_rc.right - g_ms_stage_rc.left, H = g_ms_stage_rc.bottom - g_ms_stage_rc.top;
     if (W > 16 && H > 16) {
@@ -10801,7 +11090,7 @@ static void ms_paint(HWND hwnd, HDC hdc) {
     snprintf(t, sizeof(t), "%s%s", g_ms_preview ? "Trying: " : "", clip >= 0 ? anim_lib_name(clip) : "(no animation: rest pose)");
     ui_text(hdc, g_ms_stage_rc.left + 12, g_ms_stage_rc.top + 8, W - 24, 22, t, g_ms_preview ? RGB(255, 210, 90) : RGB(255, 255, 255), SV_ONE);
     int ry = g_ms_stage_rc.bottom + 6;
-    if (g_ms_tab != PG_SOUND && !g_ms_items && !g_ms_cues) {
+    if (group_has_slots(g_ms_tab) && !g_ms_items && !g_ms_cues) {
         SelectObject(hdc, ui_font(15, 1));
         ui_text(hdc, g_ms_stage_rc.left, ry, W, 20, MOVE_SLOT_LABEL[g_ms_slot], RGB(255, 230, 90), SV_ONE);
         SelectObject(hdc, ui_font(13, 0));
@@ -10826,12 +11115,14 @@ static void ms_paint(HWND hwnd, HDC hdc) {
     }
     /* list */
     SelectObject(hdc, ui_font(12, 1));
-    if (g_ms_items) snprintf(t, sizeof(t), "ITEMS (%d)   filter: %s_", g_ms_n, g_ms_filter);
+    int no_list = (g_ms_tab == PG_AI || g_ms_tab == PG_STATS) && !g_ms_items;
+    if (no_list) t[0] = 0;
+    else if (g_ms_items) snprintf(t, sizeof(t), "ITEMS (%d)   filter: %s_", g_ms_n, g_ms_filter);
     else if (g_ms_sounds) snprintf(t, sizeof(t), "SOUNDS   filter: %s_", g_ms_filter);
     else snprintf(t, sizeof(t), "CLIPS FOR THIS SKELETON (%d)   filter: %s_", g_ms_n, g_ms_filter);
     ui_text(hdc, g_ms_list_rc.left, g_ms_list_rc.top - 20, g_ms_list_rc.right - g_ms_list_rc.left, 16, t, SVL_SECTION, SV_ONE);
-    ui_fill(hdc, &g_ms_list_rc, RGB(22, 22, 28));
-    int rows = ms_rows_visible();
+    if (!no_list) ui_fill(hdc, &g_ms_list_rc, RGB(22, 22, 28));
+    int rows = no_list ? 0 : ms_rows_visible();
     for (int r = 0; r < rows; r++) {
         int k = g_ms_scroll + r;
         if (k >= g_ms_n) break;
@@ -10872,6 +11163,7 @@ static void ms_paint(HWND hwnd, HDC hdc) {
         ui_fill(hdc, &box, RGB(40, 34, 14)); ui_frame(hdc, &box, RGB(255, 210, 60));
         SelectObject(hdc, ui_font(16, 1));
         static const char *title[PG_COUNT] = { "Save the walking animations as a preset", "Save the attacks as a preset", "Save the sounds as a preset",
+                                               "Save the reactions as a preset", "Save the AI as a preset", "Save the stats as a preset",
                                                "Save everything as a model preset" };
         ui_text(hdc, bx + 16, byy + 10, 488, 22, title[g_ms_text - 1], RGB(255, 225, 120), SV_ONE);
         SelectObject(hdc, ui_font(12, 1));
@@ -10926,7 +11218,9 @@ static int ms_key(int vk) {
         case VK_RETURN: ms_action(B_MS_USE); return 1;
         case VK_TAB: { /* the next slot of the tab */
             if (g_ms_tab == PG_SOUND) { g_ms_pool = (g_ms_pool + 1) % POOL_COUNT; return 1; }
-            int first = g_ms_tab ? MC_FIRST_COMBAT : 0, count = g_ms_tab ? MC_COUNT - MC_FIRST_COMBAT : MC_FIRST_COMBAT;
+            if (!group_has_slots(g_ms_tab)) return 1;
+            int first = g_ms_tab == PG_COMBAT ? MC_FIRST_COMBAT : g_ms_tab == PG_REACT ? MC_FIRST_REACT : 0;
+            int count = g_ms_tab == PG_COMBAT ? MC_COUNT - MC_FIRST_COMBAT : g_ms_tab == PG_REACT ? MC_FIRST_COMBAT - MC_FIRST_REACT : MC_FIRST_REACT;
             ms_select_slot(first + (g_ms_slot - first + 1 + count) % count);
             return 1;
         }
