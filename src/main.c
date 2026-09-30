@@ -197,6 +197,8 @@ static int g_free_cam = 0;
 static RoomCamera g_fcam;
 static float g_fcam_yaw = 0.0f, g_fcam_pitch = 0.0f;
 static int g_fcam_look = 0, g_fcam_lx = 0, g_fcam_ly = 0;
+static int g_fcam_resume = 0; /* it was on when a script's point was picked: the next pick flies from there again */
+static int fcam_allowed(void); /* the editor, or picking a script character's point (not a picture point) */
 static const RoomCamera *view_cam(void) { return g_free_cam ? &g_fcam : &g_room_cam; }
 static void fcam_update(void) {
     float cp = cosf(g_fcam_pitch), f[3] = { sinf(g_fcam_yaw) * cp, sinf(g_fcam_pitch), cosf(g_fcam_yaw) * cp };
@@ -213,7 +215,7 @@ static void fcam_update(void) {
 }
 static void fcam_toggle(void) {
     g_fcam_look = 0;
-    if (g_free_cam) { g_free_cam = 0; snprintf(g_status, sizeof(g_status), "back to the room's camera"); return; }
+    if (g_free_cam) { g_free_cam = 0; g_fcam_resume = 0; snprintf(g_status, sizeof(g_status), "back to the room's camera"); return; }
     g_fcam = g_room_cam; /* from where the picture is seen, same lens */
     float fx = -g_room_cam.R[2], fy = -g_room_cam.R[5], fz = -g_room_cam.R[8];
     g_fcam_yaw = atan2f(fx, fz);
@@ -1341,7 +1343,7 @@ static TunableSetting g_settings[] = {
    changed for that room. Called on every room load, before the room
    builds its walkable grid. */
 static void room_settings_load(const char *room_lower) {
-    g_free_cam = 0; g_fcam_look = 0;
+    g_free_cam = 0; g_fcam_look = 0; g_fcam_resume = 0;
     snprintf(g_settings_room, sizeof(g_settings_room), "%s", room_lower);
     for (int i = 0; i < SETTING_COUNT; i++) if (!g_settings[i].global) *g_settings[i].v = g_settings[i].def;
     char path[600]; room_settings_path(path, sizeof(path), room_lower);
@@ -4916,8 +4918,8 @@ static void ui_layout(HWND hwnd) {
     ui_add(B_FULL, x, y, half, h, g_is_fullscreen ? "Windowed" : "Fullscreen", "F11", "Switch between window and fullscreen (4:3 picture, tools in the side bars).", g_is_fullscreen, 1, 0);
     y += h + gap;
     ui_add(B_FREECAM, x, y, w, h, g_free_cam ? "Free camera: ON" : "Free camera", "F4",
-           "Scene editor / placing a script's point: fly a camera anywhere in the room's 3D blockout (no picture), to put a connector's points (or a script's) where the room's camera doesn't look. W A S D / arrows, Q / E, Shift; right button dragged: look; wheel. F4 / Esc: back.",
-           g_free_cam, g_loaded && (g_edit_mode || g_sv_pick), 1);
+           "Scene editor / placing a script's character (its position, where it faces, where it goes): fly a camera anywhere in the room's 3D blockout (no picture), to put the points where the room's camera doesn't look. W A S D / arrows, Q / E, Shift; right button dragged: look; wheel. F4 / Esc: back.",
+           g_free_cam, fcam_allowed(), 1);
     y += h + gap;
     ui_add(B_SCRIPTS, x, y, w, h, "Scripts...", "S", "This room's scripts (cutscenes): a grid of actions -- waits, music, sounds, ambiences, pictures, characters placed and moved. Play them from there.", 0, g_has_3d_character, 0);
     y += h + gap + 18;
@@ -5046,7 +5048,7 @@ static void ui_action(HWND hwnd, int id) {
         case B_WALK: g_show_walkable = !g_show_walkable; break;
         case B_HITBOX: g_show_collision = !g_show_collision; break;
         case B_MESH: g_view_mode_3d = !g_view_mode_3d; break;
-        case B_FREECAM: if (g_loaded && (g_edit_mode || g_sv_pick)) fcam_toggle(); break;
+        case B_FREECAM: if (fcam_allowed()) fcam_toggle(); break;
         case B_COLL: g_collision_enabled = !g_collision_enabled; break;
         case B_FULL: {
             int ww0, wh0, ox0, oy0; float sc0;
@@ -5375,17 +5377,20 @@ static void draw_world_point(HDC hdc, const float w[3], const char *label, COLOR
     Ellipse(hdc, x - 8, y - 8, x + 9, y + 9);
     SelectObject(hdc, ob); SelectObject(hdc, old); DeleteObject(pen);
     HFONT f = ui_font(13, 1); HFONT of = (HFONT)SelectObject(hdc, f);
-    ui_text(hdc, x - 8, y - 8, 17, 17, label[0] == '1' ? "1" : "2", col, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    char in[2] = { (label[0] >= '0' && label[0] <= '9') ? label[0] : (char)toupper((unsigned char)label[0]), 0 }; /* a number, else the name's initial */
+    ui_text(hdc, x - 8, y - 8, 17, 17, in, col, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     ui_text(hdc, x + 12, y - 9, 160, 18, label, col, DT_LEFT | DT_SINGLELINE);
     SelectObject(hdc, of);
 }
 
 static int sv_pick_marker(float out[3]); /* SCRIPTS */
+static void sv_pick_markers(HDC hdc);
 static void draw_editor_overlays(HDC hdc) {
     if (!g_has_3d_character) return;
     int show = g_edit_mode || g_show_walkable || g_sv_pick;
     if (!show) return;
     float pm[3];
+    if (g_sv_pick) sv_pick_markers(hdc);
     if (sv_pick_marker(pm)) draw_world_point(hdc, pm, "1 the character", RGB(255, 220, 60));
     if (g_free_cam) { /* free camera: David, and the connectors' points (the one being set up first) */
         for (int i = 0; i < g_shape_count; i++) {
@@ -8440,6 +8445,9 @@ static void script_tick(HWND hwnd, float dt) {
 }
 
 enum { SV_PICK_NONE, SV_PICK_PLACE_POS, SV_PICK_PLACE_FACE, SV_PICK_MOVE, SV_PICK_OVERLAY, SV_PICK_CAMERA };
+static int fcam_allowed(void) {
+    return g_loaded && (g_edit_mode || g_sv_pick == SV_PICK_PLACE_POS || g_sv_pick == SV_PICK_PLACE_FACE || g_sv_pick == SV_PICK_MOVE);
+}
 
 /* The yellow step box of the side panel while a script plays or a point
    is being picked (see wizard_step_text). */
@@ -8454,16 +8462,19 @@ static const char *script_step_text(char *buf, size_t n, const char **sub) {
         snprintf(sb, sizeof(sb), "Click where the overlay's CENTRE goes (it's shown at its place now). Its position is the room's: every script uses it. Esc: cancel.");
         return "Overlays -- place an animation";
     }
+    const char *fc = g_free_cam ? "\nFree camera: W A S D / arrows fly, Q / E down / up, Shift faster, right button dragged: look, wheel: forward / back. F4: back to the picture."
+                                : "\nOut of the picture? F4: free camera.";
     if (g_sv_pick == SV_PICK_PLACE_POS) {
-        snprintf(sb, sizeof(sb), "Click the floor where the character appears (the green floor). Esc: cancel.");
+        snprintf(sb, sizeof(sb), "Click the floor where the character appears (the green floor). Esc: cancel.%s", fc);
         return "Script -- place a character: its position";
     }
     if (g_sv_pick == SV_PICK_PLACE_FACE) {
-        snprintf(sb, sizeof(sb), "Click the point it looks toward. Right-click or Esc: keep its current direction.");
+        snprintf(sb, sizeof(sb), "Click the point it looks toward. %s%s", g_free_cam ? "Esc: keep its current direction." : "Right-click or Esc: keep its current direction.", fc);
         return "Script -- place a character: where it faces";
     }
     if (g_sv_pick == SV_PICK_MOVE) {
-        snprintf(sb, sizeof(sb), "Click the floor where the character goes, or click a CONNECTOR (blue) to make it leave the room through it. Esc: cancel.");
+        snprintf(sb, sizeof(sb), g_free_cam ? "Click the floor where the character goes (to leave through a connector: from the picture, F4). Esc: cancel.%s"
+                                            : "Click the floor where the character goes, or click a CONNECTOR (blue) to make it leave the room through it. Esc: cancel.%s", fc);
         return "Script -- move a character: its destination";
     }
     if (g_run.active && g_run.zone_on) {
@@ -9624,8 +9635,12 @@ static void sv_pick_start(int mode) {
     g_sv_pick = mode;
     g_script_view = 0;
     g_status[0] = 0;
+    if (g_fcam_resume && fcam_allowed()) g_free_cam = 1; /* flying from where it was left */
 }
-static void sv_pick_end(void) { g_sv_pick = SV_PICK_NONE; g_script_view = 1; }
+static void sv_pick_end(void) {
+    if (g_free_cam) { g_free_cam = 0; g_fcam_resume = 1; g_fcam_look = 0; }
+    g_sv_pick = SV_PICK_NONE; g_script_view = 1;
+}
 static void sv_pick_click(float rx, float ry, int right) {
     ScriptAction *a = sv_cell(1);
     if (!a) { sv_pick_end(); return; }
@@ -12432,6 +12447,34 @@ static void ms_wheel(int delta) {
 }
 
 /* the point being given a facing (PLACE, second click): marked in the room */
+/* while a script's point is picked: where its other characters are placed,
+   and (facing) a line toward the floor under the mouse */
+static void sv_pick_markers(HDC hdc) {
+    Script *s = sv_cur();
+    ScriptAction *cur = sv_cell(0);
+    if (!s) return;
+    for (int r = 0; r < s->rows; r++)
+        for (int c = 0; c < s->cols; c++) {
+            ScriptAction *a = script_at(s, r, c);
+            if (a->type != ACT_PLACE || !a->has_pos || !a->model[0] || (cur && a == cur)) continue;
+            char lab[64]; snprintf(lab, sizeof(lab), "%s (row %d)", a->model, r + 1);
+            draw_world_point(hdc, a->pos, lab, RGB(200, 150, 255));
+        }
+    float from[3];
+    if (g_sv_pick == SV_PICK_PLACE_FACE && sv_pick_marker(from)) {
+        int rx, ry; float to[3], ax, ay, az, bx, by, bz;
+        client_to_room_point(g_mouse_client_x, g_mouse_client_y, &rx, &ry);
+        if (pick_floor_point((float)rx, (float)ry, to) &&
+            camera_world_to_pixel_z(view_cam(), from, (int)g_hdr.width, (int)g_hdr.height, &ax, &ay, &az) &&
+            camera_world_to_pixel_z(view_cam(), to, (int)g_hdr.width, (int)g_hdr.height, &bx, &by, &bz)) {
+            int x0, y0, x1, y1; room_to_client(ax, ay, &x0, &y0); room_to_client(bx, by, &x1, &y1);
+            HPEN pen = CreatePen(PS_DASH, 1, RGB(255, 220, 60)); HPEN op = (HPEN)SelectObject(hdc, pen);
+            SetBkMode(hdc, TRANSPARENT);
+            MoveToEx(hdc, x0, y0, NULL); LineTo(hdc, x1, y1);
+            SelectObject(hdc, op); DeleteObject(pen);
+        }
+    }
+}
 static int sv_pick_marker(float out[3]) {
     ScriptAction *a = sv_cell(0);
     if (g_sv_pick != SV_PICK_PLACE_FACE || !a || !a->has_pos) return 0;
@@ -12870,9 +12913,9 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             if (g_ms_view) { if (ms_key((int)wParam)) InvalidateRect(hwnd, NULL, FALSE); return 0; }
             if (g_anim_view) { if (anim_view_key((int)wParam)) InvalidateRect(hwnd, NULL, FALSE); return 0; }
             if (g_script_view) { if (sv_key(hwnd, (int)wParam)) InvalidateRect(hwnd, NULL, FALSE); return 0; }
-            if (wParam == VK_F4 && g_loaded && (g_edit_mode || g_sv_pick)) { fcam_toggle(); InvalidateRect(hwnd, NULL, FALSE); return 0; }
+            if (wParam == VK_F4 && fcam_allowed()) { fcam_toggle(); InvalidateRect(hwnd, NULL, FALSE); return 0; }
             if (g_free_cam) { /* flying: its keys are its own (fcam_tick reads them) */
-                if (wParam == VK_ESCAPE) { fcam_toggle(); InvalidateRect(hwnd, NULL, FALSE); return 0; }
+                if (wParam == VK_ESCAPE) { if (g_sv_pick) sv_pick_click(0, 0, 1); else fcam_toggle(); InvalidateRect(hwnd, NULL, FALSE); return 0; } /* a pick: cancelled */
                 if (strchr("WASDQE", (int)wParam) || wParam == VK_UP || wParam == VK_DOWN || wParam == VK_LEFT || wParam == VK_RIGHT) return 0;
             }
             if (g_sv_pick) { /* picking a script action's point: Esc cancels (a facing: keeps it) */
@@ -13064,6 +13107,7 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
                 InvalidateRect(hwnd, NULL, FALSE);
                 return 0;
             }
+            if (g_sv_pick == SV_PICK_PLACE_FACE) InvalidateRect(hwnd, NULL, FALSE); /* the line toward the mouse */
             if (attack_drag(g_mouse_client_x, g_mouse_client_y)) return 0;
             if (g_radial) {
                 int h0 = g_radial_hover;
