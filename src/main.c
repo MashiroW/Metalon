@@ -1432,7 +1432,7 @@ static int advance_character(float dt) {
     if (g_act->play_clip >= 0) { /* a clip over its own pose (attacks, script animations...): its times, then back */
         Actor *a = g_act;
         float d = anim_lib_duration(a->play_clip);
-        a->play_t += dt * (a->play_speed > 0.0f ? a->play_speed : g_david_anim_speed);
+        if (!a->play_ended) a->play_t += dt * (a->play_speed > 0.0f ? a->play_speed : g_david_anim_speed);
         if (a->stepping && d > 0.0f) { /* the step taken with it, eased */
             float k = fminf(1.0f, a->play_t / d);
             k = k * k * (3.0f - 2.0f * k);
@@ -1442,7 +1442,7 @@ static int advance_character(float dt) {
             if (g_room_mesh_tri_count > 0 && floor_below(a->pos[0], a->pos[2], a->pos[1], NAV_MAX_STEP, g_room_mesh_tris, g_room_mesh_tri_count, &gy)) a->pos[1] = gy;
         }
         if (a->play_event && a->play_t >= a->play_event_at) actor_apply_event(a); /* e.g. the weapon changes in the middle of the sheathing */
-        if (a->play_ended) a->play_t = d > 0.001f ? d - 0.001f : 0.0f; /* a script clip over: its last frame, until the script goes on */
+        if (a->play_ended) { if (a->play_t > d - 0.001f) a->play_t = d > 0.001f ? d - 0.001f : 0.0f; } /* a script clip over: held where it is, until the script goes on */
         else if (d <= 0.0f) { if (a->play_script) { a->play_ended = 1; a->play_t = 0.0f; } else actor_play_end(a); }
         else if (a->play_t >= d) {
             if (a->play_left > 0 && --a->play_left == 0) {
@@ -6828,7 +6828,22 @@ static float sound_seconds(const char *file) { /* cached: the editor asks every 
     c[k].s = s;
     return s;
 }
+static int action_duration_raw(const ScriptAction *a, float *sec);
+/* its whole length when it can be trimmed (a sound, a line, an animation played N times): 1 */
+static int action_media_length(const ScriptAction *a, float *full) {
+    if (a->type != ACT_SOUND && a->type != ACT_SPEAK && !(a->type == ACT_ANIM && a->anim_mode == ANIM_TIMES)) return 0;
+    return action_duration_raw(a, full) == DUR_KNOWN;
+}
 static int action_duration(const ScriptAction *a, float *sec) {
+    int k = action_duration_raw(a, sec);
+    float full;
+    if (k == DUR_KNOWN && (a->trim_in > 0.0f || a->trim_out > 0.0f) && action_media_length(a, &full)) {
+        *sec = full - a->trim_in - a->trim_out;
+        if (*sec < 0.05f) *sec = 0.05f;
+    }
+    return k;
+}
+static int action_duration_raw(const ScriptAction *a, float *sec) {
     *sec = 0.0f;
     switch (a->type) {
         case ACT_WAIT: *sec = a->seconds; return a->seconds > 0.0f ? DUR_KNOWN : DUR_INSTANT;
@@ -6878,6 +6893,7 @@ typedef struct {
     int clip;           /* ANIM */
     int row_long;       /* ANIM "until the rest of the row is over" */
     int portrait;       /* SPEAK: shown until the line is over */
+    float limit;        /* in a timeline: it's cut after this long (its trimmed end), 0 = none */
 } CellRun;
 static struct {
     int active;
@@ -7202,6 +7218,35 @@ static void run_release_holds(void) {
     }
 }
 
+/* a timeline action just started: from its trimmed start, cut at its trimmed end */
+static void zone_trim_start(const ScriptAction *a, CellRun *c) {
+    float full;
+    c->limit = 0.0f;
+    if (!action_media_length(a, &full) || (a->trim_in <= 0.0f && a->trim_out <= 0.0f)) return;
+    c->limit = full - a->trim_in - a->trim_out;
+    if (c->limit < 0.05f) c->limit = 0.05f;
+    if (a->trim_in <= 0.0f) return;
+    if ((a->type == ACT_SOUND || a->type == ACT_SPEAK) && c->voice) {
+        audio_stop(c->voice);
+        c->voice = audio_play_at(a->file, AUDIO_SOUND, a->type == ACT_SOUND ? a->repeat : 0, 0, a->trim_in);
+        if (a->type == ACT_SOUND) { int *slot = run_voice_slot(a->id); if (slot) *slot = c->voice; }
+        if (!c->voice) c->done = 1;
+    }
+    if (a->type == ACT_ANIM && c->actor && c->actor->play_clip == c->clip) {
+        Actor *ac = c->actor;
+        float d = anim_lib_duration(c->clip), sp = a->speed > 0.0f ? a->speed : g_david_anim_speed;
+        float t = a->trim_in * sp;
+        while (d > 0.0f && t >= d && ac->play_left > 1) { t -= d; ac->play_left--; }
+        ac->play_t = d > 0.001f ? fminf(t, d - 0.001f) : 0.0f;
+    }
+}
+/* ...and its trimmed end reached */
+static void zone_trim_cut(const ScriptAction *a, CellRun *c) {
+    if ((a->type == ACT_SOUND || a->type == ACT_SPEAK) && c->voice) audio_fade(c->voice, 0.03f);
+    if (a->type == ACT_ANIM && c->actor && c->actor->play_clip == c->clip) c->actor->play_ended = 1; /* held on that frame */
+    c->done = 1;
+}
+
 /* An advanced timeline zone, every game step: its clock goes on, each
    action starts at its time, the zone is over (returns 1) once they all
    are -- however many rows it was given. A DYNAMIC action's real length
@@ -7228,9 +7273,11 @@ static int run_zone_tick(Script *s, int zi, float dt) {
             g_run.zev_started[k] = 1; g_run.zev_t0[k] = g_run.zone_t;
             run_start(a, c);
             if (a->type == ACT_SOUND && c->voice) c->done = 0; /* in a timeline a sound lasts its length */
+            zone_trim_start(a, c);
             if (g_run.leave) return 1;
         }
         if (c->row_long) continue;
+        if (c->limit > 0.0f && !c->done && g_run.zone_t - g_run.zev_t0[k] >= c->limit - 1e-4f) zone_trim_cut(a, c);
         int was = c->done;
         if (!run_cell_done(a, c, dt)) { all = 0; continue; }
         float d;
@@ -7367,6 +7414,7 @@ enum {
     B_SV_RM_DOOR = 1200, /* + index: 0 = where he'd spawn, then the target room's connectors */
     B_SV_RM_SCRIPT = 1300, /* + index: 0 = none, then the target room's scripts */
     B_SV_ZROWS_M = 1380, B_SV_ZROWS_P, /* the selected timeline: a row less / more */
+    B_SV_TRIM_IN_M, B_SV_TRIM_IN_P, B_SV_TRIM_OUT_M, B_SV_TRIM_OUT_P, B_SV_TRIM_RESET, /* a timeline action's trims */
     B_SV_LAST = 899
 };
 #define SV_ROW_H 46
@@ -7381,8 +7429,21 @@ static int g_sv_anchor = 0;                 /* several rows selected: from this 
 static float g_sv_pending_start = -1.0f;    /* the empty cell selected in a timeline: a new action there starts at this time */
 static int g_sv_drag = 0, g_sv_drag_y0 = 0, g_sv_drag_moved = 0; /* an action of a timeline dragged */
 static int g_sv_zdrag = 0;                  /* a timeline's bottom edge dragged: its index + 1 */
+/* A GROUP of actions selected (their ids): all in plain rows, or all in one
+   timeline -- never both. Ctrl+click adds / removes one, Shift+click takes
+   every action of the rows from the anchor, a rectangle drawn from an
+   empty spot takes the ones it touches; dragging one moves them all. */
+#define SV_MAX_SEL 256
+static int g_sv_sel_ids[SV_MAX_SEL], g_sv_sel_n = 0, g_sv_sel_script = -1;
+static int g_sv_band = 0, g_sv_band_zone = -1, g_sv_band_x0, g_sv_band_y0, g_sv_band_x1, g_sv_band_y1; /* 1 pressed, 2 drawing */
+static int g_sv_cdrag = 0, g_sv_cdrag_r0, g_sv_cdrag_c0, g_sv_cdrag_dr, g_sv_cdrag_dc; /* plain rows: the group dragged by (dr, dc) cells */
+static float g_sv_gt0[SV_MAX_SEL];          /* a timeline group dragged: each one's start, lane, when it began */
+static int g_sv_glane0[SV_MAX_SEL], g_sv_gdc = 0, g_sv_drag_c0 = 0, g_sv_drag_id = 0;
+static int sv_sel_has(int id);
+static int g_sv_rsz = 0;                    /* an action of a timeline resized: 1 its top edge, 2 its bottom edge */
+static float g_sv_rsz_start, g_sv_rsz_in, g_sv_rsz_out, g_sv_rsz_sec, g_sv_rsz_len;
+static int g_sv_edge_hover = -1;            /* the action edge under the mouse: (row * SCRIPT_MAX_COLS + col) * 4 + 1 top / 2 bottom */
 static int g_sv_zedge_hover = -1;           /* the timeline whose bottom edge is under the mouse */
-static float g_sv_drag_t0 = 0.0f;
 static ScriptAction g_sv_clip;              /* copy / paste */
 static int g_sv_has_clip = 0;
 static int g_sv_text = 0;                   /* typing a script name: 1 new, 2 rename */
@@ -7867,13 +7928,15 @@ static void sv_paint_zones(HDC hdc, Script *s) {
                     RECT er; int kind; float len;
                     sv_event_geom(s, zi, r, c, &er, &kind, &len);
                     if ((kind == DUR_INSTANT) != (pass == 1)) continue;
-                    int sel = r == g_sv_row && c == g_sv_col, hov = g_sv_hover == r * SCRIPT_MAX_COLS + c;
+                    int grp = sv_sel_has(a->id) && g_sv_sel_n > 1;
+                    int sel = (r == g_sv_row && c == g_sv_col) || grp, hov = g_sv_hover == r * SCRIPT_MAX_COLS + c;
+                    COLORREF selc = grp ? RGB(255, 160, 60) : RGB(255, 210, 60);
                     COLORREF col = action_color(a->type);
                     if (kind == DUR_INSTANT) {
                         ui_fill(hdc, &er, col);
                         RECT dot = { er.left, er.top - 3, er.left + 8, er.bottom + 3 };
                         ui_fill(hdc, &dot, col);
-                        if (sel) { RECT fr = er; InflateRect(&fr, 2, 4); ui_frame(hdc, &fr, RGB(255, 210, 60)); }
+                        if (sel) { RECT fr = er; InflateRect(&fr, 2, 4); ui_frame(hdc, &fr, selc); }
                         char sm[200]; action_summary(s, a, sm, sizeof(sm));
                         snprintf(t, sizeof(t), "%s: %s", action_type_name(a->type), sm);
                         SelectObject(hdc, ui_font(11, sel || hov));
@@ -7885,11 +7948,18 @@ static void sv_paint_zones(HDC hdc, Script *s) {
                     ui_fill(hdc, &st, col);
                     if (kind == DUR_DYNAMIC) /* no known end: it fades out */
                         for (int yy = er.bottom - 14; yy < er.bottom; yy += 3) { RECT ln = { er.left + 5, yy, er.right, yy + 1 }; ui_fill(hdc, &ln, col); }
-                    ui_frame(hdc, &er, sel ? RGB(255, 210, 60) : RGB(72, 72, 88));
-                    if (sel) { RECT in = er; InflateRect(&in, -1, -1); ui_frame(hdc, &in, RGB(255, 210, 60)); }
+                    ui_frame(hdc, &er, sel ? selc : RGB(72, 72, 88));
+                    if (sel) { RECT in = er; InflateRect(&in, -1, -1); ui_frame(hdc, &in, selc); }
+                    if (a->trim_in > 0.0f) for (int x = er.left + 6; x < er.right - 2; x += 6) { RECT d = { x, er.top, x + 3, er.top + 3 }; ui_fill(hdc, &d, RGB(255, 170, 90)); }
+                    if (a->trim_out > 0.0f) for (int x = er.left + 6; x < er.right - 2; x += 6) { RECT d = { x, er.bottom - 3, x + 3, er.bottom }; ui_fill(hdc, &d, RGB(255, 170, 90)); }
+                    if (g_sv_edge_hover >= 0 && g_sv_edge_hover / 4 == r * SCRIPT_MAX_COLS + c) {
+                        int top = g_sv_edge_hover % 4 == 1;
+                        RECT hl = { er.left, top ? er.top : er.bottom - 3, er.right, top ? er.top + 3 : er.bottom };
+                        ui_fill(hdc, &hl, RGB(140, 240, 240));
+                    }
                     int h = er.bottom - er.top, w = er.right - er.left - 14;
                     float m;
-                    if (kind == DUR_KNOWN) snprintf(t, sizeof(t), "%.2f s", len);
+                    if (kind == DUR_KNOWN) snprintf(t, sizeof(t), "%.2f s%s", len, a->trim_in > 0.0f || a->trim_out > 0.0f ? " (cut)" : "");
                     else snprintf(t, sizeof(t), measured_duration(s->name, a->id, &m) ? "~%.1f s (last run)" : "? (~%.1f s)", len);
                     if (h >= 14) {
                         SelectObject(hdc, ui_font(12, 1));
@@ -7934,7 +8004,7 @@ static void sv_paint_zones(HDC hdc, Script *s) {
 /* the hovered action of a timeline, in full */
 static void sv_paint_zone_tip(HDC hdc) {
     Script *s = sv_cur();
-    if (!s || g_sv_hover < 0 || g_sv_drag) return;
+    if (!s || g_sv_hover < 0 || g_sv_drag || g_sv_rsz) return;
     int r = g_sv_hover / SCRIPT_MAX_COLS, c = g_sv_hover % SCRIPT_MAX_COLS;
     int zi = script_zone_at(s, r);
     const ScriptAction *a = script_at(s, r, c);
@@ -7944,6 +8014,8 @@ static void sv_paint_zone_tip(HDC hdc) {
     snprintf(l1, sizeof(l1), "%s  (lane %d)", action_type_name(a->type), c + 1);
     action_summary(s, a, l2, sizeof(l2));
     if (kind == DUR_INSTANT) snprintf(l3, sizeof(l3), "At %.2f s -- instant", a->start);
+    else if (kind == DUR_KNOWN && (a->trim_in > 0.0f || a->trim_out > 0.0f))
+        snprintf(l3, sizeof(l3), "%.2f s -> %.2f s  (lasts %.2f s: from %.2f s into it, %.2f s cut at its end)", a->start, a->start + len, len, a->trim_in, a->trim_out);
     else if (kind == DUR_KNOWN) snprintf(l3, sizeof(l3), "%.2f s -> %.2f s  (lasts %.2f s)", a->start, a->start + len, len);
     else snprintf(l3, sizeof(l3), "From %.2f s, until it's over (%s %.1f s)", a->start, measured_duration(s->name, a->id, &m) ? "last run:" : "estimate:", len);
     int w = 360, h = 62, x = g_mouse_client_x + 16, y = g_mouse_client_y + 18;
@@ -7957,33 +8029,214 @@ static void sv_paint_zone_tip(HDC hdc) {
     ui_text(hdc, x + 8, y + 22, w - 16, 16, l2, RGB(225, 225, 230), SV_ONE);
     ui_text(hdc, x + 8, y + 40, w - 16, 16, l3, RGB(140, 210, 210), SV_ONE);
 }
-/* dragging an action of a timeline: up / down = its start (0.05 s steps, Shift: 0.01), sideways = another lane */
+static int sv_sel_has(int id) { for (int i = 0; i < g_sv_sel_n; i++) if (g_sv_sel_ids[i] == id) return 1; return 0; }
+/* where the group is: -1 plain rows, else its timeline; -2 empty */
+static int sv_sel_kind(Script *s) {
+    int r;
+    if (!g_sv_sel_n || !script_find(s, g_sv_sel_ids[0], &r, NULL)) return -2;
+    return script_zone_at(s, r);
+}
+static void sv_sel_one(Script *s, int r, int c) {
+    const ScriptAction *a = script_at(s, r, c);
+    g_sv_sel_n = 0;
+    if (a && a->type != ACT_NONE) g_sv_sel_ids[g_sv_sel_n++] = a->id;
+}
+static void sv_sel_add(Script *s, int r, int c) {
+    const ScriptAction *a = script_at(s, r, c);
+    if (!a || a->type == ACT_NONE || sv_sel_has(a->id)) return;
+    if (g_sv_sel_n && sv_sel_kind(s) != script_zone_at(s, r)) g_sv_sel_n = 0; /* never rows and a timeline together */
+    if (g_sv_sel_n < SV_MAX_SEL) g_sv_sel_ids[g_sv_sel_n++] = a->id;
+}
+static void sv_sel_toggle(Script *s, int r, int c) {
+    const ScriptAction *a = script_at(s, r, c);
+    if (!a || a->type == ACT_NONE) return;
+    for (int i = 0; i < g_sv_sel_n; i++) if (g_sv_sel_ids[i] == a->id) { g_sv_sel_ids[i] = g_sv_sel_ids[--g_sv_sel_n]; return; }
+    sv_sel_add(s, r, c);
+}
+/* every action of the plain rows lo..hi */
+static void sv_sel_rows(Script *s, int lo, int hi) {
+    g_sv_sel_n = 0;
+    for (int r = lo; r <= hi && r < s->rows; r++) {
+        if (script_zone_at(s, r) >= 0) continue;
+        for (int c = 0; c < s->cols; c++) sv_sel_add(s, r, c);
+    }
+}
+/* the keyboard moved the selection: the group follows (Shift: the rows) */
+static void sv_sel_after_nav(void) {
+    Script *s = sv_cur();
+    if (!s) return;
+    if (GetKeyState(VK_SHIFT) & 0x8000) { int lo, hi; sv_sel_range(&lo, &hi); sv_sel_rows(s, lo, hi); }
+    else sv_sel_one(s, g_sv_row, g_sv_col);
+}
+/* plain rows: can the group move by (dr, dc) cells -- inside the grid, not into a timeline,
+   onto empty cells (or its own)? apply: do it */
+static int sv_group_move_cells(Script *s, int dr, int dc, int apply) {
+    static ScriptAction buf[SV_MAX_SEL];
+    int nr[SV_MAX_SEL], nc[SV_MAX_SEL], n = 0, maxr = 0;
+    for (int i = 0; i < g_sv_sel_n; i++) {
+        int r, c;
+        if (!script_find(s, g_sv_sel_ids[i], &r, &c)) continue;
+        int tr = r + dr, tc = c + dc;
+        if (tr < 0 || tc < 0 || tc >= s->cols || script_zone_at(s, tr) >= 0) return 0;
+        const ScriptAction *d = script_at(s, tr, tc);
+        if (d && d->type != ACT_NONE && !sv_sel_has(d->id)) return 0;
+        nr[n] = tr; nc[n] = tc; n++;
+        if (tr > maxr) maxr = tr;
+    }
+    if (!apply || n == 0) return n > 0;
+    for (int i = 0, k = 0; i < g_sv_sel_n; i++) { /* lifted, then put down (the grid may grow) */
+        ScriptAction *a = script_find(s, g_sv_sel_ids[i], NULL, NULL);
+        if (!a) continue;
+        buf[k++] = *a; memset(a, 0, sizeof(*a));
+    }
+    script_ensure_rows(s, maxr + 1);
+    for (int k = 0; k < n; k++) *script_at(s, nr[k], nc[k]) = buf[k];
+    g_sv_row += dr; g_sv_col += dc; g_sv_anchor = g_sv_row;
+    if (g_sv_row < 0) g_sv_row = 0;
+    if (g_sv_col < 0) g_sv_col = 0;
+    if (g_sv_col >= s->cols) g_sv_col = s->cols - 1;
+    return 1;
+}
+/* a timeline group: each one to its lane when the drag began + dc (a free cell there); 0 (nothing moved) if one can't */
+static int sv_zone_group_lanes(Script *s, int zi, int dc) {
+    static ScriptAction buf[SV_MAX_SEL];
+    int fr[SV_MAX_SEL], fc[SV_MAX_SEL], pr[SV_MAX_SEL], n = g_sv_sel_n;
+    const ScriptZone *z = &s->zone[zi];
+    for (int i = 0; i < n; i++) {
+        int L = g_sv_glane0[i] + dc;
+        if (L < 0 || L >= s->cols || !script_find(s, g_sv_sel_ids[i], NULL, NULL)) return 0;
+    }
+    for (int i = 0; i < n; i++) { ScriptAction *a = script_find(s, g_sv_sel_ids[i], &fr[i], &fc[i]); buf[i] = *a; memset(a, 0, sizeof(*a)); }
+    int ok = 1, placed = 0;
+    for (int i = 0; i < n && ok; i++) {
+        int L = g_sv_glane0[i] + dc, row = -1;
+        for (int r = z->row0; r < z->row0 + z->rows && r < s->rows && row < 0; r++) if (script_at(s, r, L)->type == ACT_NONE) row = r;
+        if (row < 0) { ok = 0; break; }
+        *script_at(s, row, L) = buf[i]; pr[i] = row; placed++;
+    }
+    if (!ok) { /* back where they were */
+        for (int i = 0; i < placed; i++) memset(script_at(s, pr[i], g_sv_glane0[i] + dc), 0, sizeof(ScriptAction));
+        for (int i = 0; i < n; i++) *script_at(s, fr[i], fc[i]) = buf[i];
+        return 0;
+    }
+    return 1;
+}
+/* dragging a timeline group: up / down = their starts (0.05 s steps, Shift: 0.01; none before 0), sideways = other lanes */
 static void sv_drag_move(int x, int y) {
     Script *s = sv_cur();
-    ScriptAction *a = sv_cell(0);
-    int zi = s ? script_zone_at(s, g_sv_row) : -1;
-    if (!a || a->type == ACT_NONE || zi < 0) { g_sv_drag = 0; return; }
+    int r, c;
+    ScriptAction *a = s ? script_find(s, g_sv_drag_id, &r, NULL) : NULL;
+    int zi = a ? script_zone_at(s, r) : -1;
+    if (zi < 0) { g_sv_drag = 0; return; }
     float step = (GetKeyState(VK_SHIFT) & 0x8000) ? 0.01f : 0.05f;
-    float t = g_sv_drag_t0 + (float)(y - g_sv_drag_y0) * s->zone[zi].sec_per_row / SV_ROW_H;
-    t = roundf(t / step) * step;
-    if (t < 0.0f) t = 0.0f;
-    if (fabsf(t - a->start) > 1e-4f) { a->start = t; g_sv_drag_moved = 1; }
+    float dt = (float)(y - g_sv_drag_y0) * s->zone[zi].sec_per_row / SV_ROW_H;
+    dt = roundf(dt / step) * step;
+    float mn = 1e9f;
+    for (int i = 0; i < g_sv_sel_n; i++) if (g_sv_gt0[i] < mn) mn = g_sv_gt0[i];
+    if (mn + dt < 0.0f) dt = -mn;
+    for (int i = 0; i < g_sv_sel_n; i++) {
+        ScriptAction *b = script_find(s, g_sv_sel_ids[i], NULL, NULL);
+        if (!b) continue;
+        float t = roundf((g_sv_gt0[i] + dt) * 1000.0f) / 1000.0f;
+        if (fabsf(t - b->start) > 1e-4f) { b->start = t; g_sv_drag_moved = 1; }
+    }
     int cw = (g_sv_grid_rc.right - g_sv_grid_rc.left - SV_ROWHDR_W) / s->cols;
-    int c = (x - g_sv_grid_rc.left - SV_ROWHDR_W) / cw;
+    c = (x - g_sv_grid_rc.left - SV_ROWHDR_W) / cw;
     if (c < 0) c = 0;
     if (c >= s->cols) c = s->cols - 1;
-    if (c != g_sv_col) { /* to an empty cell of that lane, if it has one */
-        const ScriptZone *z = &s->zone[zi];
-        int fr = -1;
-        for (int rr = z->row0; rr < z->row0 + z->rows && rr < s->rows && fr < 0; rr++) if (script_at(s, rr, c)->type == ACT_NONE) fr = rr;
-        if (fr >= 0) {
-            ScriptAction *dst = script_at(s, fr, c);
-            *dst = *a; memset(a, 0, sizeof(*a));
-            g_sv_row = fr; g_sv_col = c; g_sv_anchor = fr;
-            g_sv_drag_moved = 1;
+    int dc = c - g_sv_drag_c0;
+    if (dc != g_sv_gdc && sv_zone_group_lanes(s, zi, dc)) { g_sv_gdc = dc; g_sv_drag_moved = 1; }
+    if (script_find(s, g_sv_drag_id, &r, &c)) { g_sv_row = r; g_sv_col = c; g_sv_anchor = r; }
+}
+/* a rectangle drawn from an empty spot: the actions it touches (of plain rows, or of that timeline) */
+static void sv_band_select(Script *s) {
+    RECT band = { g_sv_band_x0 < g_sv_band_x1 ? g_sv_band_x0 : g_sv_band_x1, g_sv_band_y0 < g_sv_band_y1 ? g_sv_band_y0 : g_sv_band_y1,
+                  g_sv_band_x0 > g_sv_band_x1 ? g_sv_band_x0 : g_sv_band_x1, g_sv_band_y0 > g_sv_band_y1 ? g_sv_band_y0 : g_sv_band_y1 };
+    RECT tmp;
+    g_sv_sel_n = 0;
+    if (g_sv_band_zone >= 0) {
+        const ScriptZone *z = &s->zone[g_sv_band_zone];
+        for (int r = z->row0; r < z->row0 + z->rows && r < s->rows; r++)
+            for (int c = 0; c < s->cols; c++) {
+                if (script_at(s, r, c)->type == ACT_NONE) continue;
+                RECT er; int k; float l;
+                sv_event_geom(s, g_sv_band_zone, r, c, &er, &k, &l);
+                if (k == DUR_INSTANT) InflateRect(&er, 0, 3);
+                if (IntersectRect(&tmp, &er, &band)) sv_sel_add(s, r, c);
+            }
+        return;
+    }
+    int vis = sv_grid_rows_visible();
+    for (int r = g_sv_scroll; r < g_sv_scroll + vis && r < s->rows; r++) {
+        if (script_zone_at(s, r) >= 0) continue;
+        for (int c = 0; c < s->cols; c++) {
+            RECT cr; sv_cell_rect(r, c, &cr);
+            if (IntersectRect(&tmp, &cr, &band)) sv_sel_add(s, r, c);
         }
     }
 }
+
+/* can a timeline action be made shorter / longer by its edges? (a sound, a line, an
+   animation played N times: trimmed; a wait, a camera slide: their length) */
+static int sv_resizable(const ScriptAction *a) {
+    float f;
+    return a->type == ACT_WAIT || a->type == ACT_CAMERA || action_media_length(a, &f);
+}
+/* the top / bottom edge of a timeline action under (x, y): 1 / 2 (*row, *col: the action), else 0 */
+static int sv_event_edge_at(int x, int y, int *row, int *col) {
+    Script *s = sv_cur();
+    if (!s) return 0;
+    POINT p = { x, y };
+    for (int z = 0; z < s->nzones; z++)
+        for (int r = s->zone[z].row0; r < s->zone[z].row0 + s->zone[z].rows && r < s->rows; r++)
+            for (int c = 0; c < s->cols; c++) {
+                const ScriptAction *a = script_at(s, r, c);
+                if (a->type == ACT_NONE || !sv_resizable(a)) continue;
+                RECT er; int k; float l;
+                sv_event_geom(s, z, r, c, &er, &k, &l);
+                if (k != DUR_KNOWN || x < er.left || x >= er.right) continue;
+                (void)p;
+                if (er.bottom - er.top >= 16 && y >= er.top - 2 && y <= er.top + 3) { *row = r; *col = c; return 1; }
+                if (y >= er.bottom - 4 && y <= er.bottom + 2) { *row = r; *col = c; return 2; }
+            }
+    return 0;
+}
+/* an edge dragged: the time under the mouse becomes its start (top) or its end (bottom) */
+static void sv_resize_move(int y) {
+    Script *s = sv_cur();
+    ScriptAction *a = sv_cell(0);
+    int zi = s ? script_zone_at(s, g_sv_row) : -1;
+    if (!a || a->type == ACT_NONE || zi < 0) { g_sv_rsz = 0; return; }
+    float step = (GetKeyState(VK_SHIFT) & 0x8000) ? 0.01f : 0.05f;
+    float t = (float)(y - sv_zone_y(&s->zone[zi])) * s->zone[zi].sec_per_row / SV_ROW_H;
+    t = roundf(t / step) * step;
+    if (t < 0.0f) t = 0.0f;
+    float full, end = g_sv_rsz_start + g_sv_rsz_len;
+    int media = action_media_length(a, &full);
+    if (g_sv_rsz == 2) { /* its end */
+        float len = t - a->start;
+        if (len < 0.05f) len = 0.05f;
+        if (media) {
+            float out = full - a->trim_in - len;
+            if (out < 0.0f) out = 0.0f;
+            a->trim_out = out;
+        } else a->seconds = len;
+    } else { /* its start: a sound / animation starts further in it (or less), its end stays */
+        if (t > end - 0.05f) t = end - 0.05f;
+        if (media) {
+            float in = g_sv_rsz_in + (t - g_sv_rsz_start);
+            if (in < 0.0f) in = 0.0f;
+            if (in > full - g_sv_rsz_out - 0.05f) in = full - g_sv_rsz_out - 0.05f;
+            a->trim_in = in;
+            a->start = g_sv_rsz_start + (in - g_sv_rsz_in);
+        } else {
+            a->start = t;
+            a->seconds = end - t;
+        }
+    }
+    g_sv_drag_moved = 1;
+}
+
 /* the bottom edge of a timeline under (x, y): its index, else -1 */
 static int sv_zone_edge_at(int x, int y) {
     Script *s = sv_cur();
@@ -8019,7 +8272,23 @@ static void sv_zone_rows(int delta) {
     sv_changed();
 }
 static void sv_drag_end(void) {
+    if (g_sv_cdrag) {
+        g_sv_cdrag = 0; ReleaseCapture();
+        Script *s = sv_cur();
+        if (s && (g_sv_cdrag_dr || g_sv_cdrag_dc)) {
+            if (sv_group_move_cells(s, g_sv_cdrag_dr, g_sv_cdrag_dc, 1)) sv_changed();
+            else snprintf(g_status, sizeof(g_status), "can't move there: a cell is taken, outside the grid or in a timeline");
+        }
+        return;
+    }
+    if (g_sv_band) {
+        Script *s = sv_cur();
+        if (g_sv_band == 2 && s) sv_band_select(s);
+        g_sv_band = 0; ReleaseCapture();
+        return;
+    }
     if (g_sv_zdrag) { g_sv_zdrag = 0; ReleaseCapture(); if (g_sv_drag_moved) sv_changed(); return; }
+    if (g_sv_rsz) { g_sv_rsz = 0; ReleaseCapture(); if (g_sv_drag_moved) sv_changed(); return; }
     if (!g_sv_drag) return;
     g_sv_drag = 0;
     ReleaseCapture();
@@ -8296,7 +8565,17 @@ static void sv_action(HWND hwnd, int id) {
         case B_SV_PASTE:
             if (g_sv_has_clip && s) { a = sv_cell(1); int nid = s->next_id++; *a = g_sv_clip; a->id = nid; sv_changed(); }
             return;
-        case B_SV_CLEAR: if (has) { memset(a, 0, sizeof(*a)); sv_changed(); } return;
+        case B_SV_CLEAR:
+            if (s && g_sv_sel_n > 1) {
+                char q[120]; snprintf(q, sizeof(q), "Clear the %d selected actions?", g_sv_sel_n);
+                if (MessageBoxA(hwnd, q, "Silver Remaster -- scripts", MB_YESNO | MB_ICONQUESTION) != IDYES) return;
+                for (int i = 0; i < g_sv_sel_n; i++) { ScriptAction *b = script_find(s, g_sv_sel_ids[i], NULL, NULL); if (b) memset(b, 0, sizeof(*b)); }
+                g_sv_sel_n = 0;
+                sv_changed();
+                return;
+            }
+            if (has) { memset(a, 0, sizeof(*a)); sv_changed(); }
+            return;
         case B_SV_TYPE: { RECT r; sv_cell_rect(g_sv_row, g_sv_col, &r); sv_cell_menu(hwnd, r.left + 10, r.bottom); return; }
         case B_CH_OK: ch_choose(); return;
         case B_CH_CANCEL: ch_close(); return;
@@ -8320,6 +8599,19 @@ static void sv_action(HWND hwnd, int id) {
         case B_SV_AN_LOOP: a->anim_mode = ANIM_LOOP; break;
         case B_SV_AN_FOLLOW: a->speed = a->speed > 0.0f ? 0.0f : 1.0f; break;
         case B_SV_AN_FREEZE: a->freeze = !a->freeze; break;
+        case B_SV_TRIM_IN_M: case B_SV_TRIM_IN_P: case B_SV_TRIM_OUT_M: case B_SV_TRIM_OUT_P: {
+            float full;
+            if (!action_media_length(a, &full)) return;
+            float *v = (id == B_SV_TRIM_IN_M || id == B_SV_TRIM_IN_P) ? &a->trim_in : &a->trim_out;
+            float d = (id == B_SV_TRIM_IN_P || id == B_SV_TRIM_OUT_P) ? 0.05f : -0.05f;
+            float other = v == &a->trim_in ? a->trim_out : a->trim_in;
+            *v += d;
+            if (*v < 0.0f) *v = 0.0f;
+            if (*v > full - other - 0.05f) *v = full - other - 0.05f;
+            *v = roundf(*v * 100.0f) / 100.0f;
+            break;
+        }
+        case B_SV_TRIM_RESET: a->trim_in = a->trim_out = 0.0f; break;
         case B_SV_T_M1: case B_SV_T_M01: case B_SV_T_P01: case B_SV_T_P1: {
             static const float d[4] = { -0.1f, -0.01f, 0.01f, 0.1f };
             a->start += d[id - B_SV_T_M1];
@@ -8567,6 +8859,7 @@ static int sv_fade_buttons(ScriptAction *a, int ix, int iy, int iw, int rh, cons
 
 static void sv_layout_main(HWND hwnd) {
     RECT rc; GetClientRect(hwnd, &rc);
+    if (g_sv_sel_script != g_sv_script) { g_sv_sel_n = 0; g_sv_sel_script = g_sv_script; } /* a group is of one script */
     SetRect(&g_sv_port_rc, 0, 0, 0, 0);
     SetRect(&g_sv_ovprev_rc, 0, 0, 0, 0);
     int W = rc.right, H = rc.bottom;
@@ -8656,6 +8949,21 @@ static void sv_layout_main(HWND hwnd) {
             else snprintf(dl, sizeof(dl), "Lasts until it's over -- %s %.1f s.", measured_duration(s->name, a->id, &m) ? "last run:" : "estimate:", len);
             svl(ix, iy, iw, 20, 0, SVL_DIM, SV_ONE, "%s", dl);
             iy += 28;
+            float full;
+            if (action_media_length(a, &full)) { /* its part played */
+                svl(ix, iy, iw, 16, 1, SVL_SECTION, SV_ONE, "PART PLAYED (OF %.2f s) -- OR DRAG ITS TOP / BOTTOM EDGE", full);
+                iy += 20;
+                ui_add(B_SV_TRIM_IN_M, ix, iy, 34, rh, "-", "", "Start less far into it (0.05 s).", 0, a->trim_in > 0.0f, 0);
+                svl(ix + 40, iy, iw - 80, rh, 0, SVL_VALUE, SV_ONE | DT_CENTER, a->trim_in > 0.0f ? "starts %.2f s into it" : "from its start", a->trim_in);
+                ui_add(B_SV_TRIM_IN_P, ix + iw - 34, iy, 34, rh, "+", "", "Start further into it (0.05 s): the beginning is skipped.", 0, full - a->trim_in - a->trim_out > 0.1f, 0);
+                iy += rh + 4;
+                ui_add(B_SV_TRIM_OUT_M, ix, iy, 34, rh, "-", "", "Cut less of its end (0.05 s).", 0, a->trim_out > 0.0f, 0);
+                svl(ix + 40, iy, iw - 80, rh, 0, SVL_VALUE, SV_ONE | DT_CENTER, a->trim_out > 0.0f ? "ends %.2f s early" : "to its end", a->trim_out);
+                ui_add(B_SV_TRIM_OUT_P, ix + iw - 34, iy, 34, rh, "+", "", "End it earlier (0.05 s).", 0, full - a->trim_in - a->trim_out > 0.1f, 0);
+                iy += rh + 4;
+                ui_add(B_SV_TRIM_RESET, ix, iy, iw, rh, "Play all of it", "", "No cut: from its start to its end.", 0, a->trim_in > 0.0f || a->trim_out > 0.0f, 0);
+                iy += rh + 12;
+            }
         }
     } else {
         svl(ix, iy, iw, 16, 1, SVL_SECTION, SV_ONE, "ROW %d, COLUMN %d", g_sv_row + 1, g_sv_col + 1);
@@ -9105,10 +9413,33 @@ static void sv_paint(HWND hwnd, HDC hdc) {
                     ui_fill(hdc, &cr, beyond ? RGB(22, 22, 28) : RGB(27, 27, 33));
                     if (sel || hov) { SelectObject(hdc, ui_font(14, 0)); ui_text(hdc, cr.left, cr.top, cr.right - cr.left, cr.bottom - cr.top, "+ add (double-click)", RGB(110, 110, 125), DT_CENTER | DT_VCENTER | DT_SINGLELINE); }
                 }
+                int grp = a && a->type != ACT_NONE && g_sv_sel_n > 1 && sv_sel_has(a->id);
+                if (grp && !sel) { ui_frame(hdc, &cr, RGB(255, 160, 60)); RECT in = cr; InflateRect(&in, -1, -1); ui_frame(hdc, &in, RGB(255, 160, 60)); }
                 if (sel) { ui_frame(hdc, &cr, RGB(255, 210, 60)); RECT in = cr; InflateRect(&in, -1, -1); ui_frame(hdc, &in, RGB(255, 210, 60)); }
             }
         }
         sv_paint_zones(hdc, s);
+        if (g_sv_cdrag && (g_sv_cdrag_dr || g_sv_cdrag_dc)) { /* where the group would go: green, red if it can't */
+            int ok = sv_group_move_cells(s, g_sv_cdrag_dr, g_sv_cdrag_dc, 0);
+            for (int i = 0; i < g_sv_sel_n; i++) {
+                int rr, cc;
+                if (!script_find(s, g_sv_sel_ids[i], &rr, &cc)) continue;
+                RECT dr; sv_cell_rect(rr + g_sv_cdrag_dr, cc + g_sv_cdrag_dc, &dr);
+                if (dr.bottom < g_sv_grid_rc.top + SV_HDR_H || dr.top > g_sv_grid_rc.bottom) continue;
+                COLORREF gc = ok ? RGB(110, 230, 140) : RGB(255, 100, 90);
+                ui_frame(hdc, &dr, gc); InflateRect(&dr, -2, -2); ui_frame(hdc, &dr, gc);
+            }
+        }
+        if (g_sv_band == 2) { /* the selecting rectangle */
+            RECT br = { g_sv_band_x0 < g_sv_band_x1 ? g_sv_band_x0 : g_sv_band_x1, g_sv_band_y0 < g_sv_band_y1 ? g_sv_band_y0 : g_sv_band_y1,
+                        g_sv_band_x0 > g_sv_band_x1 ? g_sv_band_x0 : g_sv_band_x1, g_sv_band_y0 > g_sv_band_y1 ? g_sv_band_y0 : g_sv_band_y1 };
+            ui_frame(hdc, &br, RGB(120, 170, 255));
+        }
+        if (g_sv_sel_n > 1) {
+            SelectObject(hdc, ui_font(12, 1));
+            snprintf(t, sizeof(t), "%d ACTIONS SELECTED -- DRAG ONE TO MOVE THEM ALL, DEL: CLEAR THEM, ESC: UNSELECT", g_sv_sel_n);
+            ui_text(hdc, g_sv_grid_rc.left + SV_ROWHDR_W, g_sv_grid_rc.top, g_sv_grid_rc.right - g_sv_grid_rc.left - SV_ROWHDR_W, SV_HDR_H, t, RGB(255, 170, 80), DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+        }
         /* scrollbar */
         int tot = total + 1;
         if (tot > vis) {
@@ -9281,17 +9612,17 @@ static int sv_key(HWND hwnd, int vk) {
     }
     Script *s = sv_cur();
     switch (vk) {
-        case VK_ESCAPE: script_view_toggle(); return 1;
+        case VK_ESCAPE: if (g_sv_sel_n > 1) { g_sv_sel_n = 0; return 1; } script_view_toggle(); return 1;
         case VK_F2: sv_action(hwnd, B_SV_RENAME); return 1;
         case VK_F5: sv_action(hwnd, B_SV_PLAY); return 1;
         case VK_F6: sv_action(hwnd, B_SV_PLAY_ROW); return 1;
-        case VK_UP: if (ctrl) { if (g_sv_script > 0) { g_sv_script--; sv_select(0, 0); g_sv_scroll = 0; } } else sv_select(g_sv_row - 1, g_sv_col); return 1;
-        case VK_DOWN: if (ctrl) { if (g_sv_script < g_script_count - 1) { g_sv_script++; sv_select(0, 0); g_sv_scroll = 0; } } else sv_select(g_sv_row + 1, g_sv_col); return 1;
-        case VK_LEFT: sv_select(g_sv_row, g_sv_col - 1); return 1;
-        case VK_RIGHT: sv_select(g_sv_row, g_sv_col + 1); return 1;
-        case VK_PRIOR: sv_select(g_sv_row - sv_grid_rows_visible(), g_sv_col); return 1;
-        case VK_NEXT: sv_select(g_sv_row + sv_grid_rows_visible(), g_sv_col); return 1;
-        case VK_HOME: sv_select(0, g_sv_col); return 1;
+        case VK_UP: if (ctrl) { if (g_sv_script > 0) { g_sv_script--; sv_select(0, 0); g_sv_scroll = 0; } } else { sv_select(g_sv_row - 1, g_sv_col); sv_sel_after_nav(); } return 1;
+        case VK_DOWN: if (ctrl) { if (g_sv_script < g_script_count - 1) { g_sv_script++; sv_select(0, 0); g_sv_scroll = 0; } } else { sv_select(g_sv_row + 1, g_sv_col); sv_sel_after_nav(); } return 1;
+        case VK_LEFT: sv_select(g_sv_row, g_sv_col - 1); sv_sel_after_nav(); return 1;
+        case VK_RIGHT: sv_select(g_sv_row, g_sv_col + 1); sv_sel_after_nav(); return 1;
+        case VK_PRIOR: sv_select(g_sv_row - sv_grid_rows_visible(), g_sv_col); sv_sel_after_nav(); return 1;
+        case VK_NEXT: sv_select(g_sv_row + sv_grid_rows_visible(), g_sv_col); sv_sel_after_nav(); return 1;
+        case VK_HOME: sv_select(0, g_sv_col); sv_sel_after_nav(); return 1;
         case VK_INSERT: sv_action(hwnd, B_SV_ROW_INS); return 1;
         case VK_DELETE: sv_action(hwnd, shift ? B_SV_ROW_DEL : B_SV_CLEAR); return 1;
         case VK_RETURN: if (s) sv_action(hwnd, B_SV_TYPE); return 1;
@@ -9345,37 +9676,92 @@ static void sv_mouse_down(HWND hwnd, int x, int y, int dbl) {
     int r, c, zi;
     float zt;
     Script *s = sv_cur();
+    {
+        int er, ec, e = sv_event_edge_at(x, y, &er, &ec);
+        if (e) { /* an action's edge: drag it to trim / lengthen it */
+            sv_select(er, ec);
+            ScriptAction *a = sv_cell(0);
+            int k;
+            g_sv_rsz = e; g_sv_drag_moved = 0;
+            g_sv_rsz_start = a->start; g_sv_rsz_in = a->trim_in; g_sv_rsz_out = a->trim_out; g_sv_rsz_sec = a->seconds;
+            g_sv_rsz_len = sv_event_len(s, script_zone_at(s, er), a, &k);
+            SetCapture(hwnd);
+            return;
+        }
+    }
     int edge = sv_zone_edge_at(x, y);
     if (edge >= 0) { /* its bottom edge: drag it to make it taller / shorter */
         g_sv_zdrag = edge + 1; g_sv_drag_moved = 0;
         SetCapture(hwnd);
         return;
     }
-    if (sv_zone_hit(x, y, &zi, &r, &c, &zt)) { /* a timeline: an action (drag it), or a new one there */
+    int ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0, shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+    if (sv_zone_hit(x, y, &zi, &r, &c, &zt)) { /* a timeline: an action (drag it, and its group), or a new one there */
         if (r >= 0) {
             sv_select(r, c);
-            g_sv_drag = 1; g_sv_drag_y0 = y; g_sv_drag_t0 = script_at(s, r, c)->start; g_sv_drag_moved = 0;
+            if (ctrl || shift) { sv_sel_toggle(s, r, c); return; }
+            ScriptAction *a = script_at(s, r, c);
+            if (!sv_sel_has(a->id)) sv_sel_one(s, r, c);
+            g_sv_drag = 1; g_sv_drag_y0 = y; g_sv_drag_moved = 0; g_sv_drag_id = a->id; g_sv_drag_c0 = c; g_sv_gdc = 0;
+            for (int i = 0; i < g_sv_sel_n; i++) {
+                int rr, cc;
+                ScriptAction *b = script_find(s, g_sv_sel_ids[i], &rr, &cc);
+                g_sv_gt0[i] = b ? b->start : 0.0f; g_sv_glane0[i] = cc;
+            }
             SetCapture(hwnd);
             return;
         }
+        if (!ctrl) g_sv_sel_n = 0;
         int rows0 = s->rows, fr = script_zone_free_row(s, zi, c);
         if (fr < 0) return;
         if (s->rows != rows0) sv_changed();
         sv_select(fr, c);
         g_sv_pending_start = zt;
-        if (dbl) sv_cell_menu(hwnd, x, y);
+        if (dbl) { sv_cell_menu(hwnd, x, y); return; }
+        g_sv_band = 1; g_sv_band_zone = zi; g_sv_band_x0 = g_sv_band_x1 = x; g_sv_band_y0 = g_sv_band_y1 = y; /* or a rectangle to select */
+        SetCapture(hwnd);
         return;
     }
     if (sv_cell_at(x, y, &r, &c)) {
         sv_select(r, c);
         ScriptAction *a = sv_cell(0);
-        if (dbl && (!a || a->type == ACT_NONE)) sv_cell_menu(hwnd, x, y);
+        int filled = a && a->type != ACT_NONE;
+        if (ctrl) { sv_sel_toggle(s, r, c); return; }
+        if (shift) { int lo, hi; sv_sel_range(&lo, &hi); sv_sel_rows(s, lo, hi); return; }
+        if (filled) { /* drag it (and its group) to other cells */
+            if (!sv_sel_has(a->id)) sv_sel_one(s, r, c);
+            if (dbl) return;
+            g_sv_cdrag = 1; g_sv_cdrag_r0 = r; g_sv_cdrag_c0 = c; g_sv_cdrag_dr = g_sv_cdrag_dc = 0;
+            SetCapture(hwnd);
+            return;
+        }
+        g_sv_sel_n = 0;
+        if (dbl) { sv_cell_menu(hwnd, x, y); return; }
+        g_sv_band = 1; g_sv_band_zone = -1; g_sv_band_x0 = g_sv_band_x1 = x; g_sv_band_y0 = g_sv_band_y1 = y;
+        SetCapture(hwnd);
     }
 }
 static void sv_mouse_move(int x, int y) {
     int r, c, zi;
     float zt;
+    if (g_sv_cdrag) {
+        if (sv_cell_at(x, y, &r, &c)) { g_sv_cdrag_dr = r - g_sv_cdrag_r0; g_sv_cdrag_dc = c - g_sv_cdrag_c0; }
+        g_sv_hover = -1;
+        return;
+    }
+    if (g_sv_band) {
+        g_sv_band_x1 = x; g_sv_band_y1 = y;
+        if (g_sv_band == 1 && (abs(x - g_sv_band_x0) > 4 || abs(y - g_sv_band_y0) > 4)) g_sv_band = 2;
+        if (g_sv_band == 2) { Script *s = sv_cur(); if (s) sv_band_select(s); }
+        g_sv_hover = -1;
+        return;
+    }
     if (g_sv_zdrag) { sv_zone_edge_move(y); g_sv_hover = -1; return; }
+    if (g_sv_rsz) { sv_resize_move(y); g_sv_hover = -1; return; }
+    {
+        int er, ec, e = g_sv_drag ? 0 : sv_event_edge_at(x, y, &er, &ec);
+        g_sv_edge_hover = e ? (er * SCRIPT_MAX_COLS + ec) * 4 + e : -1;
+    }
     if (g_sv_drag) sv_drag_move(x, y);
     g_sv_zedge_hover = g_sv_drag ? -1 : sv_zone_edge_at(x, y);
     if (g_sv_zedge_hover >= 0) { g_sv_hover = -1; return; }
@@ -11096,7 +11482,7 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             return 0;
         }
         case WM_LBUTTONUP: {
-            if (g_sv_drag || g_sv_zdrag) { sv_drag_end(); InvalidateRect(hwnd, NULL, FALSE); return 0; }
+            if (g_sv_drag || g_sv_zdrag || g_sv_rsz || g_sv_cdrag || g_sv_band) { sv_drag_end(); InvalidateRect(hwnd, NULL, FALSE); return 0; }
             if (attack_release(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam))) return 0;
             if (g_anim_sb_page) { g_anim_sb_page = 0; KillTimer(hwnd, ANIM_SB_TIMER_ID); ReleaseCapture(); InvalidateRect(hwnd, NULL, FALSE); return 0; }
             if (g_anim_drag) { g_anim_drag = 0; ReleaseCapture(); InvalidateRect(hwnd, NULL, FALSE); return 0; }

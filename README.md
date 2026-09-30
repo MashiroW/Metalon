@@ -119,7 +119,17 @@ No file of the original game is needed.
   (0.05 s steps, Shift: 0.01) or sideways to another lane; click / double
   click an empty spot to add one there. Make it taller / shorter by
   dragging its bottom edge (the handle), with "+ Row" / "- Row", or Ins /
-  Delete row on one of its rows. Zoom in / out changes the seconds per row. When playing, the zone is over as soon as all its actions
+  Delete row on one of its rows. Zoom in / out changes the seconds per row.
+  A sound, a line or an animation can be cut: drag its top edge down to
+  start further into it, its bottom edge up to end it earlier (a wait or
+  a camera slide: its length); orange dots mark a cut end.
+- Groups of actions: Ctrl+click adds / removes one, Shift+click takes all
+  the actions of the rows from the selected one, a rectangle drawn from an
+  empty spot takes the ones it touches. Drag one of them to move them all
+  (in plain rows: by whole cells, green where they'll go, red if they
+  can't; in a timeline: in time and across lanes). A group is either
+  plain rows or one timeline, never both. Del clears it (asks), Esc
+  unselects it. When playing, the zone is over as soon as all its actions
   are -- not when its rows are -- and the rows after it go on. "Back to
   rows" turns it back into plain rows.
 - A script plays when David arrives through a connector that names it (the

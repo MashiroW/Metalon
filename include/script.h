@@ -74,6 +74,8 @@ typedef struct {
     int ov_frame[SCRIPT_MAX_OVERLAYS]; /* OVM_FREEZE: the frame shown */
     char script[64];                   /* ROOM: the target room's script played on arrival ("" = its auto script, like a connector without one) */
     float start;                       /* in a timeline zone: when it starts, seconds from the zone's start */
+    float trim_in, trim_out;           /* in a timeline zone (SOUND, SPEAK, ANIM played N times): seconds of it skipped
+                                          at its start / cut at its end */
     int cam_target;                    /* CAMERA: CAM_* */
     float zoom;                        /* CAMERA: x1..x3, 0 = the room's own */
 } ScriptAction;

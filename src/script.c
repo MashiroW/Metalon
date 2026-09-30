@@ -407,6 +407,11 @@ int scripts_load(const char *path, Script **out) {
             ScriptAction *a;
             if (sscanf(s + 6, "%d %f", &id, &t) == 2 && (a = script_find(&cur, id, NULL, NULL)) != NULL) a->start = t;
         }
+        else if (!strncmp(s, "trim ", 5)) {
+            int id = 0; float ti = 0.0f, to = 0.0f;
+            ScriptAction *a;
+            if (sscanf(s + 5, "%d %f %f", &id, &ti, &to) == 3 && (a = script_find(&cur, id, NULL, NULL)) != NULL) { a->trim_in = ti; a->trim_out = to; }
+        }
         else if (!strcmp(s, "end")) {
             for (int z = 0; z < cur.nzones; z++) script_ensure_rows(&cur, cur.zone[z].row0 + cur.zone[z].rows);
             if (n == cap) { cap = cap ? cap * 2 : 8; *out = (Script *)realloc(*out, sizeof(Script) * cap); }
@@ -469,6 +474,7 @@ int scripts_save(const char *path, const Script *s, int n) {
             for (int c = 0; c < s[i].cols; c++) {
                 const ScriptAction *a = &s[i].cell[(size_t)r * s[i].cols + c];
                 if (a->type != ACT_NONE && script_zone_at(&s[i], r) >= 0) fprintf(f, "start %d %.3f\n", a->id, a->start);
+                if (a->type != ACT_NONE && (a->trim_in > 0.0f || a->trim_out > 0.0f)) fprintf(f, "trim %d %.3f %.3f\n", a->id, a->trim_in, a->trim_out);
             }
         fprintf(f, "end\n");
     }

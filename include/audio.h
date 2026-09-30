@@ -35,6 +35,8 @@ void audio_music_now(char *file, int n, int *track);
    (AUDIO_AMBIENCE, loop = forever): returns its voice id, 0 if the file
    can't be played */
 int audio_play(const char *file, int kind, int repeat, int loop);
+/* same, from `offset` seconds into the file (its repeats start from the beginning) */
+int audio_play_at(const char *file, int kind, int repeat, int loop, float offset);
 void audio_stop(int id);
 void audio_fade(int id, float seconds);  /* that voice fades out, then stops (0 = at once) */
 void audio_stop_kind(int kind);      /* every voice of that kind */

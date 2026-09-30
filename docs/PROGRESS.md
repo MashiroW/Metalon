@@ -1600,3 +1600,7 @@ Validation, before removing the old data:
   dynamic (measured when played, estimate before). Editor: blocks as tall
   as they last, lanes = columns, drag to move, hover for details,
   zoom, make / end a timeline from a row selection.
+- Timeline trims (`trim <id> <in> <out>`): sounds start at an offset
+  (stb_vorbis seek, `audio_play_at`) and fade out at the cut; animations
+  start further in and hold the frame at the cut. Edge dragging in the
+  editor. Group selection (ids) with group moves in rows or in a timeline.

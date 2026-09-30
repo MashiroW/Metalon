@@ -257,11 +257,13 @@ void audio_music_now(char *file, int n, int *track) {
     LeaveCriticalSection(&g_cs);
 }
 
-int audio_play(const char *file, int kind, int repeat, int loop) {
+int audio_play(const char *file, int kind, int repeat, int loop) { return audio_play_at(file, kind, repeat, loop, 0.0f); }
+int audio_play_at(const char *file, int kind, int repeat, int loop, float offset) {
     if (!g_running || !file || !file[0]) return 0;
     int ch; unsigned rate;
     stb_vorbis *v = open_file(file, &ch, &rate);
     if (!v) return 0;
+    if (offset > 0.0f) stb_vorbis_seek(v, (unsigned)(offset * (float)rate));
     EnterCriticalSection(&g_cs);
     Voice *vc = free_slot();
     int id = 0;
