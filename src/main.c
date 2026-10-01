@@ -343,6 +343,8 @@ typedef struct {
     int play_token;            /* +1 at every new clip started: a script action knows its own by it (its pool may change the clip) */
     int pool_clips[SCRIPT_POOL_MAX + 1], pool_n; /* a script animation's random pool: a new one of them at every loop */
     float blocked_t;           /* how long another character has kept it from moving on */
+    int face_pending;          /* standing: it turns to face_to (a script's Move, once there) */
+    float face_to;
     int detours;               /* ways around another character tried, this move */
     CuePlayer cue;             /* the attack's sounds playing */
     /* combat */
@@ -1221,7 +1223,7 @@ static void set_character_target(float wx, float wy, float wz, int run) {
     int standing = !g_char_moving;
     g_char_moving = 1;
     g_char_walk_mode = run ? 2 : 1;
-    g_act->detours = 0; g_act->blocked_t = 0.0f;
+    g_act->detours = 0; g_act->blocked_t = 0.0f; g_act->face_pending = 0;
     david_turn_toward(atan2f(dx, dz), run, standing);
 }
 
@@ -1731,6 +1733,11 @@ static int advance_character(float dt) {
             }
             else a->play_t = fmodf(a->play_t, d);
         }
+    }
+    if (!g_char_moving && g_act->face_pending) { /* turning on the spot to the way it was asked to face */
+        float diff = wrap_angle(g_act->face_to - g_char_facing), st = 5.0f * dt;
+        if (fabsf(diff) <= st) { g_char_facing = g_act->face_to; g_act->face_pending = 0; }
+        else g_char_facing = wrap_angle(g_char_facing + (diff > 0.0f ? st : -st));
     }
     if (!g_char_moving) {
         g_char_anim_t += dt * g_david_anim_speed;
@@ -8447,6 +8454,7 @@ static int run_cell_done(const ScriptAction *a, CellRun *c, float dt) {
                 c->done = g_room_gen != c->room_gen || (!ac->moving && ac->pending_door < 0 && g_door_travel_request < 0);
             else if (c->door) c->done = gone;
             else c->done = gone || !ac->moving;
+            if (c->done && !gone && !c->door && a->face_end) { ac->face_pending = 1; ac->face_to = a->facing; } /* there: it turns */
             break;
         }
         default: c->done = 1;
@@ -8681,9 +8689,9 @@ static void script_tick(HWND hwnd, float dt) {
     run_release_holds();
 }
 
-enum { SV_PICK_NONE, SV_PICK_PLACE_POS, SV_PICK_PLACE_FACE, SV_PICK_MOVE, SV_PICK_OVERLAY, SV_PICK_CAMERA };
+enum { SV_PICK_NONE, SV_PICK_PLACE_POS, SV_PICK_PLACE_FACE, SV_PICK_MOVE, SV_PICK_OVERLAY, SV_PICK_CAMERA, SV_PICK_MOVE_FACE };
 static int fcam_allowed(void) {
-    return g_loaded && (g_edit_mode || g_sv_pick == SV_PICK_PLACE_POS || g_sv_pick == SV_PICK_PLACE_FACE || g_sv_pick == SV_PICK_MOVE);
+    return g_loaded && (g_edit_mode || g_sv_pick == SV_PICK_PLACE_POS || g_sv_pick == SV_PICK_PLACE_FACE || g_sv_pick == SV_PICK_MOVE || g_sv_pick == SV_PICK_MOVE_FACE);
 }
 
 /* The yellow step box of the side panel while a script plays or a point
@@ -8709,6 +8717,10 @@ static const char *script_step_text(char *buf, size_t n, const char **sub) {
     if (g_sv_pick == SV_PICK_PLACE_FACE) {
         snprintf(sb, sizeof(sb), "Click the point it looks toward. %s%s", g_free_cam ? "Esc: keep its current direction." : "Right-click or Esc: keep its current direction.", fc);
         return "Script -- place a character: where it faces";
+    }
+    if (g_sv_pick == SV_PICK_MOVE_FACE) {
+        snprintf(sb, sizeof(sb), "Click the point it looks toward once it's there. Esc: cancel.%s", fc);
+        return "Script -- move a character: where it faces at the end";
     }
     if (g_sv_pick == SV_PICK_MOVE) {
         snprintf(sb, sizeof(sb), g_free_cam ? "Click the floor where the character goes (to leave through a connector: from the picture, F4). Esc: cancel.%s"
@@ -8745,7 +8757,7 @@ enum {
     B_SV_PL_MODEL, B_SV_PL_POS, B_SV_FACE_L, B_SV_FACE_R, B_SV_MV_DEST, B_SV_MV_WALK, B_SV_MV_RUN, B_SV_MOVESET,
     B_CH_OK, B_CH_CANCEL, B_CH_LISTEN, B_CH_SCOPE0, B_CH_SCOPE1, B_CH_SCOPE2,
     B_SV_OV_LEFT, B_SV_OV_RIGHT, B_SV_OV_UP, B_SV_OV_DOWN, B_SV_OV_PICK, B_SV_OV_WAIT, B_SV_OV_RELOAD, B_SV_RM_ROOM,
-    B_SV_OV_IMPORT, B_SV_OV_REMOVE, B_SV_HS_L, B_SV_HS_R,
+    B_SV_OV_IMPORT, B_SV_OV_REMOVE, B_SV_HS_L, B_SV_HS_R, B_SV_MV_FACE_KEEP, B_SV_MV_FACE_SET, B_SV_MV_FACE_PICK,
     B_SV_CAM_KEEP, B_SV_CAM_POINT, B_SV_CAM_DAVID, B_SV_CAM_PICK, B_SV_CAM_ZM, B_SV_CAM_ZP, B_SV_CAM_ZROOM, B_SV_CAM_SM, B_SV_CAM_SP,
     B_SV_ADD = 400,     /* + action type */
     B_SV_TRACK = 500,   /* + track * 8 + op (0 listen, 1 loop, 2 up, 3 down, 4 remove) */
@@ -9906,6 +9918,15 @@ static void sv_pick_click(float rx, float ry, int right) {
         sv_pick_end();
         return;
     }
+    if (g_sv_pick == SV_PICK_MOVE_FACE) {
+        float w[3];
+        if (!right && a->has_pos && pick_floor_point(rx, ry, w) && (w[0] - a->pos[0]) * (w[0] - a->pos[0]) + (w[2] - a->pos[2]) * (w[2] - a->pos[2]) > 1e-4f) {
+            a->facing = atan2f(w[0] - a->pos[0], w[2] - a->pos[2]); a->face_end = 1;
+        }
+        sv_changed();
+        sv_pick_end();
+        return;
+    }
     if (right) { sv_pick_end(); return; }
     if (g_sv_pick == SV_PICK_MOVE) {
         int di = door_at_pixel(rx, ry);
@@ -10235,8 +10256,11 @@ static void sv_action(HWND hwnd, int id) {
         case B_SV_ST_MUSIC: a->stop_kind = STOP_MUSIC; break;
         case B_SV_PL_MODEL: g_pick_for_script = 1; g_anim_view = 1; picker_open(); return;
         case B_SV_PL_POS: sv_pick_start(SV_PICK_PLACE_POS); return;
-        case B_SV_FACE_L: a->facing = wrap_angle(a->facing + 0.785398f); break;
-        case B_SV_FACE_R: a->facing = wrap_angle(a->facing - 0.785398f); break;
+        case B_SV_FACE_L: a->facing = wrap_angle(a->facing + 0.785398f); if (a->type == ACT_MOVE) a->face_end = 1; break;
+        case B_SV_FACE_R: a->facing = wrap_angle(a->facing - 0.785398f); if (a->type == ACT_MOVE) a->face_end = 1; break;
+        case B_SV_MV_FACE_KEEP: a->face_end = 0; break;
+        case B_SV_MV_FACE_SET: a->face_end = 1; break;
+        case B_SV_MV_FACE_PICK: if (!a->has_pos) { snprintf(g_status, sizeof(g_status), "pick its destination first"); return; } sv_pick_start(SV_PICK_MOVE_FACE); return;
         case B_SV_MV_DEST: sv_pick_start(SV_PICK_MOVE); return;
         case B_SV_MV_WALK: a->run = 0; break;
         case B_SV_MV_RUN: a->run = 1; break;
@@ -10975,7 +10999,23 @@ static void sv_layout_main(HWND hwnd) {
             iy += rh + 12;
             ui_add(B_SV_MV_WALK, ix, iy, half, rh, "Walk", "", "It walks there.", !a->run, 1, 3);
             ui_add(B_SV_MV_RUN, ix + half + 6, iy, half, rh, "Run", "", "It runs there.", a->run, 1, 3);
-            iy += rh + 8;
+            iy += rh + 12;
+            if (!a->door) { /* where it faces once there */
+                svl(ix, iy, iw, 16, 1, SVL_SECTION, SV_ONE, "ORIENTATION AT THE END");
+                iy += 20;
+                ui_add(B_SV_MV_FACE_KEEP, ix, iy, half, rh, "As it arrives", "", "It keeps facing the way it walked in.", !a->face_end, 1, 3);
+                ui_add(B_SV_MV_FACE_SET, ix + half + 6, iy, half, rh, "Face a direction", "", "Once there, it turns on the spot to face the direction set below.", a->face_end, 1, 3);
+                iy += rh + 6;
+                if (a->face_end) {
+                    ui_add(B_SV_FACE_L, ix, iy, 44, rh, "<", "", "Turn it 45 degrees left.", 0, 1, 0);
+                    svl(ix + 50, iy, iw - 100, rh, 0, SVL_VALUE, SV_ONE | DT_CENTER, "%.0f deg", a->facing * 57.29578f);
+                    ui_add(B_SV_FACE_R, ix + iw - 44, iy, 44, rh, ">", "", "Turn it 45 degrees right.", 0, 1, 0);
+                    iy += rh + 6;
+                    ui_add(B_SV_MV_FACE_PICK, ix, iy, iw, rh, "Pick where it looks...", "", "Click (in the room, F4: free camera) the point it faces once at its destination.", 0, a->has_pos, 0);
+                    iy += rh + 6;
+                }
+                iy += 6;
+            }
             ui_add(B_SV_MOVESET, ix, iy, iw, rh, "Moveset of this character...", "", "The animations it walks with (graph), and change them.", 0, 1, 0);
             iy += rh + 12;
             svl(ix, iy, iw, 90, 0, SVL_DIM, DT_LEFT | DT_WORDBREAK,
@@ -12729,7 +12769,7 @@ static void sv_pick_markers(HDC hdc) {
             draw_world_point(hdc, a->pos, lab, RGB(200, 150, 255));
         }
     float from[3];
-    if (g_sv_pick == SV_PICK_PLACE_FACE && sv_pick_marker(from)) {
+    if ((g_sv_pick == SV_PICK_PLACE_FACE || g_sv_pick == SV_PICK_MOVE_FACE) && sv_pick_marker(from)) {
         int rx, ry; float to[3], ax, ay, az, bx, by, bz;
         client_to_room_point(g_mouse_client_x, g_mouse_client_y, &rx, &ry);
         if (pick_floor_point((float)rx, (float)ry, to) &&
@@ -12745,7 +12785,7 @@ static void sv_pick_markers(HDC hdc) {
 }
 static int sv_pick_marker(float out[3]) {
     ScriptAction *a = sv_cell(0);
-    if (g_sv_pick != SV_PICK_PLACE_FACE || !a || !a->has_pos) return 0;
+    if ((g_sv_pick != SV_PICK_PLACE_FACE && g_sv_pick != SV_PICK_MOVE_FACE) || !a || !a->has_pos) return 0;
     memcpy(out, a->pos, sizeof(float) * 3);
     return 1;
 }
@@ -12981,6 +13021,19 @@ static int pick_ghosts(Actor *out, int max) {
                     g->facing = atan2f(to[0] - a->pos[0], to[2] - a->pos[2]);
             }
         }
+    if (cur && cur->type == ACT_MOVE && cur->has_pos && (g_sv_pick == SV_PICK_MOVE_FACE || g_sv_pick == SV_PICK_MOVE) && n < max) {
+        CharModel *m = run_actor_model(s, cur->actor); /* the one moving, where it'll stand */
+        if (m && g_sv_pick == SV_PICK_MOVE_FACE) {
+            Actor *g = &out[n++];
+            actor_reset(g, m, 0);
+            memcpy(g->pos, cur->pos, sizeof(g->pos));
+            g->facing = cur->facing;
+            int rx, ry; float to[3];
+            client_to_room_point(g_mouse_client_x, g_mouse_client_y, &rx, &ry);
+            if (pick_floor_point((float)rx, (float)ry, to) && ((to[0] - cur->pos[0]) * (to[0] - cur->pos[0]) + (to[2] - cur->pos[2]) * (to[2] - cur->pos[2])) > 1e-4f)
+                g->facing = atan2f(to[0] - cur->pos[0], to[2] - cur->pos[2]);
+        }
+    }
     return n;
 }
 static void render_david_hires(uint32_t *px, int W, int H, float sc) {
@@ -13408,7 +13461,7 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
                 InvalidateRect(hwnd, NULL, FALSE);
                 return 0;
             }
-            if (g_sv_pick == SV_PICK_PLACE_FACE) InvalidateRect(hwnd, NULL, FALSE); /* the line toward the mouse */
+            if (g_sv_pick == SV_PICK_PLACE_FACE || g_sv_pick == SV_PICK_MOVE_FACE) InvalidateRect(hwnd, NULL, FALSE); /* the line toward the mouse */
             if (attack_drag(g_mouse_client_x, g_mouse_client_y)) return 0;
             if (g_radial) {
                 int h0 = g_radial_hover;

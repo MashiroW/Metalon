@@ -68,6 +68,7 @@ typedef struct {
     float pos[3], facing;              /* world point; facing in radians (PLACE) */
     int actor;                         /* MOVE / ANIM / SPEAK: 0 = David, else the id of the PLACE action that brought the character in */
     int run;                           /* MOVE: 0 walk, 1 run */
+    int face_end;                      /* MOVE: once there, it turns to `facing` (0: as it arrives) */
     int door;                          /* MOVE: connector shape id to go through, 0 = go to pos; ROOM: connector of the target room David
                                           comes in by, 0 = where he'd spawn */
     int nov;                           /* OVERLAY: the overlays it sets (by name, in the room's _overlays.cfg) */

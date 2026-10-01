@@ -273,7 +273,7 @@ void action_summary(const Script *s, const ScriptAction *a, char *out, int n) {
         case ACT_MOVE:
             script_actor_name(s, a->actor, t, sizeof(t));
             if (a->door) snprintf(out, n, "%s %s through connector #%d", t, a->run ? "runs" : "walks", a->door);
-            else if (a->has_pos) snprintf(out, n, "%s %s to a point", t, a->run ? "runs" : "walks");
+            else if (a->has_pos) snprintf(out, n, "%s %s to a point%s", t, a->run ? "runs" : "walks", a->face_end ? ", then turns" : "");
             else snprintf(out, n, "%s -- no destination yet", t);
             break;
         case ACT_ANIM:
@@ -396,7 +396,7 @@ static void parse_cell(Script *s, const char *line) {
             if (!strcmp(a.script, "-")) a.script[0] = 0;
         }
     }
-    else if (!strcmp(kind, "move")) { a.type = ACT_MOVE; sscanf(p, "%d %d %d %d %f %f %f", &a.actor, &a.run, &a.door, &a.has_pos, &a.pos[0], &a.pos[1], &a.pos[2]); }
+    else if (!strcmp(kind, "move")) { a.type = ACT_MOVE; sscanf(p, "%d %d %d %d %f %f %f %d %f", &a.actor, &a.run, &a.door, &a.has_pos, &a.pos[0], &a.pos[1], &a.pos[2], &a.face_end, &a.facing); }
     else return;
     if (!strcmp(a.file, "-")) a.file[0] = 0;
     script_ensure_rows(s, r + 1);
@@ -485,7 +485,7 @@ static void write_cell(FILE *f, int r, int c, const ScriptAction *a) {
             break;
         case ACT_CAMERA: fprintf(f, "camera %d %.2f %.2f %d %.1f %.1f\n", a->cam_target, a->zoom, a->seconds, a->has_pos, a->pos[0], a->pos[1]); break;
         case ACT_ROOM: fprintf(f, "room %s %d %s\n", a->file[0] ? a->file : "-", a->door, a->script[0] ? a->script : "-"); break;
-        case ACT_MOVE: fprintf(f, "move %d %d %d %d %.4f %.4f %.4f\n", a->actor, a->run, a->door, a->has_pos, a->pos[0], a->pos[1], a->pos[2]); break;
+        case ACT_MOVE: fprintf(f, "move %d %d %d %d %.4f %.4f %.4f %d %.4f\n", a->actor, a->run, a->door, a->has_pos, a->pos[0], a->pos[1], a->pos[2], a->face_end, a->facing); break;
     }
 }
 
