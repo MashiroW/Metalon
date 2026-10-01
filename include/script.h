@@ -7,6 +7,10 @@
    overlap; the columns are its lanes, the rows only hold the actions (and
    give the zone its height: `sec_per_row` seconds each). The zone is over
    once all its actions are, then the rows after it go on.
+   A SUBSCRIPT is a script played when David talks to a character (a
+   dialog): the character's Place action names it. In it, the actions can
+   be for "the one talked to" (ACTOR_PARTNER), and each of the two has a
+   list of talking animations, played while its lines are.
    Saved per room in data/rooms/<level>/<room>_scripts.cfg -- see
    scripts_save for the format. */
 #ifndef SILVER_SCRIPT_H
@@ -38,6 +42,7 @@ enum { OVM_KEEP, OVM_LOOP, OVM_ONCE, OVM_ONCE_HIDE, OVM_FREEZE, OVM_HIDE, OVM_CO
 #define SCRIPT_POOL_MAX 8
 enum { STOP_ACTION, STOP_ALL_SOUNDS, STOP_MUSIC };
 enum { CAM_KEEP, CAM_POINT, CAM_DAVID };
+#define ACTOR_PARTNER (-1)                 /* an action's character, in a subscript: the one David talks to */
 
 /* ANIM: how long the animation plays */
 enum {
@@ -77,6 +82,8 @@ typedef struct {
     int ov_frame[SCRIPT_MAX_OVERLAYS]; /* OVM_FREEZE: the frame shown */
     char script[64];                   /* ROOM: the target room's script played on arrival ("" = its auto script, like a connector without one) */
     int side, ai_off;                  /* PLACE: 0 an ally, 1 an enemy; its AI off */
+    int player;                        /* PLACE: no new character -- David himself (the player) is put there;
+                                          `script` (PLACE, not the player): its dialog, the subscript played when David talks to it */
     int set_side, set_ai;              /* CHAR: 0 unchanged; side 1 ally / 2 enemy; AI 1 on / 2 off */
     int set_weapon, set_shield;        /* CHAR: 0 unchanged, 1 becomes item / item2 ("" = none) */
     char item[48], item2[48];
@@ -96,6 +103,9 @@ typedef struct { int row0, rows; float sec_per_row; } ScriptZone;
 typedef struct {
     char name[64];
     int auto_run;                      /* played when David enters the room */
+    int sub;                           /* a subscript (a dialog): played when David talks to a character */
+    int ntalk[2];                      /* subscript: the talking animations of David [0], of the one talked to [1] */
+    char talk[2][SCRIPT_POOL_MAX][96];
     int nzones;                        /* advanced timeline zones, by row */
     ScriptZone zone[SCRIPT_MAX_ZONES];
     int cols, rows;

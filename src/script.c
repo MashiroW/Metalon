@@ -214,9 +214,11 @@ static const char *base_name(const char *path) {
 
 void script_actor_name(const Script *s, int actor, char *out, int n) {
     if (actor == 0) { snprintf(out, n, "David"); return; }
+    if (actor == ACTOR_PARTNER) { snprintf(out, n, "The one talked to"); return; }
     int r = -1;
     ScriptAction *p = script_find((Script *)s, actor, &r, NULL);
     if (!p || p->type != ACT_PLACE) { snprintf(out, n, "(character removed)"); return; }
+    if (p->player) { snprintf(out, n, "David"); return; }
     snprintf(out, n, "%s (row %d)", p->model[0] ? p->model : "?", r + 1);
 }
 
@@ -253,8 +255,10 @@ void action_summary(const Script *s, const ScriptAction *a, char *out, int n) {
             if (a->fade > 0) { size_t l = strlen(out); snprintf(out + l, n - l, "  (fade out %.1f s)", a->fade); }
             break;
         case ACT_PLACE:
+            if (a->player) { snprintf(out, n, "David (the player) is put here%s", a->has_pos ? "" : "  -- no position yet"); break; }
             snprintf(out, n, "%s%s%s%s", a->model[0] ? a->model : "(no character)", a->side ? "  (enemy)" : "", a->ai_off ? "  (AI off)" : "",
                      a->has_pos ? "" : "  -- no position yet");
+            if (a->script[0]) { size_t l = strlen(out); snprintf(out + l, n - l, "  (talks: %s)", a->script); }
             break;
         case ACT_CHAR: {
             script_actor_name(s, a->actor, t, sizeof(t));
@@ -321,6 +325,8 @@ void action_summary(const Script *s, const ScriptAction *a, char *out, int n) {
 /* ---------------- file ----------------
    script <name>
    auto 0|1
+   sub 1                                    (a subscript: a dialog)
+   talk <0 David | 1 the one talked to> <source/clip>   (a subscript's talking animations)
    columns <n>
    cell <row> <col> <id> wait <seconds>
    cell <row> <col> <id> background <level/room/picture.png | ->
@@ -328,7 +334,7 @@ void action_summary(const Script *s, const ScriptAction *a, char *out, int n) {
    cell <row> <col> <id> sound <file> <repeat> <wait>
    cell <row> <col> <id> ambience <file> <loop>
    cell <row> <col> <id> stop action <id> | stop sounds | stop music
-   cell <row> <col> <id> place <model> <has_pos> <x> <y> <z> <facing>
+   cell <row> <col> <id> place <model> <has_pos> <x> <y> <z> <facing> <side> <ai_off> <player> <dialog subscript (rest of the line) | ->
    cell <row> <col> <id> move <actor> <run> <door> <has_pos> <x> <y> <z>
    cell <row> <col> <id> anim <actor> <mode> <times> <source/clip> <speed, 0 = the game's> <freeze>
    cell <row> <col> <id> speak <actor> <file>
@@ -367,7 +373,18 @@ static void parse_cell(Script *s, const char *line) {
         const char *fd = strstr(p, " fade ");
         if (fd) sscanf(fd + 6, "%f", &a.fade);
     }
-    else if (!strcmp(kind, "place")) { a.type = ACT_PLACE; sscanf(p, "%47s %d %f %f %f %f %d %d", a.model, &a.has_pos, &a.pos[0], &a.pos[1], &a.pos[2], &a.facing, &a.side, &a.ai_off); if (!strcmp(a.model, "-")) a.model[0] = 0; }
+    else if (!strcmp(kind, "place")) {
+        a.type = ACT_PLACE;
+        int k = 0;
+        if (sscanf(p, "%47s %d %f %f %f %f %d %d %n", a.model, &a.has_pos, &a.pos[0], &a.pos[1], &a.pos[2], &a.facing, &a.side, &a.ai_off, &k) >= 8 && k > 0) {
+            int k2 = 0;
+            if (sscanf(p + k, "%d %n", &a.player, &k2) >= 1 && k2 > 0) {
+                snprintf(a.script, sizeof(a.script), "%s", p + k + k2);
+                if (!strcmp(a.script, "-")) a.script[0] = 0;
+            }
+        }
+        if (!strcmp(a.model, "-")) a.model[0] = 0;
+    }
     else if (!strcmp(kind, "char")) {
         a.type = ACT_CHAR;
         sscanf(p, "%d %d %d %d %47s %d %47s", &a.actor, &a.set_side, &a.set_ai, &a.set_weapon, a.item, &a.set_shield, a.item2);
@@ -418,6 +435,12 @@ int scripts_load(const char *path, Script **out) {
         if (!strncmp(s, "script ", 7)) { script_init(&cur, s + 7); in = 1; }
         else if (!in) continue;
         else if (!strncmp(s, "auto ", 5)) cur.auto_run = atoi(s + 5) != 0;
+        else if (!strncmp(s, "sub ", 4)) cur.sub = atoi(s + 4) != 0;
+        else if (!strncmp(s, "talk ", 5)) {
+            int k = -1; char f[96] = "";
+            if (sscanf(s + 5, "%d %95s", &k, f) == 2 && k >= 0 && k < 2 && cur.ntalk[k] < SCRIPT_POOL_MAX)
+                snprintf(cur.talk[k][cur.ntalk[k]++], sizeof(cur.talk[0][0]), "%s", f);
+        }
         else if (!strncmp(s, "columns ", 8)) { int c = atoi(s + 8); if (c >= 1 && c <= SCRIPT_MAX_COLS && cur.rows == 0) cur.cols = c; }
         else if (!strncmp(s, "cell ", 5)) parse_cell(&cur, s);
         else if (!strncmp(s, "zone ", 5)) {
@@ -474,7 +497,8 @@ static void write_cell(FILE *f, int r, int c, const ScriptAction *a) {
             if (a->fade > 0) fprintf(f, " fade %.2f", a->fade);
             fprintf(f, "\n");
             break;
-        case ACT_PLACE: fprintf(f, "place %s %d %.4f %.4f %.4f %.4f %d %d\n", a->model[0] ? a->model : "-", a->has_pos, a->pos[0], a->pos[1], a->pos[2], a->facing, a->side, a->ai_off); break;
+        case ACT_PLACE: fprintf(f, "place %s %d %.4f %.4f %.4f %.4f %d %d %d %s\n", a->model[0] ? a->model : "-", a->has_pos, a->pos[0], a->pos[1], a->pos[2], a->facing, a->side, a->ai_off,
+                                a->player, a->script[0] ? a->script : "-"); break;
         case ACT_CHAR: fprintf(f, "char %d %d %d %d %s %d %s\n", a->actor, a->set_side, a->set_ai, a->set_weapon, a->item[0] ? a->item : "-", a->set_shield, a->item2[0] ? a->item2 : "-"); break;
         case ACT_ANIM: fprintf(f, "anim %d %d %d %s %.2f %d\n", a->actor, a->anim_mode, a->repeat, a->file[0] ? a->file : "-", a->speed, a->freeze); break;
         case ACT_SPEAK: fprintf(f, "speak %d %s\n", a->actor, a->file[0] ? a->file : "-"); break;
@@ -495,7 +519,10 @@ int scripts_save(const char *path, const Script *s, int n) {
     if (!f) return 0;
     fprintf(f, "# Silver Remaster room scripts (Scripts screen: S). One action per cell; rows play one after the other.\n");
     for (int i = 0; i < n; i++) {
-        fprintf(f, "script %s\nauto %d\ncolumns %d\n", s[i].name, s[i].auto_run, s[i].cols);
+        fprintf(f, "script %s\nauto %d\n", s[i].name, s[i].auto_run);
+        if (s[i].sub) fprintf(f, "sub 1\n");
+        for (int k = 0; k < 2; k++) for (int j = 0; j < s[i].ntalk[k]; j++) fprintf(f, "talk %d %s\n", k, s[i].talk[k][j]);
+        fprintf(f, "columns %d\n", s[i].cols);
         for (int z = 0; z < s[i].nzones; z++) fprintf(f, "zone %d %d %.3f\n", s[i].zone[z].row0, s[i].zone[z].rows, s[i].zone[z].sec_per_row);
         for (int r = 0; r < s[i].rows; r++)
             for (int c = 0; c < s[i].cols; c++) {

@@ -1648,3 +1648,17 @@ Validation, before removing the old data:
 - Characters are obstacles: cylinders (body radius x their build) the
   others slide along; held back 0.5 s: a detour beside it, or a stop next
   to it; attack / dodge steps stop against them. B shows them all.
+- Move character: an orientation at the end (45-degree steps, or a point
+  picked), turned on the spot once there.
+
+## 2026-10-01 -- Dialogs: subscripts, talking to characters
+
+- Place character can put the player himself (David) somewhere: his
+  position and facing, his walk stopped.
+- Subscripts (`sub 1` in the scripts file): dialogs, listed apart in the
+  Scripts screen. A Place action names its character's dialog; the mouth
+  cursor (sprite mouse.9) shows over that character (its projected
+  silhouette), a click walks David to it, both turn (face_pending), then
+  the subscript plays with ACTOR_PARTNER (-1) = that character, its AI
+  paused. Talking animations per subscript (`talk 0|1 <clip>`), played
+  looped (random, another at every loop) while the speaker's Speak lasts.

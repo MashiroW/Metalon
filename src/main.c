@@ -345,6 +345,7 @@ typedef struct {
     float blocked_t;           /* how long another character has kept it from moving on */
     int face_pending;          /* standing: it turns to face_to (a script's Move, once there) */
     float face_to;
+    char talk[64];             /* its dialog: the subscript played when David talks to it ("" = none) */
     int detours;               /* ways around another character tried, this move */
     CuePlayer cue;             /* the attack's sounds playing */
     /* combat */
@@ -385,6 +386,8 @@ static void render_mesh_hires(const CharModel *m, float *vx, float *vy, const fl
 static Actor g_actors[MAX_ACTORS];
 static Actor *g_act = &g_actors[0];
 #define DAVID_ACTOR (&g_actors[0])
+static Actor *g_talking_with = NULL; /* the one David talks to (both turning to each other, then its subscript): its AI waits */
+static int g_talking_with_pid = 0;
 #define g_char_pos (g_act->pos)
 #define g_char_target (g_act->target)
 #define g_char_facing (g_act->facing)
@@ -6738,6 +6741,7 @@ static Actor *actor_nearest_foe(const Actor *a) {
 }
 /* AI, "close in and strike": to the nearest foe until close enough, then its blows with pauses between them */
 static void actor_ai_tick(Actor *a, float dt) {
+    if (a == g_talking_with) return; /* talking with David */
     const AiSettings *ai = moveset_ai(actor_moveset(a));
     if (!ai || ai->kind != AI_MELEE || !actor_alive(a) || a->play_clip >= 0) return; /* nothing to do, or busy (a blow, a reaction, a script...) */
     a->ai_cool -= dt; a->ai_repath -= dt;
@@ -7097,7 +7101,7 @@ static void radial_draw_text(HDC hdc) {
 }
 
 /* ---------------- cursor: CAPS LOCK, clipping, edge panning ---------------- */
-static HCURSOR g_cur_game = NULL, g_cur_door = NULL, g_cur_pan[9], g_cur_attack = NULL;
+static HCURSOR g_cur_game = NULL, g_cur_door = NULL, g_cur_pan[9], g_cur_attack = NULL, g_cur_talk = NULL;
 static int g_pan_dir = 0;        /* 0 none, 1 up 2 down 3 left 4 right 5 ul 6 ur 7 dl 8 dr */
 static int g_clip_active = 0;
 static RECT g_clip_rect;
@@ -7174,6 +7178,7 @@ static void load_game_cursors(void) {
     for (int i = 1; i < 9; i++) g_cur_pan[i] = cursor_from_sprite(i, 2.0f, rules[i], 0, 0);
     g_cur_door = cursor_from_sprite(11, 1.5f, NULL, 21, 21);
     g_cur_attack = cursor_from_sprite(29, 2.0f, "tl", 0, 0); /* the sword: attack mode */
+    g_cur_talk = cursor_from_sprite(9, 2.0f, NULL, 9, 9); /* the mouth: over a character David can talk to */
     if (!g_cur_game) g_cur_game = LoadCursorA(NULL, IDC_ARROW);
 }
 
@@ -7219,6 +7224,7 @@ static int pan_direction(int cx, int cy) {
     return 0;
 }
 
+static Actor *talk_actor_at(float rx, float ry);
 static HCURSOR cursor_for(int cx, int cy) {
     if (screen_view()) return ui_hit(cx, cy) != B_NONE ? LoadCursorA(NULL, IDC_HAND) : g_cursor_arrow;
     if (g_map_mode) return g_cursor_arrow;
@@ -7235,6 +7241,7 @@ static HCURSOR cursor_for(int cx, int cy) {
         return g_cursor_arrow;
     }
     if (attack_mode() && g_cur_attack) return g_cur_attack;
+    if (g_cur_talk) { int rx, ry; client_to_room_point(cx, cy, &rx, &ry); if (talk_actor_at((float)rx, (float)ry)) return g_cur_talk; }
     if (g_pan_dir && g_cur_pan[g_pan_dir]) return g_cur_pan[g_pan_dir];
     if (g_hovered_door >= 0 && !g_show_walkable && g_cur_door) return g_cur_door;
     return g_cur_game;
@@ -8175,6 +8182,7 @@ typedef struct {
     float timer;        /* WAIT */
     Actor *actor;       /* MOVE / ANIM / SPEAK */
     int door, room_gen; /* MOVE through a connector */
+    int pid;            /* MOVE: the place_id of the one moving (it left if another one has its slot) */
     int clip;           /* ANIM */
     int token;          /* ANIM: the actor's play_token of its animation (its pool changes the clip, not this) */
     int row_long;       /* ANIM "until the rest of the row is over" */
@@ -8201,6 +8209,15 @@ static struct {
 
 static int script_playing(void) { return g_run.active; }
 
+/* the character of a script action: David (or a Place action of the player),
+   "the one talked to" (a subscript), or a character placed */
+static Actor *run_actor(int actor) {
+    if (actor == ACTOR_PARTNER) return (g_talking_with && g_talking_with->used && g_talking_with->place_id == g_talking_with_pid) ? g_talking_with : NULL;
+    ScriptAction *p = actor > 0 ? script_find(&g_run.s, actor, NULL, NULL) : NULL;
+    if (p && p->type == ACT_PLACE && p->player) return DAVID_ACTOR;
+    return actor_by_place_id(actor);
+}
+
 /* the script animations stop (the characters go back to their own pose) -- not the looped ones (ANIM_LOOP) */
 static void run_stop_anims(void) {
     for (int k = 0; k < MAX_ACTORS; k++) {
@@ -8217,6 +8234,7 @@ static void script_stop(const char *why) {
     run_stop_anims();
     snprintf(g_status, sizeof(g_status), "script \"%s\" %s", g_run.s.name, why ? why : "finished");
     g_run.active = 0;
+    g_talking_with = NULL; /* a dialog over */
     script_free(&g_run.s);
 }
 
@@ -8234,6 +8252,16 @@ static void script_start(const Script *sc, int from_row) {
 /* A character comes in (or is put back) where the action says. */
 static Actor *actor_place(const ScriptAction *a) {
     if (!g_has_3d_character) return NULL;
+    if (a->player) { /* David himself: taken there, whatever he was doing */
+        if (!a->has_pos) { snprintf(g_status, sizeof(g_status), "script: a 'Place character' (the player) has no position"); return NULL; }
+        Actor *d = DAVID_ACTOR;
+        memcpy(d->pos, a->pos, sizeof(d->pos));
+        memcpy(d->target, a->pos, sizeof(d->target));
+        d->facing = a->facing;
+        d->moving = 0; d->walk_mode = 0; d->waypoint_count = d->waypoint_idx = 0; d->turn_clip = -1; d->pending_door = -1; d->face_pending = 0;
+        g_click_marker_active = 0;
+        return d;
+    }
     if (!a->model[0] || !a->has_pos) { snprintf(g_status, sizeof(g_status), "script: a 'Place character' has no character or position"); return NULL; }
     CharModel *m = model_by_name(a->model);
     if (!m) { snprintf(g_status, sizeof(g_status), "script: character '%s' not found in assets/chars", a->model); return NULL; }
@@ -8246,6 +8274,7 @@ static Actor *actor_place(const ScriptAction *a) {
     ac->facing = a->facing;
     ac->side = a->side ? SIDE_ENEMY : SIDE_ALLY;
     ac->ai_on = !a->ai_off;
+    snprintf(ac->talk, sizeof(ac->talk), "%s", a->script); /* its dialog */
     return ac;
 }
 
@@ -8268,7 +8297,7 @@ static void run_char_equip(const ScriptAction *a, CellRun *c) {
     }
 }
 static void run_start_char(const ScriptAction *a, CellRun *c) {
-    Actor *ac = actor_by_place_id(a->actor);
+    Actor *ac = run_actor(a->actor);
     if (!ac) { char who[96]; script_actor_name(&g_run.s, a->actor, who, sizeof(who)); snprintf(g_status, sizeof(g_status), "script: %s isn't in the room", who); return; }
     if (a->set_side) ac->side = a->set_side == 2 ? SIDE_ENEMY : SIDE_ALLY;
     if (a->set_ai) ac->ai_on = a->set_ai == 1 && ac != DAVID_ACTOR;
@@ -8281,9 +8310,9 @@ static void run_start_char(const ScriptAction *a, CellRun *c) {
 static void run_start_move(const ScriptAction *a, CellRun *c) {
     char who[96];
     script_actor_name(&g_run.s, a->actor, who, sizeof(who));
-    Actor *ac = actor_by_place_id(a->actor);
+    Actor *ac = run_actor(a->actor);
     if (!ac) { snprintf(g_status, sizeof(g_status), "script: %s isn't in the room", who); return; }
-    c->actor = ac;
+    c->actor = ac; c->pid = ac->place_id;
     int ok = 0, no_door = 0;
     actor_begin(ac);
     if (a->door) {
@@ -8321,7 +8350,7 @@ static const char *action_pick(const ScriptAction *a) {
     return k == 0 ? a->file : a->pool[k - 1];
 }
 static void run_start_anim(const ScriptAction *a, CellRun *c) {
-    Actor *ac = actor_by_place_id(a->actor);
+    Actor *ac = run_actor(a->actor);
     snprintf(c->pick, sizeof(c->pick), "%s", action_pick(a));
     int clip = anim_lib_find_ref(c->pick);
     char who[96];
@@ -8349,6 +8378,32 @@ static void run_start_anim(const ScriptAction *a, CellRun *c) {
     c->actor = ac; c->clip = clip;
     c->row_long = a->anim_mode == ANIM_ROW;
     c->done = 0;
+}
+/* SPEAK in a subscript: the one speaking plays one of its talking
+   animations (the subscript's list for David / for the one talked to, at
+   random, another one at every loop) while its line plays -- not if it's
+   busy (moving, a clip of its own). */
+static void speak_anim_start(const ScriptAction *a, CellRun *c) {
+    if (!g_run.s.sub) return;
+    Actor *ac = run_actor(a->actor);
+    int k = a->actor == ACTOR_PARTNER ? 1 : ac == DAVID_ACTOR ? 0 : -1;
+    if (!ac || k < 0 || !g_run.s.ntalk[k] || !ac->model || ac->dead || ac->down || ac->moving || (ac->play_clip >= 0 && !ac->play_ended)) return;
+    int clips[SCRIPT_POOL_MAX], n = 0;
+    for (int i = 0; i < g_run.s.ntalk[k]; i++) {
+        int pc = anim_lib_find_ref(g_run.s.talk[k][i]);
+        if (pc >= 0 && anim_lib_fits(pc, ac->model->node_count)) clips[n++] = pc;
+    }
+    if (!n) return;
+    ac->play_clip = clips[rand() % n]; ac->play_t = 0.0f; ac->play_next = -1; ac->play_speed = 0.0f;
+    ac->play_left = -1; ac->play_hold = 0; ac->play_script = 1; ac->play_ended = 0; ac->play_freeze = 0; ac->hold_step = g_run.step;
+    ac->play_token++; c->token = ac->play_token; c->actor = ac; c->clip = ac->play_clip;
+    ac->pool_n = 0;
+    if (n > 1) for (int i = 0; i < n; i++) ac->pool_clips[ac->pool_n++] = clips[i];
+}
+/* ...its line over (or cut): back to its own pose */
+static void speak_anim_end(CellRun *c) {
+    if (c->actor && c->actor->play_clip >= 0 && c->actor->play_token == c->token) { c->actor->play_clip = -1; c->actor->pool_n = 0; }
+    c->actor = NULL;
 }
 static void run_start(const ScriptAction *a, CellRun *c) {
     c->done = 1;
@@ -8412,6 +8467,7 @@ static void run_start(const ScriptAction *a, CellRun *c) {
             c->voice = audio_play(a->file, AUDIO_SOUND, 0, 0);
             c->timer = 2.0f; /* no line (or unreadable): the portrait shows 2 s */
             c->done = 0;
+            speak_anim_start(a, c);
             break;
         }
     }
@@ -8425,6 +8481,7 @@ static int run_cell_done(const ScriptAction *a, CellRun *c, float dt) {
         case ACT_SPEAK:
             if (c->voice) c->done = !audio_playing(c->voice);
             else { c->timer -= dt; c->done = c->timer <= 0.0f; }
+            if (c->done) speak_anim_end(c);
             break;
         case ACT_CAMERA: c->done = !g_camslide.active; break;
         case ACT_OVERLAY: { /* its "once" overlays have played (or are gone with the room) */
@@ -8447,7 +8504,7 @@ static int run_cell_done(const ScriptAction *a, CellRun *c, float dt) {
             break;
         case ACT_MOVE: {
             Actor *ac = c->actor;
-            int gone = !ac->used || ac->place_id != a->actor;
+            int gone = !ac->used || ac->place_id != c->pid;
             if (c->door && ac == DAVID_ACTOR)
                 /* only once in the other room -- or if he stopped without going through (a
                    connector without target room: the row would otherwise never end) */
@@ -8463,9 +8520,28 @@ static int run_cell_done(const ScriptAction *a, CellRun *c, float dt) {
 }
 
 /* the model of a script's character (David, or a PLACE action's) */
+/* the character a subscript is the dialog of: the one in the room talking
+   with it, else the first Place action of the room's scripts naming it */
+static CharModel *sub_partner_model(const char *name) {
+    for (int k = 1; k < MAX_ACTORS; k++) if (g_actors[k].used && g_actors[k].model && !strcmp(g_actors[k].talk, name)) return g_actors[k].model;
+    for (int i = 0; i < g_script_count; i++)
+        for (int r = 0; r < g_scripts[i].rows; r++)
+            for (int c = 0; c < g_scripts[i].cols; c++) {
+                ScriptAction *p = script_at(&g_scripts[i], r, c);
+                if (p->type != ACT_PLACE || p->player || !p->model[0] || strcmp(p->script, name)) continue;
+                CharModel *m = model_by_name(p->model);
+                if (m) return m;
+            }
+    return NULL;
+}
 static CharModel *run_actor_model(const Script *s, int actor) {
     if (actor == 0) return &g_david;
+    if (actor == ACTOR_PARTNER) {
+        if (g_run.active && s == &g_run.s) { Actor *p = run_actor(ACTOR_PARTNER); if (p && p->model) return p->model; }
+        return sub_partner_model(s->name);
+    }
     ScriptAction *p = script_find((Script *)s, actor, NULL, NULL);
+    if (p && p->type == ACT_PLACE && p->player) return &g_david;
     return (p && p->type == ACT_PLACE) ? model_by_name(p->model) : NULL;
 }
 
@@ -8520,7 +8596,7 @@ static void run_zone_skip(void) {
             cr->done = 1; cr->row_long = 0;
             continue;
         }
-        if (a->type == ACT_SPEAK && !cr->done) audio_stop(cr->voice); /* the line is cut */
+        if (a->type == ACT_SPEAK && !cr->done) { audio_stop(cr->voice); speak_anim_end(cr); } /* the line is cut */
         if (a->type == ACT_ANIM && !cr->done && cr->actor && (cr->actor->play_clip >= 0 && cr->actor->play_token == cr->token)) cr->actor->play_clip = -1;
         cr->done = 1; cr->timer = 0.0f; cr->row_long = 0;
     }
@@ -8537,7 +8613,7 @@ static void script_skip_row(void) {
     for (int c = 0; c < SCRIPT_MAX_COLS; c++) {
         CellRun *cr = &g_run.cell[c];
         const ScriptAction *a = c < g_run.s.cols ? script_at(&g_run.s, g_run.row, c) : NULL;
-        if (a && a->type == ACT_SPEAK && !cr->done) audio_stop(cr->voice); /* the line is cut */
+        if (a && a->type == ACT_SPEAK && !cr->done) { audio_stop(cr->voice); speak_anim_end(cr); } /* the line is cut */
         if (a && a->type == ACT_ANIM && !cr->done && cr->actor && (cr->actor->play_clip >= 0 && cr->actor->play_token == cr->token)) cr->actor->play_clip = -1;
         cr->done = 1; cr->timer = 0.0f;
     }
@@ -8584,6 +8660,7 @@ static void zone_trim_start(const ScriptAction *a, CellRun *c) {
 /* ...and its trimmed end reached */
 static void zone_trim_cut(const ScriptAction *a, CellRun *c) {
     if ((a->type == ACT_SOUND || a->type == ACT_SPEAK) && c->voice) audio_fade(c->voice, 0.03f);
+    if (a->type == ACT_SPEAK) speak_anim_end(c);
     if (a->type == ACT_ANIM && c->actor && (c->actor->play_clip >= 0 && c->actor->play_token == c->token)) c->actor->play_ended = 1; /* held on that frame */
     c->done = 1;
 }
@@ -8645,7 +8722,7 @@ static void script_tick(HWND hwnd, float dt) {
         if (!g_run.active && !g_edit_mode && !g_script_view && g_has_3d_character) {
             int i = -1;
             if (g_arrival_script[0]) i = room_script_find(g_arrival_script);
-            else for (int k = 0; k < g_script_count && i < 0; k++) if (g_scripts[k].auto_run) i = k;
+            else for (int k = 0; k < g_script_count && i < 0; k++) if (g_scripts[k].auto_run && !g_scripts[k].sub) i = k;
             if (i >= 0) script_start(&g_scripts[i], 0);
         }
         g_arrival_script[0] = 0;
@@ -8687,6 +8764,76 @@ static void script_tick(HWND hwnd, float dt) {
         g_run.row++; g_run.row_started = 0; g_run.step++;
     }
     run_release_holds();
+}
+
+/* TALKING TO A CHARACTER. A placed character with a dialog (the subscript
+   its Place action names) shows the mouth cursor (mouse.9) under the
+   mouse. A click sends David up to it (double-click: running); there,
+   both turn to face each other, then the subscript plays -- its "one
+   talked to" is that character, whose AI waits until it's over. */
+static struct { int on, facing, pid; Actor *who; float t; } g_talk;
+static Actor *talk_actor_at(float rx, float ry) {
+    if (!g_has_3d_character || g_edit_mode || script_playing() || g_free_cam || g_tr.phase || DAVID_ACTOR->down) return NULL;
+    Actor *best = NULL;
+    float best_z = 1e30f;
+    for (int k = 1; k < MAX_ACTORS; k++) {
+        Actor *a = &g_actors[k];
+        if (!a->used || !a->model || !a->talk[0] || a->dead || a->down || room_script_find(a->talk) < 0) continue;
+        float head[3] = { a->pos[0], a->pos[1] + model_height(a->model), a->pos[2] }, fx, fy, fz, hx, hy, hz;
+        if (!char_project(a->pos, a->pos, &fx, &fy, &fz) || !char_project(a->pos, head, &hx, &hy, &hz)) continue;
+        float h = fy - hy;
+        if (h < 4.0f || ry < hy || ry > fy + h * 0.05f || fabsf(rx - (fx + hx) * 0.5f) > h * 0.28f) continue; /* its silhouette, roughly */
+        if (fz < best_z) { best_z = fz; best = a; }
+    }
+    return best;
+}
+static void talk_cancel(void) {
+    if (g_talk.on && g_talk.facing && !script_playing()) g_talking_with = NULL;
+    g_talk.on = 0;
+}
+static void talk_click(Actor *t, int run) {
+    Actor *d = DAVID_ACTOR;
+    float dx = d->pos[0] - t->pos[0], dz = d->pos[2] - t->pos[2], dist = sqrtf(dx * dx + dz * dz);
+    float gap = actor_radius(d) + actor_radius(t) + 0.35f;
+    memset(&g_talk, 0, sizeof(g_talk));
+    g_talk.on = 1; g_talk.who = t; g_talk.pid = t->place_id;
+    if (dist <= gap + 0.3f) { /* close enough already */
+        if (d->moving) { d->moving = 0; d->waypoint_count = 0; d->walk_mode = 0; d->turn_clip = -1; }
+        return;
+    }
+    float k = gap / dist, goal[3] = { t->pos[0] + dx * k, t->pos[1], t->pos[2] + dz * k }; /* in front of it, on David's side */
+    g_click_fail = 0;
+    if (!move_to_world_point(goal, run)) { g_talk.on = 0; report_click_refusal(); }
+}
+/* every game step: David walking up, both turning, then the dialog */
+static void talk_tick(float dt) {
+    if (!g_talk.on) return;
+    Actor *d = DAVID_ACTOR, *t = g_talk.who;
+    if (!t->used || t->place_id != g_talk.pid || t->dead || t->down || d->dead || d->down || script_playing() || g_edit_mode || g_tr.phase) { talk_cancel(); return; }
+    if (d->moving) return;
+    float dx = t->pos[0] - d->pos[0], dz = t->pos[2] - d->pos[2];
+    if (!g_talk.facing) { /* arrived: they turn to each other */
+        if (sqrtf(dx * dx + dz * dz) > (actor_radius(d) + actor_radius(t)) * 2.5f + 1.0f) {
+            g_talk.on = 0;
+            snprintf(g_status, sizeof(g_status), "David can't get close enough to talk to it");
+            return;
+        }
+        g_talk.facing = 1; g_talk.t = 0.0f;
+        if (t->moving) { t->moving = 0; t->waypoint_count = 0; t->walk_mode = 0; t->turn_clip = -1; }
+        d->face_pending = 1; d->face_to = atan2f(dx, dz);
+        t->face_pending = 1; t->face_to = atan2f(-dx, -dz);
+        g_talking_with = t; g_talking_with_pid = t->place_id;
+        return;
+    }
+    g_talk.t += dt;
+    if ((d->face_pending || t->face_pending) && g_talk.t < 2.0f) return;
+    if (d->face_pending) { d->facing = d->face_to; d->face_pending = 0; }
+    if (t->face_pending) { t->facing = t->face_to; t->face_pending = 0; }
+    g_talk.on = 0;
+    int i = room_script_find(t->talk);
+    if (i < 0) { g_talking_with = NULL; return; }
+    script_start(&g_scripts[i], 0);
+    g_talking_with = t; g_talking_with_pid = t->place_id; /* the subscript's "one talked to" */
 }
 
 enum { SV_PICK_NONE, SV_PICK_PLACE_POS, SV_PICK_PLACE_FACE, SV_PICK_MOVE, SV_PICK_OVERLAY, SV_PICK_CAMERA, SV_PICK_MOVE_FACE };
@@ -8758,6 +8905,7 @@ enum {
     B_CH_OK, B_CH_CANCEL, B_CH_LISTEN, B_CH_SCOPE0, B_CH_SCOPE1, B_CH_SCOPE2,
     B_SV_OV_LEFT, B_SV_OV_RIGHT, B_SV_OV_UP, B_SV_OV_DOWN, B_SV_OV_PICK, B_SV_OV_WAIT, B_SV_OV_RELOAD, B_SV_RM_ROOM,
     B_SV_OV_IMPORT, B_SV_OV_REMOVE, B_SV_HS_L, B_SV_HS_R, B_SV_MV_FACE_KEEP, B_SV_MV_FACE_SET, B_SV_MV_FACE_PICK,
+    B_SV_NEW_SUB, B_SV_PL_PLAYER, B_SV_PL_TALK, B_SV_PL_TALK_EDIT, B_SV_TALK_A, B_SV_TALK_B,
     B_SV_CAM_KEEP, B_SV_CAM_POINT, B_SV_CAM_DAVID, B_SV_CAM_PICK, B_SV_CAM_ZM, B_SV_CAM_ZP, B_SV_CAM_ZROOM, B_SV_CAM_SM, B_SV_CAM_SP,
     B_SV_ADD = 400,     /* + action type */
     B_SV_TRACK = 500,   /* + track * 8 + op (0 listen, 1 loop, 2 up, 3 down, 4 remove) */
@@ -9069,9 +9217,17 @@ static void ch_open(int kind, const char *current) {
     g_ch_t = 0.0f;
 }
 static int g_ch_to_pool = 0; /* the chooser adds to the action's random pool (not its main file) */
-static void ch_close(void) { g_ch = CH_NONE; audio_preview(NULL); g_ch_to_pool = 0; }
+static int g_ch_talk = 0;    /* the chooser adds to a subscript's talking animations: 1 David's, 2 the one talked to's */
+static void ch_close(void) { g_ch = CH_NONE; audio_preview(NULL); g_ch_to_pool = 0; g_ch_talk = 0; }
 static void ch_choose(void) {
     const char *name = ch_current();
+    if (g_ch_talk && g_ch == CH_CLIP) { /* a subscript's talking animations */
+        Script *ts = sv_cur();
+        int k = g_ch_talk - 1;
+        if (name && ts && ts->ntalk[k] < SCRIPT_POOL_MAX) { snprintf(ts->talk[k][ts->ntalk[k]++], sizeof(ts->talk[0][0]), "%s", name); sv_changed(); }
+        ch_close();
+        return;
+    }
     ScriptAction *a = sv_cell(1);
     if (!name || !a) { ch_close(); return; }
     if (g_ch == CH_PORTRAIT) { /* kept for this character for good */
@@ -9778,19 +9934,52 @@ static void sv_drag_end(void) {
     if (g_sv_drag_moved) sv_changed();
 }
 
-static void sv_new_script(void) {
+/* a new script (sub: a subscript) at the end of the list, named after base (NULL: "Script n" / "Dialog n"); its index, -1: none
+   (g_scripts moves: pointers into it are no good after) */
+static int sv_make_script(int sub, const char *base) {
     Script *ns = (Script *)realloc(g_scripts, sizeof(Script) * (g_script_count + 1));
-    if (!ns) return;
+    if (!ns) return -1;
     g_scripts = ns;
     char name[64];
-    for (int k = g_script_count + 1;; k++) { snprintf(name, sizeof(name), "Script %d", k); if (room_script_find(name) < 0) break; }
-    script_init(&g_scripts[g_script_count], name);
-    script_ensure_rows(&g_scripts[g_script_count], 1); /* the first block: the room's music, None until chosen */
-    action_init(&g_scripts[g_script_count], script_at(&g_scripts[g_script_count], 0, 0), ACT_MUSIC);
-    g_sv_script = g_script_count++;
+    for (int k = 1;; k++) {
+        if (base) snprintf(name, sizeof(name), k == 1 ? "%.50s" : "%.50s %d", base, k);
+        else snprintf(name, sizeof(name), sub ? "Dialog %d" : "Script %d", sub ? k : g_script_count + k);
+        if (room_script_find(name) < 0) break;
+    }
+    Script *s = &g_scripts[g_script_count];
+    script_init(s, name);
+    script_ensure_rows(s, 1);
+    s->sub = sub;
+    if (!sub) action_init(s, script_at(s, 0, 0), ACT_MUSIC); /* the first block: the room's music, None until chosen */
+    return g_script_count++;
+}
+static void sv_new_script(int sub) {
+    int i = sv_make_script(sub, NULL);
+    if (i < 0) return;
+    g_sv_script = i;
     g_sv_row = g_sv_col = g_sv_scroll = 0;
     sv_changed();
     g_sv_text = 2; g_sv_text_buf[0] = 0; /* type its name right away */
+}
+/* the Place actions naming subscript `from` as their dialog name `to` instead ("": none) */
+static void sv_sub_relink(const char *from, const char *to) {
+    char old[64];
+    snprintf(old, sizeof(old), "%s", from);
+    for (int i = 0; i < g_script_count; i++)
+        for (int r = 0; r < g_scripts[i].rows; r++)
+            for (int c = 0; c < g_scripts[i].cols; c++) {
+                ScriptAction *p = script_at(&g_scripts[i], r, c);
+                if (p->type == ACT_PLACE && !strcmp(p->script, old)) snprintf(p->script, sizeof(p->script), "%s", to);
+            }
+}
+static int sv_sub_linked(const char *name) {
+    for (int i = 0; i < g_script_count; i++)
+        for (int r = 0; r < g_scripts[i].rows; r++)
+            for (int c = 0; c < g_scripts[i].cols; c++) {
+                ScriptAction *p = script_at(&g_scripts[i], r, c);
+                if (p->type == ACT_PLACE && !p->player && !strcmp(p->script, name)) return 1;
+            }
+    return 0;
 }
 static void sv_text_commit(void) {
     Script *s = sv_cur();
@@ -9801,8 +9990,36 @@ static void sv_text_commit(void) {
     snprintf(name, sizeof(name), "%s", g_sv_text_buf);
     int i = room_script_find(name);
     if (i >= 0 && i != g_sv_script) { snprintf(g_status, sizeof(g_status), "a script is already called \"%s\"", name); return; }
+    if (s->sub && strcmp(s->name, name)) sv_sub_relink(s->name, name); /* the characters keep their dialog */
     snprintf(s->name, sizeof(s->name), "%s", name);
     sv_changed();
+}
+/* THE LIST (left): the main scripts, then the subscripts (dialogs), each under its title */
+enum { SVE_MAIN = -1, SVE_SUB = -2, SVE_NO_MAIN = -3, SVE_NO_SUB = -4 };
+#define SV_SUB_COL RGB(240, 130, 230)
+static int *g_sv_ent = NULL, g_sv_ent_n = 0, g_sv_ent_cap = 0;
+static void sv_list_build(void) {
+    if (g_sv_ent_cap < g_script_count + 4) {
+        int *e = (int *)realloc(g_sv_ent, sizeof(int) * (size_t)(g_script_count + 64));
+        if (!e) { g_sv_ent_n = 0; return; }
+        g_sv_ent = e; g_sv_ent_cap = g_script_count + 64;
+    }
+    int n = 0;
+    for (int sub = 0; sub < 2; sub++) {
+        g_sv_ent[n++] = sub ? SVE_SUB : SVE_MAIN;
+        int any = 0;
+        for (int k = 0; k < g_script_count; k++) if (!g_scripts[k].sub == !sub) { g_sv_ent[n++] = k; any = 1; }
+        if (!any) g_sv_ent[n++] = sub ? SVE_NO_SUB : SVE_NO_MAIN;
+    }
+    g_sv_ent_n = n;
+}
+/* Ctrl+Up / Down: the script above / below in the list */
+static void sv_list_step(int d) {
+    sv_list_build();
+    int pos = -1;
+    for (int i = 0; i < g_sv_ent_n; i++) if (g_sv_ent[i] == g_sv_script) pos = i;
+    for (int i = pos + d; i >= 0 && i < g_sv_ent_n; i += d)
+        if (g_sv_ent[i] >= 0) { g_sv_script = g_sv_ent[i]; sv_select(0, 0); g_sv_scroll = 0; return; }
 }
 /* SPEAK for a character that has no portrait yet: choose it now */
 static void sv_ask_portrait(ScriptAction *a) {
@@ -9948,7 +10165,7 @@ static void sv_pick_click(float rx, float ry, int right) {
 
 static void sv_model_chosen(const char *name) {
     ScriptAction *a = sv_cell(1);
-    if (a && a->type == ACT_PLACE) { snprintf(a->model, sizeof(a->model), "%s", name); sv_changed(); }
+    if (a && a->type == ACT_PLACE) { snprintf(a->model, sizeof(a->model), "%s", name); a->player = 0; sv_changed(); }
     g_script_view = 1;
 }
 
@@ -9956,6 +10173,16 @@ static void sv_play(int from_row) {
     Script *s = sv_cur();
     if (!s) return;
     if (script_used_rows(s) == 0) { snprintf(g_status, sizeof(g_status), "this script is empty"); return; }
+    if (s->sub) { /* a dialog: with its character, if it's in the room (the scene as it is) */
+        Actor *who = NULL;
+        for (int k = 1; k < MAX_ACTORS && !who; k++) if (g_actors[k].used && !strcmp(g_actors[k].talk, s->name)) who = &g_actors[k];
+        ch_close();
+        g_script_view = 0; g_sv_text = 0;
+        script_start(s, from_row);
+        if (who) { g_talking_with = who; g_talking_with_pid = who->place_id; }
+        else snprintf(g_status, sizeof(g_status), "subscript \"%s\": its character isn't in the room (play the script placing it first) -- its actions are skipped", s->name);
+        return;
+    }
     /* a clean start: characters, picture and sounds of a previous test are gone */
     actors_clear_npcs();
     background_set("");
@@ -9971,8 +10198,34 @@ static int sv_actor_list(Script *s, int *ids, int *rows, int max) {
     ScriptAction *pl[64]; int pr[64];
     int n = sv_actions_of(s, ACT_PLACE, ACT_PLACE, pl, pr, 64), k = 0;
     ids[k] = 0; rows[k] = -1; k++;
-    for (int i = 0; i < n && k < max; i++) { ids[k] = pl[i]->id; rows[k] = pr[i]; k++; }
+    if (s->sub) { ids[k] = ACTOR_PARTNER; rows[k] = -1; k++; } /* a dialog: the one David talks to */
+    for (int i = 0; i < n && k < max; i++) { if (pl[i]->player) continue; ids[k] = pl[i]->id; rows[k] = pr[i]; k++; } /* (the player's: David) */
     return k;
+}
+/* a subscript's talking animations (k: 0 David's, 1 the one talked to's): add one, take one out */
+static void sv_talk_menu(HWND hwnd, Script *s, int k) {
+    CharModel *m = k ? run_actor_model(s, ACTOR_PARTNER) : &g_david;
+    HMENU mn = CreatePopupMenu();
+    char lab[200];
+    snprintf(lab, sizeof(lab), "%s's talking animations: one of them at random (another at every loop) while %s lines play",
+             k ? (m ? m->name : "The one talked to") : "David", k ? "its" : "his");
+    AppendMenuA(mn, MF_STRING | MF_GRAYED, 0, lab);
+    AppendMenuA(mn, MF_SEPARATOR, 0, NULL);
+    for (int i = 0; i < s->ntalk[k]; i++) { snprintf(lab, sizeof(lab), "Take out:  %s", s->talk[k][i]); AppendMenuA(mn, MF_STRING, 100 + i, lab); }
+    if (!s->ntalk[k]) AppendMenuA(mn, MF_STRING | MF_GRAYED, 0, "(none yet: it just stands while it speaks)");
+    AppendMenuA(mn, MF_SEPARATOR, 0, NULL);
+    AppendMenuA(mn, MF_STRING | ((m && s->ntalk[k] < SCRIPT_POOL_MAX) ? 0 : MF_GRAYED), 1,
+                m ? "Add an animation..." : "Add an animation...  (give this subscript to a character first: its Place action, Dialog)");
+    POINT pt; GetCursorPos(&pt);
+    int cmd = TrackPopupMenu(mn, TPM_RETURNCMD | TPM_NONOTIFY, pt.x, pt.y, 0, hwnd, NULL);
+    DestroyMenu(mn);
+    if (cmd == 1 && m) { g_ch_model = m; ch_open(CH_CLIP, NULL); g_ch_talk = k + 1; return; }
+    if (cmd >= 100 && cmd - 100 < s->ntalk[k]) {
+        int i = cmd - 100;
+        memmove(s->talk[k][i], s->talk[k][i + 1], sizeof(s->talk[0][0]) * (size_t)(s->ntalk[k] - i - 1));
+        s->ntalk[k]--;
+        sv_changed();
+    }
 }
 
 /* an action of a timeline, just changed: does it now go into another one of its lane? */
@@ -9988,7 +10241,9 @@ static void sv_action(HWND hwnd, int id) {
     int has = a && a->type != ACT_NONE;
     switch (id) {
         case B_SV_CLOSE: script_view_toggle(); return;
-        case B_SV_NEW: sv_new_script(); return;
+        case B_SV_NEW: sv_new_script(0); return;
+        case B_SV_NEW_SUB: sv_new_script(1); return;
+        case B_SV_TALK_A: case B_SV_TALK_B: if (s && s->sub) sv_talk_menu(hwnd, s, id - B_SV_TALK_A); return;
         case B_SV_RENAME: if (s && strcmp(s->name, DEFAULT_SCRIPT)) { g_sv_text = 2; snprintf(g_sv_text_buf, sizeof(g_sv_text_buf), "%s", s->name); } return;
         case B_SV_DUP:
             if (s) {
@@ -10008,6 +10263,7 @@ static void sv_action(HWND hwnd, int id) {
             if (s && strcmp(s->name, DEFAULT_SCRIPT)) {
                 char q[200]; snprintf(q, sizeof(q), "Delete the script \"%s\"?", s->name);
                 if (MessageBoxA(hwnd, q, "Silver Remaster -- scripts", MB_YESNO | MB_ICONQUESTION) != IDYES) return;
+                if (s->sub) sv_sub_relink(s->name, ""); /* its characters don't talk any more */
                 script_free(s);
                 memmove(&g_scripts[g_sv_script], &g_scripts[g_sv_script + 1], sizeof(Script) * (g_script_count - g_sv_script - 1));
                 g_script_count--;
@@ -10017,7 +10273,7 @@ static void sv_action(HWND hwnd, int id) {
                 sv_changed();
             }
             return;
-        case B_SV_AUTO: if (s) { s->auto_run = !s->auto_run; sv_changed(); } return;
+        case B_SV_AUTO: if (s && !s->sub) { s->auto_run = !s->auto_run; sv_changed(); } return;
         case B_SV_PLAY: sv_play(0); return;
         case B_SV_PLAY_ROW: sv_play(g_sv_row); return;
         case B_SV_HS_L: g_sv_hscroll--; if (s) sv_hscroll_clamp(s); return;
@@ -10113,6 +10369,7 @@ static void sv_action(HWND hwnd, int id) {
             for (int k = 0; k < n; k++) {
                 char lab[128];
                 if (ids[k] == 0) snprintf(lab, sizeof(lab), "David");
+                else if (ids[k] == ACTOR_PARTNER) { CharModel *pm = run_actor_model(s, ACTOR_PARTNER); snprintf(lab, sizeof(lab), "The one David talks to  (%s)", pm ? pm->name : "no character has this dialog yet"); }
                 else { ScriptAction *p = script_find(s, ids[k], NULL, NULL); snprintf(lab, sizeof(lab), "%s  (placed row %d)%s", p && p->model[0] ? p->model : "?", rows[k] + 1, rows[k] >= g_sv_row ? "  -- a later row" : ""); }
                 AppendMenuA(m, MF_STRING | (a->actor == ids[k] ? MF_CHECKED : 0) | ((k % 30 == 0 && k) ? MF_MENUBARBREAK : 0), 10 + k, lab);
             }
@@ -10256,6 +10513,57 @@ static void sv_action(HWND hwnd, int id) {
         case B_SV_ST_MUSIC: a->stop_kind = STOP_MUSIC; break;
         case B_SV_PL_MODEL: g_pick_for_script = 1; g_anim_view = 1; picker_open(); return;
         case B_SV_PL_POS: sv_pick_start(SV_PICK_PLACE_POS); return;
+        case B_SV_PL_PLAYER:
+            if (a->type != ACT_PLACE) return;
+            a->player = !a->player;
+            if (a->player) { /* it's David now: its actions are David's */
+                a->script[0] = 0;
+                for (int r = 0; r < s->rows; r++)
+                    for (int c = 0; c < s->cols; c++) {
+                        ScriptAction *b = script_at(s, r, c);
+                        if ((b->type == ACT_MOVE || b->type == ACT_ANIM || b->type == ACT_SPEAK || b->type == ACT_CHAR) && b->actor == a->id) b->actor = 0;
+                    }
+            }
+            break;
+        case B_SV_PL_TALK_EDIT: {
+            int i = a->type == ACT_PLACE ? room_script_find(a->script) : -1;
+            if (i < 0) return;
+            g_sv_script = i; g_sv_row = g_sv_col = g_sv_scroll = 0;
+            return;
+        }
+        case B_SV_PL_TALK: {
+            if (a->type != ACT_PLACE || a->player) return;
+            HMENU m = CreatePopupMenu();
+            AppendMenuA(m, MF_STRING | MF_GRAYED, 0, "When David talks to it (the mouth cursor over it), this subscript plays:");
+            AppendMenuA(m, MF_SEPARATOR, 0, NULL);
+            AppendMenuA(m, MF_STRING | (!a->script[0] ? MF_CHECKED : 0), 1, "None: it doesn't talk");
+            int subs[256], ns = 0;
+            for (int k = 0; k < g_script_count && ns < 256; k++) if (g_scripts[k].sub) {
+                subs[ns] = k;
+                AppendMenuA(m, MF_STRING | (!strcmp(a->script, g_scripts[k].name) ? MF_CHECKED : 0), 100 + ns, g_scripts[k].name);
+                ns++;
+            }
+            AppendMenuA(m, MF_SEPARATOR, 0, NULL);
+            AppendMenuA(m, MF_STRING, 2, "A new subscript for it (then edit it)");
+            POINT pt; GetCursorPos(&pt);
+            int cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_NONOTIFY, pt.x, pt.y, 0, hwnd, NULL);
+            DestroyMenu(m);
+            if (cmd == 1) a->script[0] = 0;
+            else if (cmd >= 100 && cmd - 100 < ns) snprintf(a->script, sizeof(a->script), "%s", g_scripts[subs[cmd - 100]].name);
+            else if (cmd == 2) {
+                char base[64];
+                snprintf(base, sizeof(base), "Talk to %.40s", a->model[0] ? a->model : "someone");
+                int i = sv_make_script(1, base); /* g_scripts moved: a and s with it */
+                if (i < 0) return;
+                a = sv_cell(0);
+                if (a) snprintf(a->script, sizeof(a->script), "%s", g_scripts[i].name);
+                sv_changed();
+                g_sv_script = i; g_sv_row = g_sv_col = g_sv_scroll = 0;
+                snprintf(g_status, sizeof(g_status), "subscript \"%s\": what's said when David talks to it (the one talked to: its actions' character)", g_scripts[i].name);
+                return;
+            } else return;
+            break;
+        }
         case B_SV_FACE_L: a->facing = wrap_angle(a->facing + 0.785398f); if (a->type == ACT_MOVE) a->face_end = 1; break;
         case B_SV_FACE_R: a->facing = wrap_angle(a->facing - 0.785398f); if (a->type == ACT_MOVE) a->face_end = 1; break;
         case B_SV_MV_FACE_KEEP: a->face_end = 0; break;
@@ -10265,10 +10573,9 @@ static void sv_action(HWND hwnd, int id) {
         case B_SV_MV_WALK: a->run = 0; break;
         case B_SV_MV_RUN: a->run = 1; break;
         case B_SV_MOVESET: {
-            const char *model = "david";
-            if (a->type == ACT_PLACE) model = a->model;
-            else if (a->actor) { ScriptAction *p = script_find(s, a->actor, NULL, NULL); if (p) model = p->model; }
-            CharModel *m = model_by_name(model);
+            CharModel *m;
+            if (a->type == ACT_PLACE) m = model_by_name(a->player ? "david" : a->model);
+            else { CharModel *rm = run_actor_model(s, a->actor); m = (!rm || rm == &g_david) ? model_by_name("david") : rm; }
             if (m) ms_open(m); else snprintf(g_status, sizeof(g_status), "choose the character first");
             return;
         }
@@ -10379,7 +10686,7 @@ static void room_info(const char *label) {
     }
     Script *sc = NULL;
     int ns = room_scripts_read(label, &sc);
-    for (int i = 0; i < ns; i++) { if (g_rinfo.ns < 24) snprintf(g_rinfo.script[g_rinfo.ns++], 64, "%s", sc[i].name); script_free(&sc[i]); }
+    for (int i = 0; i < ns; i++) { if (g_rinfo.ns < 24 && !sc[i].sub) snprintf(g_rinfo.script[g_rinfo.ns++], 64, "%s", sc[i].name); script_free(&sc[i]); }
     free(sc);
 }
 
@@ -10423,8 +10730,9 @@ static int sv_actor_buttons(Script *s, ScriptAction *a, int ix, int iy, int iw, 
     iy += 22;
     /* the one chosen; the button opens the list of all of them (David + every character the script places) */
     int prow = -1;
-    ScriptAction *p = a->actor ? script_find(s, a->actor, &prow, NULL) : NULL;
+    ScriptAction *p = a->actor > 0 ? script_find(s, a->actor, &prow, NULL) : NULL;
     if (a->actor == 0) snprintf(t, sizeof(t), "David");
+    else if (a->actor == ACTOR_PARTNER) { CharModel *pm = run_actor_model(s, ACTOR_PARTNER); snprintf(t, sizeof(t), "The one David talks to  (%s)", pm ? pm->name : "nobody has this dialog yet"); }
     else if (!p) snprintf(t, sizeof(t), "(its Place action is gone -- choose)");
     else snprintf(t, sizeof(t), "%s  (placed row %d)", p->model[0] ? p->model : "?", prow + 1);
     size_t l = strlen(t);
@@ -10432,7 +10740,7 @@ static int sv_actor_buttons(Script *s, ScriptAction *a, int ix, int iy, int iw, 
     ui_addf(B_SV_ACTOR_MENU, ix, iy, iw, rh, t, "", "The character of this action: click to choose among David and every character this script places.", 1, 1, 1);
     iy += rh + 3;
     int zone = script_zone_at(s, g_sv_row) >= 0;
-    if (a->actor && p && prow >= g_sv_row && !(zone && script_zone_at(s, prow) == script_zone_at(s, g_sv_row))) {
+    if (a->actor > 0 && p && prow >= g_sv_row && !(zone && script_zone_at(s, prow) == script_zone_at(s, g_sv_row))) {
         svl(ix, iy, iw, 18, 0, RGB(255, 150, 120), SV_ONE, "placed by a later row: it won't be there yet");
         iy += 20;
     }
@@ -10478,28 +10786,37 @@ static void sv_layout_main(HWND hwnd) {
     g_btn_count = 0; g_svl_n = 0;
     int list_w = W / 6; if (list_w < 180) list_w = 180; if (list_w > 240) list_w = 240;
     int insp_w = W / 4; if (insp_w < 300) insp_w = 300; if (insp_w > 400) insp_w = 400;
-    SetRect(&g_sv_list_rc, 10, 66, 10 + list_w, H - 118);
+    SetRect(&g_sv_list_rc, 10, 66, 10 + list_w, H - 149);
     SetRect(&g_sv_insp_rc, W - insp_w - 10, 44, W - 10, H - 10);
     SetRect(&g_sv_grid_rc, g_sv_list_rc.right + 12, 112, g_sv_insp_rc.left - 12, H - 10);
     Script *s = sv_cur();
 
     /* header */
-    svl(12, 8, list_w + 400, 28, 2, RGB(255, 225, 120), SV_ONE, "Scripts -- %s", current_room_label());
+    if (s && s->sub) { /* a dialog: said loud and clear */
+        CharModel *pm = run_actor_model(s, ACTOR_PARTNER);
+        svl(12, 8, W - 130, 28, 2, SV_SUB_COL, SV_ONE, "Editing a SUBSCRIPT (dialog): \"%s\" -- %s%s   (%s)", s->name,
+            pm ? "David talks to " : "no character has it as its dialog yet", pm ? pm->name : "", current_room_label());
+    } else svl(12, 8, list_w + 400, 28, 2, RGB(255, 225, 120), SV_ONE, "Scripts -- %s", current_room_label());
     ui_add(B_SV_CLOSE, W - 96, 8, 86, 26, "Close", "Esc", "Back to the game.", 0, 1, 0);
 
     /* left: the room's scripts */
     svl(10, 46, list_w, 16, 1, SVL_SECTION, SV_ONE, "SCRIPTS OF THIS ROOM (%d)", g_script_count);
     int bx = 10, by = g_sv_list_rc.bottom + 8, bh = 26, bw = (list_w - 6) / 2;
-    ui_add(B_SV_NEW, bx, by, bw, bh, "New", "", "A new empty script for this room (then type its name, Enter).", 0, 1, 0);
+    ui_add(B_SV_NEW, bx, by, bw, bh, "New script", "", "A new empty script for this room (then type its name, Enter).", 0, 1, 0);
     int is_default = s && !strcmp(s->name, DEFAULT_SCRIPT);
     ui_add(B_SV_RENAME, bx + bw + 6, by, bw, bh, "Rename", "F2", "Rename the selected script (type, Enter). A connector playing it must be pointed at the new name again. 'Default' keeps its name.", 0, s != NULL && !is_default, 0);
     by += bh + 5;
     ui_add(B_SV_DUP, bx, by, bw, bh, "Duplicate", "", "A copy of the selected script.", 0, s != NULL, 0);
     ui_add(B_SV_DELETE, bx + bw + 6, by, bw, bh, "Delete", "", "Delete the selected script (asks first). Every room keeps its 'Default' script.", 0, s != NULL && !is_default, 0);
     by += bh + 5;
-    ui_add(B_SV_AUTO, bx, by, list_w, bh, s && s->auto_run ? "Auto on entry: ON" : "Auto on entry: off", "",
+    if (s && s->sub) ui_add(B_SV_AUTO, bx, by, list_w, bh, "A dialog: never auto", "", "A subscript plays when David talks to its character (Place character > Dialog), never on its own.", 0, 0, 1);
+    else ui_add(B_SV_AUTO, bx, by, list_w, bh, s && s->auto_run ? "Auto on entry: ON" : "Auto on entry: off", "",
            "ON: played whenever David enters this room without a connector script of its own (the first 'auto' script of the list). Not while the scene editor is on.",
            s && s->auto_run, s != NULL, 1);
+    by += bh + 5;
+    ui_add(B_SV_NEW_SUB, bx, by, list_w, bh, "New subscript (dialog)", "",
+           "A new SUBSCRIPT: a dialog, played when David talks to a character (give it to the character: its Place action > Dialog). Same grid, same actions; "
+           "they can be for 'the one David talks to'.", 0, 1, 0);
 
     /* middle: toolbar + grid */
     int tx = g_sv_grid_rc.left, ty = 44, th = 28, gap = 6;
@@ -10527,6 +10844,21 @@ static void sv_layout_main(HWND hwnd) {
         if (tx + tb[i].w > g_sv_grid_rc.right) { tx = g_sv_grid_rc.left; ty += th + gap; }
         ui_add(tb[i].id, tx, ty, tb[i].w, th, tb[i].label, tb[i].key, tb[i].desc, 0, tb[i].enabled, 0);
         tx += tb[i].w + gap;
+    }
+    if (s && s->sub) { /* a dialog: the talking animations of both */
+        CharModel *pm = run_actor_model(s, ACTOR_PARTNER);
+        char l[2][96];
+        snprintf(l[0], sizeof(l[0]), "David talks with: %d anim%s", s->ntalk[0], s->ntalk[0] == 1 ? "" : "s");
+        snprintf(l[1], sizeof(l[1]), "%.20s talks with: %d anim%s", pm ? pm->name : "The other", s->ntalk[1], s->ntalk[1] == 1 ? "" : "s");
+        for (int k = 0; k < 2; k++) {
+            int w = 230;
+            if (tx + w > g_sv_grid_rc.right) { tx = g_sv_grid_rc.left; ty += th + gap; }
+            ui_addf(B_SV_TALK_A + k, tx, ty, w, th, l[k], "",
+                    k ? "The talking animations of the one David talks to: while each of its lines (Speak) plays, it plays one of them at random. Click: add / take out."
+                      : "David's talking animations in this dialog: while each of his lines (Speak) plays, he plays one of them at random. Click: add / take out.",
+                    s->ntalk[k] > 0, 1, 1);
+            tx += w + gap;
+        }
     }
     g_sv_grid_rc.top = ty + th + 12;
     if (s) {
@@ -10722,10 +11054,13 @@ static void sv_layout_main(HWND hwnd) {
         case ACT_PLACE:
             svl(ix, iy, iw, 16, 1, SVL_SECTION, SV_ONE, "CHARACTER");
             iy += 20;
-            svl(ix, iy, iw, 20, 0, SVL_VALUE, SV_ONE, "%s", a->model[0] ? a->model : "(none yet)");
+            svl(ix, iy, iw, 20, 0, a->player ? RGB(120, 230, 140) : SVL_VALUE, SV_ONE, "%s", a->player ? "David -- the player himself" : a->model[0] ? a->model : "(none yet)");
             iy += 26;
-            ui_add(B_SV_PL_MODEL, ix, iy, half, rh, "Choose...", "", "Pick a character of the game (grid with previews).", 0, 1, 0);
-            ui_add(B_SV_MOVESET, ix + half + 6, iy, half, rh, "Moveset...", "", "The animations this character walks with (graph), and change them.", 0, a->model[0] != 0, 0);
+            ui_add(B_SV_PL_MODEL, ix, iy, half, rh, "Choose...", "", a->player ? "Pick a character of the game instead (a new one, not the player)." : "Pick a character of the game (grid with previews).", 0, 1, 0);
+            ui_add(B_SV_MOVESET, ix + half + 6, iy, half, rh, "Moveset...", "", "The animations this character walks with (graph), and change them.", 0, a->model[0] != 0 || a->player, 0);
+            iy += rh + 4;
+            ui_add(B_SV_PL_PLAYER, ix, iy, iw, rh, a->player ? "[x]  The player: David himself" : "[  ]  The player: David himself", "",
+                   "Ticked: no new character -- David, the one we play, is taken to this position and facing when the action plays. The actions for 'David' act on him.", a->player, 1, 3);
             iy += rh + 14;
             svl(ix, iy, iw, 16, 1, SVL_SECTION, SV_ONE, "POSITION");
             iy += 20;
@@ -10740,6 +11075,10 @@ static void sv_layout_main(HWND hwnd) {
             svl(ix + 50, iy, iw - 100, rh, 0, SVL_VALUE, SV_ONE | DT_CENTER, "%.0f deg", a->facing * 57.29578f);
             ui_add(B_SV_FACE_R, ix + iw - 44, iy, 44, rh, ">", "", "Turn it 45 degrees right.", 0, 1, 0);
             iy += rh + 12;
+            if (a->player) {
+                svl(ix, iy, iw, 60, 0, SVL_DIM, DT_LEFT | DT_WORDBREAK, "David is taken there at once (whatever he was doing), facing that way. He's still the player: once the script is over, he's yours again.");
+                break;
+            }
             svl(ix, iy, iw, 16, 1, SVL_SECTION, SV_ONE, "SIDE");
             iy += 20;
             ui_add(B_SV_PL_SIDE, ix, iy, half, rh, "Ally", "", "On David's side: our blows don't touch it; its AI goes for the enemies. Health gone: knocked down, not dead.", !a->side, 1, 3);
@@ -10748,6 +11087,18 @@ static void sv_layout_main(HWND hwnd) {
             ui_add(B_SV_PL_AI, ix, iy, iw, rh, a->ai_off ? "[  ]  Its AI plays" : "[x]  Its AI plays", "",
                    "Ticked: it acts on its own (its AI preset, moveset screen). 'Character settings' can change it later.", !a->ai_off, 1, 3);
             iy += rh + 12;
+            {
+                svl(ix, iy, iw, 16, 1, SV_SUB_COL, SV_ONE, "DIALOG -- WHEN DAVID TALKS TO IT");
+                iy += 20;
+                char dl[120];
+                snprintf(dl, sizeof(dl), "%s   v", a->script[0] ? a->script : "None: it doesn't talk");
+                ui_addf(B_SV_PL_TALK, ix, iy, iw, rh, dl, "",
+                        "The subscript played when David talks to it: the mouth cursor over it, a click -- David walks up to it, they turn to each other, then the subscript plays.",
+                        a->script[0] != 0, 1, 1);
+                iy += rh + 4;
+                ui_add(B_SV_PL_TALK_EDIT, ix, iy, iw, rh, "Edit its subscript", "", "Open its subscript (the dialog) in this screen.", 0, a->script[0] && room_script_find(a->script) >= 0, 0);
+                iy += rh + 12;
+            }
             svl(ix, iy, iw, 60, 0, SVL_DIM, DT_LEFT | DT_WORDBREAK, "It stands there until a 'Move character' action (or its AI) moves it. It leaves with the room. 'Character settings' changes its side, AI and equipment later.");
             break;
         case ACT_CHAR: {
@@ -11033,22 +11384,40 @@ static void sv_paint(HWND hwnd, HDC hdc) {
     char t[300];
     /* scripts list */
     ui_fill(hdc, &g_sv_list_rc, RGB(22, 22, 28));
-    int lrows = (g_sv_list_rc.bottom - g_sv_list_rc.top) / SV_LIST_ROW_H;
-    if (g_sv_script < g_sv_list_scroll) g_sv_list_scroll = g_sv_script;
-    if (g_sv_script >= g_sv_list_scroll + lrows) g_sv_list_scroll = g_sv_script - lrows + 1;
+    sv_list_build(); /* the main scripts, then the subscripts */
+    int lrows = (g_sv_list_rc.bottom - g_sv_list_rc.top) / SV_LIST_ROW_H, lpos = 0, nmain = 0, nsub = 0;
+    for (int i = 0; i < g_sv_ent_n; i++) if (g_sv_ent[i] == g_sv_script) lpos = i;
+    for (int k = 0; k < g_script_count; k++) { if (g_scripts[k].sub) nsub++; else nmain++; }
+    if (lpos < g_sv_list_scroll) g_sv_list_scroll = lpos;
+    if (lpos >= g_sv_list_scroll + lrows) g_sv_list_scroll = lpos - lrows + 1;
     for (int r = 0; r < lrows; r++) {
-        int k = g_sv_list_scroll + r;
-        if (k >= g_script_count) break;
-        int y = g_sv_list_rc.top + r * SV_LIST_ROW_H;
+        int i = g_sv_list_scroll + r;
+        if (i >= g_sv_ent_n) break;
+        int k = g_sv_ent[i], y = g_sv_list_rc.top + r * SV_LIST_ROW_H;
         RECT row = { g_sv_list_rc.left, y, g_sv_list_rc.right, y + SV_LIST_ROW_H };
-        if (k == g_sv_script) ui_fill(hdc, &row, RGB(60, 50, 10));
+        if (k < 0) { /* a title, or "none" under it */
+            int title = k == SVE_MAIN || k == SVE_SUB;
+            if (title) ui_fill(hdc, &row, k == SVE_MAIN ? RGB(30, 34, 46) : RGB(46, 26, 46));
+            if (k == SVE_MAIN) snprintf(t, sizeof(t), "MAIN SCRIPTS (%d)", nmain);
+            else if (k == SVE_SUB) snprintf(t, sizeof(t), "SUBSCRIPTS -- DIALOGS (%d)", nsub);
+            else snprintf(t, sizeof(t), k == SVE_NO_SUB ? "(none: New subscript, below)" : "(none: New script, below)");
+            SelectObject(hdc, ui_font(12, title));
+            ui_text(hdc, row.left + 8, y, row.right - row.left - 12, SV_LIST_ROW_H, t, k == SVE_MAIN ? SVL_SECTION : k == SVE_SUB ? SV_SUB_COL : SVL_DIM, SV_ONE);
+            continue;
+        }
+        int sub = g_scripts[k].sub;
+        if (k == g_sv_script) ui_fill(hdc, &row, sub ? RGB(70, 30, 70) : RGB(60, 50, 10));
         SelectObject(hdc, ui_font(15, k == g_sv_script));
         const char *name = g_scripts[k].name;
         if (k == g_sv_script && g_sv_text) { snprintf(t, sizeof(t), "%s_", g_sv_text_buf); name = t; }
-        ui_text(hdc, row.left + 8, y, row.right - row.left - 56, SV_LIST_ROW_H, name, k == g_sv_script ? RGB(255, 230, 90) : RGB(220, 220, 225), SV_ONE);
-        if (g_scripts[k].auto_run) { SelectObject(hdc, ui_font(12, 1)); ui_text(hdc, row.right - 48, y, 42, SV_LIST_ROW_H, "AUTO", RGB(120, 230, 140), DT_RIGHT | DT_VCENTER | DT_SINGLELINE); }
+        ui_text(hdc, row.left + (sub ? 16 : 8), y, row.right - row.left - (sub ? 74 : 56), SV_LIST_ROW_H, name,
+                k == g_sv_script ? (sub ? RGB(255, 170, 245) : RGB(255, 230, 90)) : RGB(220, 220, 225), SV_ONE);
+        SelectObject(hdc, ui_font(12, 1));
+        if (sub) {
+            int used = sv_sub_linked(g_scripts[k].name);
+            ui_text(hdc, row.right - 62, y, 56, SV_LIST_ROW_H, used ? "TALK" : "UNUSED", used ? SV_SUB_COL : SVL_DIM, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+        } else if (g_scripts[k].auto_run) ui_text(hdc, row.right - 48, y, 42, SV_LIST_ROW_H, "AUTO", RGB(120, 230, 140), DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
     }
-    if (g_script_count == 0) { SelectObject(hdc, ui_font(14, 0)); ui_text(hdc, g_sv_list_rc.left + 8, g_sv_list_rc.top + 8, g_sv_list_rc.right - g_sv_list_rc.left - 16, 40, "(no script)", SVL_DIM, DT_LEFT | DT_WORDBREAK); }
     if (g_sv_text) {
         SelectObject(hdc, ui_font(12, 1));
         ui_text(hdc, g_sv_list_rc.left, g_sv_list_rc.bottom - 20, g_sv_list_rc.right - g_sv_list_rc.left, 18, "TYPE THE NAME, ENTER / ESC", RGB(255, 210, 60), DT_CENTER | DT_SINGLELINE);
@@ -11056,6 +11425,10 @@ static void sv_paint(HWND hwnd, HDC hdc) {
 
     /* grid */
     ui_fill(hdc, &g_sv_grid_rc, RGB(20, 20, 26));
+    if (s && s->sub) { /* a subscript: framed in its colour */
+        RECT fr = g_sv_grid_rc;
+        for (int k = 0; k < 3; k++) { InflateRect(&fr, 1, 1); ui_frame(hdc, &fr, SV_SUB_COL); }
+    }
     if (s) {
         int cw = sv_col_w(s), vcols = sv_cols_visible(s);
         SelectObject(hdc, ui_font(12, 1));
@@ -11312,8 +11685,8 @@ static int sv_key(HWND hwnd, int vk) {
         case VK_F2: sv_action(hwnd, B_SV_RENAME); return 1;
         case VK_F5: sv_action(hwnd, B_SV_PLAY); return 1;
         case VK_F6: sv_action(hwnd, B_SV_PLAY_ROW); return 1;
-        case VK_UP: if (ctrl) { if (g_sv_script > 0) { g_sv_script--; sv_select(0, 0); g_sv_scroll = 0; } } else { sv_select(g_sv_row - 1, g_sv_col); sv_sel_after_nav(); } return 1;
-        case VK_DOWN: if (ctrl) { if (g_sv_script < g_script_count - 1) { g_sv_script++; sv_select(0, 0); g_sv_scroll = 0; } } else { sv_select(g_sv_row + 1, g_sv_col); sv_sel_after_nav(); } return 1;
+        case VK_UP: if (ctrl) sv_list_step(-1); else { sv_select(g_sv_row - 1, g_sv_col); sv_sel_after_nav(); } return 1;
+        case VK_DOWN: if (ctrl) sv_list_step(1); else { sv_select(g_sv_row + 1, g_sv_col); sv_sel_after_nav(); } return 1;
         case VK_LEFT: sv_select(g_sv_row, g_sv_col - 1); sv_sel_after_nav(); return 1;
         case VK_RIGHT: sv_select(g_sv_row, g_sv_col + 1); sv_sel_after_nav(); return 1;
         case VK_PRIOR: sv_select(g_sv_row - sv_grid_rows_visible(), g_sv_col); sv_sel_after_nav(); return 1;
@@ -11362,8 +11735,10 @@ static void sv_mouse_down(HWND hwnd, int x, int y, int dbl) {
     int b = ui_hit(x, y);
     if (b != B_NONE) { ui_action(hwnd, b); return; }
     if (x >= g_sv_list_rc.left && x < g_sv_list_rc.right && y >= g_sv_list_rc.top && y < g_sv_list_rc.bottom) {
-        int k = g_sv_list_scroll + (y - g_sv_list_rc.top) / SV_LIST_ROW_H;
-        if (k < g_script_count) {
+        int i = g_sv_list_scroll + (y - g_sv_list_rc.top) / SV_LIST_ROW_H, k = -1;
+        sv_list_build();
+        if (i >= 0 && i < g_sv_ent_n) k = g_sv_ent[i];
+        if (k >= 0 && k < g_script_count) { /* (a title: nothing) */
             if (k != g_sv_script) { if (g_sv_text) sv_text_commit(); g_sv_script = k; g_sv_row = g_sv_col = g_sv_scroll = 0; }
             else if (dbl) sv_action(hwnd, B_SV_RENAME);
         }
@@ -13006,9 +13381,9 @@ static int pick_ghosts(Actor *out, int max) {
     for (int r = 0; r < s->rows && n < max; r++)
         for (int c = 0; c < s->cols && n < max; c++) {
             ScriptAction *a = script_at(s, r, c);
-            if (a->type != ACT_PLACE || !a->has_pos || !a->model[0]) continue;
+            if (a->type != ACT_PLACE || !a->has_pos || (!a->model[0] && !a->player)) continue;
             if (a == cur && g_sv_pick == SV_PICK_PLACE_POS) continue; /* being put somewhere else */
-            CharModel *m = model_by_name(a->model);
+            CharModel *m = a->player ? &g_david : model_by_name(a->model);
             if (!m) continue;
             Actor *g = &out[n++];
             actor_reset(g, m, a->id);
@@ -13185,7 +13560,7 @@ static void game_tick(HWND hwnd) {
         g_last_game_tick_ms = now;
         if (dt > 0.1) dt = 0.1; /* clamp huge gaps (e.g. window drag) */
         int frozen = transition_frozen(); /* black between two rooms: everything waits */
-        if (!frozen) script_tick(hwnd, (float)dt); /* a script playing: its rows, before the characters move */
+        if (!frozen) { talk_tick((float)dt); script_tick(hwnd, (float)dt); } /* a talk starting its dialog; a script playing: its rows, before the characters move */
         int need_repaint = 0;
         if (g_has_3d_character && !frozen) {
             for (int k = 0; k < MAX_ACTORS; k++) {
@@ -13431,6 +13806,9 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             }
             if (g_has_3d_character && DAVID_ACTOR->down) return 0; /* knocked down */
             if (g_has_3d_character) {
+                talk_cancel();
+                Actor *tk = talk_actor_at((float)rx, (float)ry);
+                if (tk) { talk_click(tk, dbl); InvalidateRect(hwnd, NULL, FALSE); return 0; } /* David goes to talk to it */
                 int dd = door_at_pixel((float)rx, (float)ry);
                 if (dd >= 0) { door_click(dd, dbl); InvalidateRect(hwnd, NULL, FALSE); return 0; }
                 if (!try_click_to_move((float)rx, (float)ry, dbl)) report_click_refusal();

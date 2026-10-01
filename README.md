@@ -80,7 +80,9 @@ No file of the original game is needed.
   - **Stop sound**: one of the script's sounds / ambiences, all of them,
     or the music -- at once or fading out;
   - **Place character**: any character of the game appears at a point
-    clicked in the room, facing a direction;
+    clicked in the room, facing a direction -- or, ticking "The player",
+    David himself (the one we play) is taken there; a placed character can
+    have a **dialog** (a subscript, below);
   - **Move character**: David or a placed character walks / runs to a
     point clicked in the room, or through a connector (for David: until
     he is in the other room);
@@ -146,6 +148,15 @@ No file of the original game is needed.
   unselects it. When playing, the zone is over as soon as all its actions
   are -- not when its rows are -- and the rows after it go on. "Back to
   rows" turns it back into plain rows.
+- **Subscripts (dialogs)**: listed apart, under the main scripts ("New
+  subscript"); edited in the same grid with the same actions, framed in
+  pink with a pink title. A placed character's Dialog (its Place action)
+  names one: in the game the mouth cursor shows over it, a click sends
+  David up to it (double-click: running), both turn to face each other,
+  then the subscript plays. Its actions can be for "the one David talks
+  to"; David and that one each have a list of talking animations (the
+  toolbar buttons), one played at random while each of their lines (Speak)
+  plays. The character's AI waits meanwhile.
 - A script plays when David arrives through a connector that names it (the
   connector wizard asks for it; also "Arrival script..." on a connector),
   or, entering the room otherwise, the room's first script marked *auto*.
