@@ -342,6 +342,8 @@ typedef struct {
     int hold_step;             /* the script step (g_run.step) it belongs to */
     int play_token;            /* +1 at every new clip started: a script action knows its own by it (its pool may change the clip) */
     int pool_clips[SCRIPT_POOL_MAX + 1], pool_n; /* a script animation's random pool: a new one of them at every loop */
+    float blocked_t;           /* how long another character has kept it from moving on */
+    int detours;               /* ways around another character tried, this move */
     CuePlayer cue;             /* the attack's sounds playing */
     /* combat */
     int side;                  /* SIDE_ALLY (David's side) / SIDE_ENEMY: blows only land on the other side */
@@ -1219,6 +1221,7 @@ static void set_character_target(float wx, float wy, float wz, int run) {
     int standing = !g_char_moving;
     g_char_moving = 1;
     g_char_walk_mode = run ? 2 : 1;
+    g_act->detours = 0; g_act->blocked_t = 0.0f;
     david_turn_toward(atan2f(dx, dz), run, standing);
 }
 
@@ -1535,6 +1538,95 @@ static void actor_play_end(Actor *a) {
     }
 }
 
+/* CHARACTERS AS OBSTACLES: each one standing (not dead, not knocked down)
+   is a cylinder the others can't go into, like a wall -- its radius: the
+   body radius setting, scaled by its build against David's (its model's
+   widest reach). Moving into one: it slides along it; held back half a
+   second: it goes around it (a free spot beside it), or stops if that's
+   where it was going. The attack / dodge steps stop against them. */
+static void model_extent(const CharModel *m, float *height, float *reach);
+static float actor_radius(const Actor *a) {
+    float h, r, dh, dr;
+    if (!a->model || !DAVID_ACTOR->model) return g_nav.body_radius;
+    model_extent(a->model, &h, &r);
+    model_extent(DAVID_ACTOR->model, &dh, &dr);
+    float k = dr > 1e-3f ? r / dr : 1.0f;
+    if (k < 0.6f) k = 0.6f;
+    if (k > 3.0f) k = 3.0f;
+    return g_nav.body_radius * k;
+}
+static int actor_blocks(const Actor *a, const Actor *b) { return b != a && b->used && !b->dead && !b->down && b->model; }
+/* the character (other than a) whose cylinder the point (x, z) at height y is in, NULL: none */
+static Actor *actor_blocker_at(const Actor *a, float x, float y, float z) {
+    float ra = actor_radius(a);
+    for (int k = 0; k < MAX_ACTORS; k++) {
+        Actor *b = &g_actors[k];
+        if (!actor_blocks(a, b) || fabsf(b->pos[1] - y) > 2.0f) continue;
+        float r = ra + actor_radius(b), dx = x - b->pos[0], dz = z - b->pos[2];
+        if (dx * dx + dz * dz < r * r) return b;
+    }
+    return NULL;
+}
+/* a straight line from -> to: does it go into another character? */
+static int actor_line_blocked(const Actor *a, const float from[3], const float to[3]) {
+    for (int i = 1; i <= 8; i++) {
+        float t = i / 8.0f;
+        if (actor_blocker_at(a, from[0] + (to[0] - from[0]) * t, from[1], from[2] + (to[2] - from[2]) * t)) return 1;
+    }
+    return 0;
+}
+/* a's move from its position by (mx, mz) this step: kept out of the others (sliding along them) */
+static void actor_collide_move(const Actor *a, float *mx, float *mz) {
+    float ra = actor_radius(a);
+    for (int k = 0; k < MAX_ACTORS; k++) {
+        const Actor *b = &g_actors[k];
+        if (!actor_blocks(a, b) || fabsf(b->pos[1] - a->pos[1]) > 2.0f) continue;
+        float r = ra + actor_radius(b);
+        float nx = a->pos[0] + *mx - b->pos[0], nz = a->pos[2] + *mz - b->pos[2];
+        if (nx * nx + nz * nz >= r * r) continue; /* clear of b */
+        float cx = a->pos[0] - b->pos[0], cz = a->pos[2] - b->pos[2], cl = sqrtf(cx * cx + cz * cz);
+        if (cl < 1e-4f) continue; /* right on it (placed there): let it out */
+        cx /= cl; cz /= cl;
+        float toward = *mx * cx + *mz * cz;
+        if (toward < 0.0f) { *mx -= cx * toward; *mz -= cz * toward; } /* only along it */
+        nx = a->pos[0] + *mx - b->pos[0]; nz = a->pos[2] + *mz - b->pos[2];
+        if (nx * nx + nz * nz < r * r && nx * nx + nz * nz < cl * cl) { *mx = 0.0f; *mz = 0.0f; } /* still into it: not this step */
+    }
+}
+/* held back by b: a way around it (a waypoint beside it, then on), or 0 */
+static int actor_detour(Actor *a, const Actor *b) {
+    float tx = a->target[0] - a->pos[0], tz = a->target[2] - a->pos[2], tl = sqrtf(tx * tx + tz * tz);
+    if (tl < 1e-4f) return 0;
+    tx /= tl; tz /= tl;
+    float r = (actor_radius(a) + actor_radius(b)) * 1.35f;
+    for (int side = 0; side < 2; side++) {
+        float sgn = side ? -1.0f : 1.0f;
+        /* first the side the target is on */
+        float px = -tz * sgn, pz = tx * sgn;
+        float c[3] = { b->pos[0] + px * r + tx * r * 0.3f, a->pos[1], b->pos[2] + pz * r + tz * r * 0.3f };
+        float gy;
+        if (g_room_mesh_tri_count > 0 && g_collision_enabled) {
+            if (!floor_below(c[0], c[2], a->pos[1] + 0.5f, NAV_MAX_STEP + 0.5f, g_room_mesh_tris, g_room_mesh_tri_count, &gy)) continue;
+            c[1] = gy;
+            if (!stand_ok(c[0], c[1], c[2], g_room_mesh_tris, g_room_mesh_tri_count)) continue;
+            if (!path_is_walkable(a->pos, c, g_room_mesh_tris, g_room_mesh_tri_count, CHAR_RADIUS, NAV_MAX_STEP, g_room_floor_y - 12.0f)) continue;
+        }
+        if (actor_blocker_at(a, c[0], c[1], c[2])) continue;
+        /* insert it as the next waypoint, the current target after it */
+        if (a->waypoint_count <= 0) {
+            memcpy(a->waypoints[0], c, sizeof(c)); memcpy(a->waypoints[1], a->target, sizeof(float) * 3);
+            a->waypoint_count = 2; a->waypoint_idx = 0;
+        } else if (a->waypoint_count < MAX_CHAR_WAYPOINTS) {
+            int i = a->waypoint_idx;
+            memmove(a->waypoints[i + 1], a->waypoints[i], sizeof(a->waypoints[0]) * (size_t)(a->waypoint_count - i));
+            memcpy(a->waypoints[i], c, sizeof(c));
+            a->waypoint_count++;
+        } else return 0;
+        memcpy(a->target, c, sizeof(c));
+        return 1;
+    }
+    return 0;
+}
 /* START CLIPS' PACE. The clips don't move the body: the code does. Setting
    off from standing still, it used to go at walk speed through the whole
    start clip, then jump to its run / walk speed -- but torun's legs already
@@ -1542,7 +1634,10 @@ static void actor_play_end(Actor *a) {
    towalk's barely move at first (~1 unit/s): the feet slid on the floor.
    Now the body goes at the pace the clip's planted foot gives (the lower
    foot, its move against the hips), measured once per clip and character,
-   scaled by its walk cycle's own pace against the "Walk speed" setting.
+   scaled like the cycle it leads to (a run start: the run cycle's own pace
+   against "Run speed"; a walk start: the walk cycle and "Walk speed" -- the
+   two settings needn't keep the clips' ratio), and over its last third
+   eased into that speed exactly: no jump when the cycle takes over.
    Human skeletons only (feet 32 / 35, hips 2); else the old way. */
 #define PACE_N 3 /* its pace over each third (its stride's own rhythm smoothed away: the body doesn't surge) */
 static float clip_foot_pace(const CharModel *m, int clip, float out[PACE_N]) { /* model units / s, -1: can't */
@@ -1576,12 +1671,13 @@ static float clip_foot_pace(const CharModel *m, int clip, float out[PACE_N]) { /
     }
     return mean;
 }
-/* the speed a character sets off at, t s into start clip `clip` (fallback: when it can't be measured) */
-static float start_pace(Actor *a, int clip, float t, float fallback) {
+/* the speed a character sets off at, t s into start clip `clip`, toward a run (run) or a walk (fallback: when it can't be measured) */
+static float start_pace(Actor *a, int clip, float t, int run, float fallback) {
     static struct { const CharModel *m; int clip; float v[PACE_N], mean; } cache[48];
     static int n = 0, next = 0;
     const CharModel *m = a->model;
-    int walk = a->clips[MC_WALK];
+    int walk = a->clips[run ? MC_RUN : MC_WALK]; /* the cycle it leads to */
+    float target = run ? CHAR_RUN_SPEED : CHAR_WALK_SPEED;
     float *prof = NULL, walk_mean = -1.0f;
     for (int i = 0; i < n; i++) {
         if (cache[i].m != m) continue;
@@ -1601,9 +1697,12 @@ static float start_pace(Actor *a, int clip, float t, float fallback) {
     float u = t / d * PACE_N - 0.5f;
     int i0 = (int)floorf(u);
     float w = u - i0, v0 = prof[i0 < 0 ? 0 : i0 >= PACE_N ? PACE_N - 1 : i0], v1 = prof[i0 + 1 < 0 ? 0 : i0 + 1 >= PACE_N ? PACE_N - 1 : i0 + 1];
-    float v = (v0 + (v1 - v0) * w) * (CHAR_WALK_SPEED / walk_mean);
-    float lo = CHAR_WALK_SPEED * 0.15f, hi = CHAR_RUN_SPEED * 1.2f;
-    return v < lo ? lo : v > hi ? hi : v;
+    float v = (v0 + (v1 - v0) * w) * (target / walk_mean);
+    float lo = target * 0.1f, hi = target * 1.25f;
+    v = v < lo ? lo : v > hi ? hi : v;
+    float k = t / d * 3.0f - 2.0f; /* its last third: into the cycle's speed */
+    if (k > 0.0f) { if (k > 1.0f) k = 1.0f; k = k * k * (3.0f - 2.0f * k); v += (target - v) * k; }
+    return v;
 }
 static int advance_character(float dt) {
     if (g_act->play_clip >= 0) { /* a clip over its own pose (attacks, script animations...): its times, then back */
@@ -1660,7 +1759,7 @@ static int advance_character(float dt) {
        walking keeps its pace */
     float speed = (g_char_walk_mode == 2) ? CHAR_RUN_SPEED : CHAR_WALK_SPEED;
     if (turning) {
-        if (g_char_turn_from_stand) speed = start_pace(g_act, g_char_turn_clip, g_char_turn_t, CHAR_WALK_SPEED); /* as fast as its feet go */
+        if (g_char_turn_from_stand) speed = start_pace(g_act, g_char_turn_clip, g_char_turn_t, g_char_walk_mode == 2, g_char_walk_mode == 2 ? CHAR_RUN_SPEED : CHAR_WALK_SPEED); /* as fast as its feet go */
         else if (g_char_walk_mode == 2) speed = CHAR_RUN_SPEED * g_david_run_turn_pct * 0.01f;
     }
     float step = speed * dt;
@@ -1705,8 +1804,33 @@ static int advance_character(float dt) {
     }
     {
         float frac = step / dist;
-        g_char_pos[0] += dx * frac;
-        g_char_pos[2] += dz * frac;
+        float mx = dx * frac, mz = dz * frac, want = step;
+        actor_collide_move(g_act, &mx, &mz); /* not into another character */
+        float got = sqrtf(mx * mx + mz * mz);
+        if (got < want * 0.3f) {
+            g_act->blocked_t += dt;
+            if (g_act->blocked_t > 0.5f) { /* held back: around it, or there's nowhere else to go */
+                g_act->blocked_t = 0.0f;
+                Actor *b = NULL;
+                float ahead[3] = { g_char_pos[0] + dx * frac * 4.0f, g_char_pos[1], g_char_pos[2] + dz * frac * 4.0f };
+                for (int tries = 0; tries < 3 && !b; tries++) b = actor_blocker_at(g_act, ahead[0], ahead[1], ahead[2]), ahead[0] += dx * frac * 4.0f, ahead[2] += dz * frac * 4.0f;
+                float near_target = b ? (actor_radius(g_act) + actor_radius(b)) * 1.6f : 0.0f;
+                int last_leg = g_char_waypoint_idx >= g_char_waypoint_count - 1;
+                if (!b || (last_leg && dist < near_target) || g_act->detours >= 4 || !actor_detour(g_act, b)) {
+                    g_char_moving = 0; g_char_walk_mode = 0; g_char_anim_t = 0.0f; g_char_waypoint_count = 0; g_char_turn_clip = -1;
+                    if (g_act == DAVID_ACTOR) g_click_marker_active = 0;
+                    g_pending_door = -1;
+                    return 1;
+                }
+                g_act->detours++;
+                g_char_walk_mode = g_char_walk_mode ? g_char_walk_mode : 1;
+                return 1;
+            }
+        } else g_act->blocked_t = 0.0f;
+        frac = dist > 1e-6f ? got / dist : 0.0f;
+        if (got > 1e-6f) { dx = mx / frac; dz = mz / frac; } /* its slide's direction */
+        g_char_pos[0] += mx;
+        g_char_pos[2] += mz;
         float gy;
         float snap_step = (g_nav_zone_at && g_nav_zone_at(g_char_pos[0], g_char_pos[1], g_char_pos[2]) == NAV_ZONE_FORCE)
                           ? NAV_FORCED_STEP : NAV_MAX_STEP;
@@ -2290,15 +2414,24 @@ static void draw_click_marker(HDC hdc, int cam_x, int cam_y) {
    drawn body, so it stays glued to him on rolled cameras too. Drawn on
    top, no depth test, so it's visible even behind geometry. */
 static int g_show_collision = 0;
-static void draw_collision_box(HDC hdc, int cam_x, int cam_y) {
+static void draw_collision_box_one(HDC hdc, int cam_x, int cam_y);
+static void draw_collision_box(HDC hdc, int cam_x, int cam_y) { /* B: every character's (David first: the current actor) */
     if (!g_show_collision || !g_has_3d_character) return;
+    for (int k = 0; k < MAX_ACTORS; k++) {
+        if (!g_actors[k].used) continue;
+        actor_begin(&g_actors[k]); draw_collision_box_one(hdc, cam_x, cam_y); actor_end();
+    }
+}
+static void draw_collision_box_one(HDC hdc, int cam_x, int cam_y) {
     const int SEG = 20;
     /* feet, max step (anything lower is climbable), body band start, head
        -- the exact volume stand_ok tests, from the live settings */
     const float heights[4] = { 0.0f, NAV_MAX_STEP, NAV_BODY_Y0, NAV_BODY_Y1 };
-    const float CHAR_RADIUS_DRAWN = g_nav.body_radius;
-    const COLORREF cols[4] = { RGB(0, 230, 255), RGB(255, 60, 255), RGB(255, 60, 255), RGB(0, 230, 255) };
-    COLORREF body = g_collision_enabled ? RGB(0, 230, 255) : RGB(140, 140, 140);
+    const float CHAR_RADIUS_DRAWN = actor_radius(g_act);
+    int him = g_act == DAVID_ACTOR, off = g_act->dead || g_act->down; /* the others orange; lying down: no obstacle, grey */
+    const COLORREF ring = off ? RGB(120, 120, 120) : him ? RGB(0, 230, 255) : RGB(255, 160, 50);
+    const COLORREF cols[4] = { ring, RGB(255, 60, 255), RGB(255, 60, 255), ring };
+    COLORREF body = g_collision_enabled ? ring : RGB(140, 140, 140);
     for (int hi = 0; hi < 4; hi++) {
         HPEN pen = CreatePen(PS_SOLID, (hi == 1 || hi == 2) ? 1 : 2, g_collision_enabled ? cols[hi] : body);
         HPEN oldPen = (HPEN)SelectObject(hdc, pen);
@@ -2327,7 +2460,7 @@ static void draw_collision_box(HDC hdc, int cam_x, int cam_y) {
     }
     SelectObject(hdc, oldPen);
     DeleteObject(pen);
-    if (g_char_moving) { /* remaining path, through the real room camera (it's on the floor) */
+    if (g_char_moving && !g_free_cam) { /* remaining path, through the real room camera (it's on the floor) */
         HPEN gp = CreatePen(PS_SOLID, 2, RGB(60, 255, 90));
         HPEN op = (HPEN)SelectObject(hdc, gp);
         float px, py, pz;
@@ -4980,7 +5113,7 @@ static void ui_layout(HWND hwnd) {
     /* view */
     int vy = y;
     ui_add(B_WALK, x, y, half, h, "Walkable", "P", "Show in green the floor David can reach from where he stands.", g_show_walkable, 1, 1);
-    ui_add(B_HITBOX, x + half + 6, y, half, h, "Hitbox", "B", "Show David's collision volume (knee/chest rings) and his planned path.", g_show_collision, 1, 1);
+    ui_add(B_HITBOX, x + half + 6, y, half, h, "Hitbox", "B", "Show every character's collision volume (David cyan, the others orange, lying down grey: no obstacle) and their planned paths.", g_show_collision, 1, 1);
     y += h + gap;
     ui_add(B_MESH, x, y, half, h, "3D mesh", "F3", "Show the raw 3D blockout instead of the picture, to check the alignment.", g_view_mode_3d, 1, 1);
     ui_add(B_COLL, x + half + 6, y, half, h, g_collision_enabled ? "Collisions" : "Fly mode", "C", "Collisions ON: David walks on floors only. OFF (fly mode): straight line through anything.", g_collision_enabled, 1, 1);
@@ -5778,6 +5911,7 @@ static void actor_plan_step(Actor *a, float diameters) {
             to[1] = gy;
             if (!path_is_walkable(a->pos, to, g_room_mesh_tris, g_room_mesh_tri_count, CHAR_RADIUS, NAV_MAX_STEP, g_room_floor_y - 12.0f)) continue;
         }
+        if (actor_line_blocked(a, a->pos, to)) continue; /* into another character: shorter */
         memcpy(a->step_from, a->pos, sizeof(a->step_from));
         memcpy(a->step_to, to, sizeof(a->step_to));
         a->stepping = 1;
@@ -6085,7 +6219,7 @@ static float model_height(const CharModel *m) {
 static void magic_tick(float dt);
 static int actor_alive(const Actor *a) { return a->used && !a->dead && !a->down; }
 static int actor_in_hitbox(const Actor *b, const float p[3]) {
-    float r = g_nav.body_radius * 1.25f, dx = p[0] - b->pos[0], dz = p[2] - b->pos[2];
+    float r = actor_radius(b) * 1.25f, dx = p[0] - b->pos[0], dz = p[2] - b->pos[2];
     return dx * dx + dz * dz < r * r && p[1] >= b->pos[1] - 0.1f && p[1] <= b->pos[1] + model_height(b->model) * 1.05f;
 }
 /* does a blade of a (now, or on its way since the pose before) go through b's hitbox? */
@@ -6423,7 +6557,7 @@ static void proj_tick(float dt) {
         for (int k = 0; k < MAX_ACTORS && p->used; k++) { /* a character of the other side */
             Actor *b = &g_actors[k];
             if (!b->used || b->dead || b->down || b->side == p->side || b->dodging) continue;
-            float r = g_nav.body_radius * 1.25f, dx = p->pos[0] - b->pos[0], dz = p->pos[2] - b->pos[2];
+            float r = actor_radius(b) * 1.25f, dx = p->pos[0] - b->pos[0], dz = p->pos[2] - b->pos[2];
             if (dx * dx + dz * dz < r * r && p->pos[1] >= b->pos[1] - 0.2f && p->pos[1] <= b->pos[1] + model_height(b->model) * 1.05f) proj_impact(p, b);
         }
         if (!p->used) continue;
@@ -13459,7 +13593,8 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
                     XFORM xf = { view_scale, 0, 0, view_scale, 0, 0 };
                     SetWorldTransform(vdc, &xf);
                     if (!g_has_3d_character) draw_player(vdc, g_cam_x, g_cam_y);
-                    if (!g_free_cam) { draw_click_marker(vdc, g_cam_x, g_cam_y); draw_collision_box(vdc, g_cam_x, g_cam_y); }
+                    if (!g_free_cam) draw_click_marker(vdc, g_cam_x, g_cam_y);
+                    draw_collision_box(vdc, g_cam_x, g_cam_y);
                     ModifyWorldTransform(vdc, NULL, MWT_IDENTITY);
                     SetGraphicsMode(vdc, GM_COMPATIBLE);
                     GdiFlush();

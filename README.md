@@ -291,7 +291,7 @@ Every tool is also a button in the side panel, with its shortcut shown.
 | **Caps Lock** | off = playing (mouse kept in the picture), on = tools (mouse free for the panels) |
 | PgUp / PgDn, TAB | previous / next room, room list (type to filter) |
 | P | walkable area (green) |
-| B | David's hitbox and path |
+| B | every character's hitbox (David cyan, the others orange, lying down grey) and paths |
 | C | collisions on/off (fly mode) |
 | F3 | raw 3D blockout instead of the picture |
 | F4 (editor, placing a script's character: position, facing, destination) | free camera: fly anywhere in the room's blockout (no picture, the floor he can stand on green) to put a connector's points, or a script character's, where the room's camera doesn't look (the script's other characters are marked; kept for the next pick) -- the keys where W A S D are on a QWERTY keyboard (Z Q S D on an AZERTY one) / arrows, Q / E (A / E) down / up, Shift faster, right button dragged to look, wheel forward / back; F4 / Esc back |

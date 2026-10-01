@@ -1641,3 +1641,10 @@ Validation, before removing the old data:
   its 2.4 s, its planted foot against the hips), towalk's barely move at
   first (~1): the feet slid. Now its pace per third of the clip, measured
   in the game (start_pace), scaled by the character's walk cycle.
+- The start pace is scaled like the cycle it leads to (run starts by the
+  run cycle and Run speed -- the settings needn't keep the clips' ratio:
+  walk 1.5 / run 6 made torun end at ~3 then jump to 6) and eased into
+  that speed over its last third.
+- Characters are obstacles: cylinders (body radius x their build) the
+  others slide along; held back 0.5 s: a detour beside it, or a stop next
+  to it; attack / dodge steps stop against them. B shows them all.
