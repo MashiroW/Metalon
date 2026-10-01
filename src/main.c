@@ -1535,6 +1535,76 @@ static void actor_play_end(Actor *a) {
     }
 }
 
+/* START CLIPS' PACE. The clips don't move the body: the code does. Setting
+   off from standing still, it used to go at walk speed through the whole
+   start clip, then jump to its run / walk speed -- but torun's legs already
+   run (measured: ~11 units/s on average over its 2.4 s, against 6) and
+   towalk's barely move at first (~1 unit/s): the feet slid on the floor.
+   Now the body goes at the pace the clip's planted foot gives (the lower
+   foot, its move against the hips), measured once per clip and character,
+   scaled by its walk cycle's own pace against the "Walk speed" setting.
+   Human skeletons only (feet 32 / 35, hips 2); else the old way. */
+#define PACE_N 3 /* its pace over each third (its stride's own rhythm smoothed away: the body doesn't surge) */
+static float clip_foot_pace(const CharModel *m, int clip, float out[PACE_N]) { /* model units / s, -1: can't */
+    if (!m || m->node_count != 48 || clip < 0) return -1.0f;
+    float d = anim_lib_duration(clip);
+    if (d <= 0.05f) return -1.0f;
+    static NodeOverride ov[DAVID_MAX_NODES];
+    static Mat4 skin[DAVID_MAX_JOINTS];
+    enum { S = PACE_N * 24 };
+    float fy[S + 1][2], fx[S + 1][2], fz[S + 1][2];
+    for (int i = 0; i <= S; i++) {
+        anim_lib_sample_for(clip, d * i / S * 0.999f, m, ov);
+        skeleton_skin_matrices_for(m, ov, skin);
+        Mat4 h, f0, f1;
+        if (!skeleton_node_global(2, &h) || !skeleton_node_global(32, &f0) || !skeleton_node_global(35, &f1)) return -1.0f;
+        fy[i][0] = f0.m[13]; fy[i][1] = f1.m[13];
+        fx[i][0] = f0.m[12] - h.m[12]; fx[i][1] = f1.m[12] - h.m[12];
+        fz[i][0] = f0.m[14] - h.m[14]; fz[i][1] = f1.m[14] - h.m[14];
+    }
+    float sp[S], mean = 0.0f;
+    for (int i = 0; i < S; i++) {
+        int f = fy[i][0] < fy[i][1] ? 0 : 1; /* the planted foot: the lower one */
+        float dx = fx[i + 1][f] - fx[i][f], dz = fz[i + 1][f] - fz[i][f];
+        sp[i] = sqrtf(dx * dx + dz * dz) / (d / S);
+        mean += sp[i] / S;
+    }
+    for (int k = 0; k < PACE_N; k++) { /* its mean over each third */
+        float acc = 0.0f;
+        for (int i = k * 24; i < (k + 1) * 24; i++) acc += sp[i];
+        out[k] = acc / 24.0f;
+    }
+    return mean;
+}
+/* the speed a character sets off at, t s into start clip `clip` (fallback: when it can't be measured) */
+static float start_pace(Actor *a, int clip, float t, float fallback) {
+    static struct { const CharModel *m; int clip; float v[PACE_N], mean; } cache[48];
+    static int n = 0, next = 0;
+    const CharModel *m = a->model;
+    int walk = a->clips[MC_WALK];
+    float *prof = NULL, walk_mean = -1.0f;
+    for (int i = 0; i < n; i++) {
+        if (cache[i].m != m) continue;
+        if (cache[i].clip == clip) prof = cache[i].v;
+        if (cache[i].clip == walk) walk_mean = cache[i].mean;
+    }
+    for (int pass = 0; pass < 2; pass++) { /* measure what's missing: the start clip, its walk cycle */
+        int c = pass ? walk : clip;
+        if ((pass && walk_mean >= 0.0f) || (!pass && prof) || c < 0) continue;
+        int k = n < 48 ? n++ : (next++ % 48);
+        cache[k].m = m; cache[k].clip = c;
+        cache[k].mean = clip_foot_pace(m, c, cache[k].v);
+        if (pass) walk_mean = cache[k].mean; else prof = cache[k].mean >= 0.0f ? cache[k].v : NULL;
+    }
+    float d = anim_lib_duration(clip);
+    if (!prof || walk_mean <= 0.01f || d <= 0.0f) return fallback;
+    float u = t / d * PACE_N - 0.5f;
+    int i0 = (int)floorf(u);
+    float w = u - i0, v0 = prof[i0 < 0 ? 0 : i0 >= PACE_N ? PACE_N - 1 : i0], v1 = prof[i0 + 1 < 0 ? 0 : i0 + 1 >= PACE_N ? PACE_N - 1 : i0 + 1];
+    float v = (v0 + (v1 - v0) * w) * (CHAR_WALK_SPEED / walk_mean);
+    float lo = CHAR_WALK_SPEED * 0.15f, hi = CHAR_RUN_SPEED * 1.2f;
+    return v < lo ? lo : v > hi ? hi : v;
+}
 static int advance_character(float dt) {
     if (g_act->play_clip >= 0) { /* a clip over its own pose (attacks, script animations...): its times, then back */
         Actor *a = g_act;
@@ -1584,12 +1654,13 @@ static int advance_character(float dt) {
             turning = g_char_turn_clip >= 0;
         }
     }
-    /* a start from standing still sets off at walk speed; a turn while
-       already running (a new order, a path corner around a prop) slows
-       to the "Run turn speed" share of his run speed; walking keeps its pace */
+    /* a start from standing still goes at the pace of its clip's feet
+       (start_pace); a turn while already running (a new order, a path corner
+       around a prop) slows to the "Run turn speed" share of his run speed;
+       walking keeps its pace */
     float speed = (g_char_walk_mode == 2) ? CHAR_RUN_SPEED : CHAR_WALK_SPEED;
     if (turning) {
-        if (g_char_turn_from_stand) speed = CHAR_WALK_SPEED;
+        if (g_char_turn_from_stand) speed = start_pace(g_act, g_char_turn_clip, g_char_turn_t, CHAR_WALK_SPEED); /* as fast as its feet go */
         else if (g_char_walk_mode == 2) speed = CHAR_RUN_SPEED * g_david_run_turn_pct * 0.01f;
     }
     float step = speed * dt;

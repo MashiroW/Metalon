@@ -1636,3 +1636,8 @@ Validation, before removing the old data:
 - Weapon "orb:<element>" for an orb (no model), wands as items; combat
   presets Orb Magic / Wand Magic follow them; projectiles (spells, vials)
   with trails and blasts; buffs, poison, slow.
+- Setting off from standing: the body used to move at walk speed through
+  the whole start clip -- torun's feet run (~11 units/s on average over
+  its 2.4 s, its planted foot against the hips), towalk's barely move at
+  first (~1): the feet slid. Now its pace per third of the clip, measured
+  in the game (start_pace), scaled by the character's walk cycle.
